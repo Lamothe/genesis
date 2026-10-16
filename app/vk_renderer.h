@@ -6,12 +6,13 @@
 
 #include "camera.h"
 #include "geometry.h"
+#include "mesh.h"
 
 namespace vredit {
 
-// Vulkan viewport renderer: draws cubes per DrawItem, depth-tested lines
-// (floor grid) and always-on-top overlay lines (gizmo handles). Vulkan 1.3
-// with dynamic rendering; no Vulkan types leak past this header.
+// Vulkan viewport renderer: draws registered meshes per DrawItem, depth-tested
+// lines (floor grid) and always-on-top overlay lines (gizmo handles). Vulkan
+// 1.3 with dynamic rendering; no Vulkan types leak past this header.
 class VkRenderer {
 public:
   struct Config {
@@ -32,6 +33,10 @@ public:
   void shutdown();
 
   bool resize(std::uint32_t width, std::uint32_t height);
+
+  // Registers static mesh data and returns a handle (0 is the built-in cube).
+  // Safe to call at any time; internally synchronises with in-flight frames.
+  MeshHandle addMesh(MeshData const& data);
 
   // Renders one frame. Windowed: presents to the swapchain. Offscreen:
   // renders into an internal image available through readback().

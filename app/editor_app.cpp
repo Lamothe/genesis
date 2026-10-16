@@ -16,7 +16,10 @@
 
 #include "camera.h"
 #include "gizmo.h"
+#include "gltf.h"
 #include "handles.h"
+#include "mesh.h"
+#include "obj.h"
 #include "picking.h"
 #include "scene.h"
 #include "vk_renderer.h"
@@ -34,6 +37,8 @@ constexpr float kSnapScale = 0.25F;
 
 struct NodeVisual {
   NodeId id{kInvalidNode};
+  MeshHandle mesh{0};
+  Aabb localBounds{{-0.5F, -0.5F, -0.5F}, {0.5F, 0.5F, 0.5F}};
   Vec3 colour{1.0F, 1.0F, 1.0F};
 };
 
@@ -68,33 +73,103 @@ struct XcbWindow {
   xcb_get_keyboard_mapping_reply_t* keymapReply{nullptr};
 };
 
+void addCubeVisual(App& app, NodeId id, Vec3 colour) {
+  NodeVisual visual;
+  visual.id = id;
+  visual.colour = colour;
+  app.visuals.push_back(visual);
+}
+
 void buildDemoScene(App& app) {
   NodeId a = app.scene.create();
   Transform ta;
   ta.translation = {1.2F, 0.5F, 0.0F};
   app.scene.setLocal(a, ta);
-  app.visuals.push_back({a, {0.85F, 0.25F, 0.20F}});
+  addCubeVisual(app, a, {0.85F, 0.25F, 0.20F});
 
   NodeId b = app.scene.create();
   Transform tb;
   tb.translation = {-1.8F, 0.35F, 1.2F};
   tb.scale = {0.7F, 0.7F, 0.7F};
   app.scene.setLocal(b, tb);
-  app.visuals.push_back({b, {0.25F, 0.45F, 0.85F}});
+  addCubeVisual(app, b, {0.25F, 0.45F, 0.85F});
 
   NodeId parent = app.scene.create();
   Transform tp;
   tp.translation = {0.0F, 0.5F, -2.4F};
   tp.rotation = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 0.7853982F);
   app.scene.setLocal(parent, tp);
-  app.visuals.push_back({parent, {0.35F, 0.75F, 0.35F}});
+  addCubeVisual(app, parent, {0.35F, 0.75F, 0.35F});
 
   NodeId child = app.scene.create(parent);
   Transform tc;
   tc.translation = {0.0F, 1.4F, 0.0F};
   tc.scale = {0.55F, 0.55F, 0.55F};
   app.scene.setLocal(child, tc);
-  app.visuals.push_back({child, {0.85F, 0.75F, 0.25F}});
+  addCubeVisual(app, child, {0.85F, 0.75F, 0.25F});
+}
+
+// Adds a loaded model's meshes and node hierarchy to the scene and visuals.
+bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
+  std::vector<MeshHandle> meshHandles(model.meshes.size(), 0U);
+  for (std::size_t m = 0; m < model.meshes.size(); ++m) {
+    meshHandles[m] = renderer.addMesh(model.meshes[m].data);
+    if (meshHandles[m] == kInvalidMesh) {
+      std::printf("mesh registration failed for mesh %zu\n", m);
+      return false;
+    }
+  }
+  std::vector<NodeId> handles(model.nodes.size(), kInvalidNode);
+  for (std::size_t n = 0; n < model.nodes.size(); ++n) {
+    ModelNode const& node = model.nodes[n];
+    NodeId parent = node.parent >= 0 ? handles[static_cast<std::size_t>(node.parent)] : kInvalidNode;
+    NodeId id = app.scene.create(parent);
+    app.scene.setLocal(id, node.local);
+    handles[n] = id;
+    if (node.mesh >= 0 && static_cast<std::size_t>(node.mesh) < model.meshes.size()) {
+      ModelMesh const& mesh = model.meshes[static_cast<std::size_t>(node.mesh)];
+      NodeVisual visual;
+      visual.id = id;
+      visual.mesh = meshHandles[static_cast<std::size_t>(node.mesh)];
+      visual.localBounds = meshBounds(mesh.data);
+      visual.colour = mesh.colour;
+      app.visuals.push_back(visual);
+    }
+  }
+  return true;
+}
+
+// Frames the camera on the combined world bounds of all visuals.
+void frameScene(App& app) {
+  bool first = true;
+  Aabb bounds{};
+  for (NodeVisual const& visual : app.visuals) {
+    Mat4 world = app.scene.world(visual.id);
+    for (int corner = 0; corner < 8; ++corner) {
+      Vec3 local{((corner & 1) != 0) ? visual.localBounds.max.x : visual.localBounds.min.x,
+                 ((corner & 2) != 0) ? visual.localBounds.max.y : visual.localBounds.min.y,
+                 ((corner & 4) != 0) ? visual.localBounds.max.z : visual.localBounds.min.z};
+      Vec3 point = transformPoint(world, local);
+      if (first) {
+        bounds = {point, point};
+        first = false;
+      } else {
+        bounds.min = {std::fmin(bounds.min.x, point.x), std::fmin(bounds.min.y, point.y),
+                      std::fmin(bounds.min.z, point.z)};
+        bounds.max = {std::fmax(bounds.max.x, point.x), std::fmax(bounds.max.y, point.y),
+                      std::fmax(bounds.max.z, point.z)};
+      }
+    }
+  }
+  if (first) {
+    return;
+  }
+  Vec3 centre = (bounds.min + bounds.max) * 0.5F;
+  float radius = length(bounds.max - bounds.min) * 0.5F;
+  app.camera.target = centre;
+  app.camera.distance = std::fmax(2.2F * radius, 1.0F);
+  app.camera.pitch = -0.35F;
+  app.camera.yaw = 0.6F;
 }
 
 Ray appRay(App const& app, Vec2 pixel) {
@@ -155,17 +230,22 @@ std::optional<NodeId> pickNode(App& app, Ray const& ray) {
   std::vector<std::pair<NodeId, Aabb>> candidates;
   for (NodeVisual const& visual : app.visuals) {
     Mat4 world = app.scene.world(visual.id);
-    Aabb box{transformPoint(world, {-0.5F, -0.5F, -0.5F}),
-             transformPoint(world, {0.5F, 0.5F, 0.5F})};
-    for (int corner = 1; corner < 8; ++corner) {
-      Vec3 point = transformPoint(world,
-                                  {((corner & 1) != 0) ? 0.5F : -0.5F,
-                                   ((corner & 2) != 0) ? 0.5F : -0.5F,
-                                   ((corner & 4) != 0) ? 0.5F : -0.5F});
-      box.min = {std::fmin(box.min.x, point.x), std::fmin(box.min.y, point.y),
-                 std::fmin(box.min.z, point.z)};
-      box.max = {std::fmax(box.max.x, point.x), std::fmax(box.max.y, point.y),
-                 std::fmax(box.max.z, point.z)};
+    Aabb box{};
+    bool first = true;
+    for (int corner = 0; corner < 8; ++corner) {
+      Vec3 local{((corner & 1) != 0) ? visual.localBounds.max.x : visual.localBounds.min.x,
+                 ((corner & 2) != 0) ? visual.localBounds.max.y : visual.localBounds.min.y,
+                 ((corner & 4) != 0) ? visual.localBounds.max.z : visual.localBounds.min.z};
+      Vec3 point = transformPoint(world, local);
+      if (first) {
+        box = {point, point};
+        first = false;
+      } else {
+        box.min = {std::fmin(box.min.x, point.x), std::fmin(box.min.y, point.y),
+                   std::fmin(box.min.z, point.z)};
+        box.max = {std::fmax(box.max.x, point.x), std::fmax(box.max.y, point.y),
+                   std::fmax(box.max.z, point.z)};
+      }
     }
     candidates.push_back({visual.id, box});
   }
@@ -196,7 +276,7 @@ void assembleFrame(App& app,
                     std::vector<RendererVertex>& overlayLines) {
   appendGrid(depthLines, 8.0F, 1.0F);
   for (NodeVisual const& visual : app.visuals) {
-    items.push_back({app.scene.world(visual.id), visual.colour, true});
+    items.push_back({visual.mesh, app.scene.world(visual.id), visual.colour, true});
   }
   Vec3 pivot;
   Quat orientation;
@@ -419,10 +499,39 @@ bool writePpm(char const* path,
   return static_cast<bool>(file);
 }
 
-int runSmokeOffscreen(char const* shaderDir) {
+bool loadModels(App& app, VkRenderer& renderer, std::vector<char const*> const& paths) {
+  for (char const* path : paths) {
+    Model model;
+    std::string error;
+    std::string name(path);
+    bool ok = false;
+    if (name.size() >= 4U && name.compare(name.size() - 4U, 4U, ".glb") == 0) {
+      ok = loadGlbFile(path, model, error);
+    } else if (name.size() >= 4U && name.compare(name.size() - 4U, 4U, ".obj") == 0) {
+      ok = loadObjFile(path, model, error);
+    } else {
+      std::printf("unsupported model type: %s (want .glb or .obj)\n", path);
+      return false;
+    }
+    if (!ok) {
+      std::printf("failed to load %s: %s\n", path, error.c_str());
+      return false;
+    }
+    if (!addModelToScene(app, renderer, model)) {
+      return false;
+    }
+    std::printf("loaded %s: %zu meshes, %zu nodes\n", path, model.meshes.size(),
+                model.nodes.size());
+  }
+  return true;
+}
+
+int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& modelPaths) {
   App app;
-  buildDemoScene(app);
-  app.selection.push_back(app.visuals[0].id); // exercise the gizmo overlay path
+  if (modelPaths.empty()) {
+    buildDemoScene(app);
+    app.selection.push_back(app.visuals[0].id); // exercise the gizmo overlay path
+  }
 
   VkRenderer renderer;
   VkRenderer::Config config;
@@ -433,6 +542,13 @@ int runSmokeOffscreen(char const* shaderDir) {
   if (!renderer.init(config)) {
     std::printf("SMOKE FAIL: renderer init\n");
     return 1;
+  }
+  if (!modelPaths.empty()) {
+    if (!loadModels(app, renderer, modelPaths)) {
+      std::printf("SMOKE FAIL: model loading\n");
+      return 1;
+    }
+    frameScene(app);
   }
 
   std::vector<DrawItem> items;
@@ -465,7 +581,9 @@ int runSmokeOffscreen(char const* shaderDir) {
   writePpm(".build/smoke.ppm", pixels, config.width, config.height);
   std::printf("SMOKE pixels: covered=%d reddish=%d (of %d) -> .build/smoke.ppm\n", covered,
               reddish, config.width * config.height);
-  if (covered < 2000 || reddish < 200) {
+  int minCovered = modelPaths.empty() ? 2000 : 100;
+  int minReddish = modelPaths.empty() ? 200 : 0;
+  if (covered < minCovered || reddish < minReddish) {
     std::printf("SMOKE FAIL: pixel assertions\n");
     return 1;
   }
@@ -474,9 +592,11 @@ int runSmokeOffscreen(char const* shaderDir) {
   return 0;
 }
 
-int runSmokeWindow(char const* shaderDir, int frames) {
+int runSmokeWindow(char const* shaderDir, int frames, std::vector<char const*> const& modelPaths) {
   App app;
-  buildDemoScene(app);
+  if (modelPaths.empty()) {
+    buildDemoScene(app);
+  }
   XcbWindow window;
   if (!openWindow(window, app.width, app.height, "vr-editor (smoke)")) {
     return 2;
@@ -493,6 +613,15 @@ int runSmokeWindow(char const* shaderDir, int frames) {
     renderer.shutdown(); // surface outlives the XCB connection
     closeWindow(window);
     return 1;
+  }
+  if (!modelPaths.empty()) {
+    if (!loadModels(app, renderer, modelPaths)) {
+      std::printf("SMOKE FAIL: model loading\n");
+      renderer.shutdown();
+      closeWindow(window);
+      return 1;
+    }
+    frameScene(app);
   }
   for (int frame = 0; frame < frames && app.running; ++frame) {
     xcb_generic_event_t* event = nullptr;
@@ -518,9 +647,11 @@ int runSmokeWindow(char const* shaderDir, int frames) {
   return 0;
 }
 
-int runInteractive(char const* shaderDir) {
+int runInteractive(char const* shaderDir, std::vector<char const*> const& modelPaths) {
   App app;
-  buildDemoScene(app);
+  if (modelPaths.empty()) {
+    buildDemoScene(app);
+  }
   XcbWindow window;
   if (!openWindow(window, app.width, app.height, "vr-editor")) {
     return 1;
@@ -537,6 +668,14 @@ int runInteractive(char const* shaderDir) {
     renderer.shutdown(); // surface outlives the XCB connection
     closeWindow(window);
     return 1;
+  }
+  if (!modelPaths.empty()) {
+    if (!loadModels(app, renderer, modelPaths)) {
+      renderer.shutdown();
+      closeWindow(window);
+      return 1;
+    }
+    frameScene(app);
   }
   std::printf(
       "vr-editor on %s\n"
@@ -571,23 +710,56 @@ int runInteractive(char const* shaderDir) {
 } // namespace
 
 int main(int argc, char** argv) {
+  enum class Mode { Interactive, SmokeOffscreen, SmokeWindow };
+  Mode mode = Mode::Interactive;
   char const* shaderDir = ".build/shaders";
+  int frames = 30;
+  std::vector<char const*> modelPaths;
+
   for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "--shaders") == 0 && i + 1 < argc) {
+    char const* arg = argv[i];
+    if (std::strcmp(arg, "--shaders") == 0 && i + 1 < argc) {
       shaderDir = argv[++i];
-    } else if (std::strcmp(argv[i], "--smoke-offscreen") == 0) {
-      return runSmokeOffscreen(shaderDir);
-    } else if (std::strcmp(argv[i], "--smoke-window") == 0) {
-      int frames = 30;
-      if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') {
-        frames = std::atoi(argv[++i]);
+    } else if (std::strcmp(arg, "--smoke-offscreen") == 0) {
+      mode = Mode::SmokeOffscreen;
+    } else if (std::strcmp(arg, "--smoke-window") == 0) {
+      mode = Mode::SmokeWindow;
+      if (i + 1 < argc) {
+        // Only consume the frame count when the next argument is all digits, so
+        // model files are never mistaken for it.
+        char const* next = argv[i + 1];
+        std::size_t length = std::strlen(next);
+        bool allDigits = length > 0U;
+        for (std::size_t c = 0; c < length; ++c) {
+          if (next[c] < '0' || next[c] > '9') {
+            allDigits = false;
+            break;
+          }
+        }
+        if (allDigits) {
+          frames = std::atoi(next);
+          ++i;
+        }
       }
-      return runSmokeWindow(shaderDir, frames);
-    } else if (std::strcmp(argv[i], "--help") == 0) {
+    } else if (std::strcmp(arg, "--help") == 0) {
       std::printf(
-          "usage: vr-editor [--shaders DIR] [--smoke-offscreen | --smoke-window [FRAMES]]\n");
+          "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR]\n"
+          "                [--smoke-offscreen | --smoke-window [FRAMES]]\n");
       return 0;
+    } else if (arg[0] == '-') {
+      std::printf("unknown option: %s\n", arg);
+      return 1;
+    } else {
+      modelPaths.push_back(arg);
     }
   }
-  return runInteractive(shaderDir);
+
+  switch (mode) {
+  case Mode::SmokeOffscreen:
+    return runSmokeOffscreen(shaderDir, modelPaths);
+  case Mode::SmokeWindow:
+    return runSmokeWindow(shaderDir, frames, modelPaths);
+  default:
+    return runInteractive(shaderDir, modelPaths);
+  }
 }

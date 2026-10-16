@@ -3,13 +3,20 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "camera.h"
 #include "gizmo.h"
+#include "gltf.h"
 #include "handles.h"
+#include "json.h"
+#include "mesh.h"
+#include "obj.h"
 #include "picking.h"
 #include "scene.h"
 #include "vecmath.h"
@@ -659,6 +666,293 @@ void testHandlePickingBehindCamera() {
   CHECK(pickHandle(shapes, {0.05F, 0.5F}, 0.1F) == GizmoHandle::AxisY);
 }
 
+void testJsonParser() {
+  JsonDocument doc;
+  std::string error;
+  CHECK(doc.parse(R"({"a": [1, 2.5, true, null, "x\n"], "b": {"c": "d"}, "e": "\u0041", "f": -1.5e2})",
+                  error));
+  JsonDocument::NodeId root = doc.root();
+  CHECK(doc.type(root) == JsonDocument::Type::Object);
+  CHECK(doc.size(root) == 4U);
+
+  JsonDocument::NodeId a = doc.member(root, "a");
+  CHECK(doc.type(a) == JsonDocument::Type::Array);
+  CHECK(doc.size(a) == 5U);
+  CHECK_NEAR(doc.asNumber(doc.element(a, 0)), 1.0, 1e-12);
+  CHECK_NEAR(doc.asNumber(doc.element(a, 1)), 2.5, 1e-12);
+  CHECK(doc.asBool(doc.element(a, 2)));
+  CHECK(doc.isNull(doc.element(a, 3)));
+  CHECK(doc.asString(doc.element(a, 4)) == "x\n");
+  CHECK(doc.asString(doc.member(doc.member(root, "b"), "c")) == "d");
+  CHECK(doc.asString(doc.member(root, "e")) == "A");
+  CHECK_NEAR(doc.asNumber(doc.member(root, "f")), -150.0, 1e-9);
+  CHECK(doc.member(root, "missing") == JsonDocument::kInvalid);
+
+  CHECK(!doc.parse("[1,]", error));       // trailing comma
+  CHECK(!doc.parse("{\"a\" 1}", error));  // missing colon
+  CHECK(!doc.parse("123 x", error));      // trailing garbage
+  CHECK(!doc.parse("\"unterminated", error));
+  CHECK(!doc.parse("", error));
+  CHECK(!doc.parse("tru", error));
+  std::string deep(300, '[');
+  deep += std::string(300, ']');
+  CHECK(!doc.parse(deep, error)); // nesting cap: clean error, no stack overflow
+  // Parser must remain usable after failure.
+  CHECK(doc.parse("[7]", error));
+  CHECK(doc.size(doc.root()) == 1U);
+}
+
+void testMeshBounds() {
+  MeshData mesh;
+  mesh.vertices.push_back({{-1.0F, 2.0F, -3.0F}, {}, {}});
+  mesh.vertices.push_back({{4.0F, -5.0F, 6.0F}, {}, {}});
+  Aabb box = meshBounds(mesh);
+  CHECK_NEAR3(box.min, {-1.0F, -5.0F, -3.0F});
+  CHECK_NEAR3(box.max, {4.0F, 2.0F, 6.0F});
+}
+
+namespace fixtures {
+
+void pushU32(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
+  std::uint8_t raw[4];
+  std::memcpy(raw, &value, 4);
+  bytes.insert(bytes.end(), raw, raw + 4);
+}
+
+std::vector<std::uint8_t> buildGlb(std::string const& json, std::vector<std::uint8_t> const& bin) {
+  std::vector<std::uint8_t> bytes;
+  std::string jsonPadded = json;
+  while (jsonPadded.size() % 4U != 0) {
+    jsonPadded.push_back(' ');
+  }
+  std::vector<std::uint8_t> binPadded = bin;
+  while (binPadded.size() % 4U != 0) {
+    binPadded.push_back(0);
+  }
+  std::uint32_t total =
+      12U + 8U + static_cast<std::uint32_t>(jsonPadded.size()) + 8U +
+      static_cast<std::uint32_t>(binPadded.size());
+  pushU32(bytes, 0x46546C67U);
+  pushU32(bytes, 2U);
+  pushU32(bytes, total);
+  pushU32(bytes, static_cast<std::uint32_t>(jsonPadded.size()));
+  pushU32(bytes, 0x4E4F534AU);
+  bytes.insert(bytes.end(), jsonPadded.begin(), jsonPadded.end());
+  pushU32(bytes, static_cast<std::uint32_t>(binPadded.size()));
+  pushU32(bytes, 0x004E4942U);
+  bytes.insert(bytes.end(), binPadded.begin(), binPadded.end());
+  return bytes;
+}
+
+bool writeFile(char const* path, std::vector<std::uint8_t> const& bytes) {
+  std::ofstream file(path, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+  file.write(reinterpret_cast<char const*>(bytes.data()),
+             static_cast<std::streamsize>(bytes.size()));
+  return static_cast<bool>(file);
+}
+
+std::string const kTriangleJson =
+    R"({"asset": {"version": "2.0"},)"
+    R"( "scenes": [{"nodes": [0]}], "scene": 0,)"
+    R"( "nodes": [{"name": "parent", "translation": [1, 2, 3], "children": [1]},)"
+    R"(             {"name": "child", "mesh": 0, "scale": [2, 2, 2]}],)"
+    R"( "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "material": 0}]}],)"
+    R"( "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [0.5, 0.25, 0.125, 1]}}],)"
+    R"( "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},)"
+    R"(                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}],)"
+    R"( "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36},)"
+    R"(                 {"buffer": 0, "byteOffset": 36, "byteLength": 6}],)"
+    R"( "buffers": [{"byteLength": 44}]})";
+
+std::vector<std::uint8_t> triangleBin(std::uint32_t lastVertexIndex) {
+  std::vector<std::uint8_t> bin;
+  float const positions[9] = {0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
+  std::uint8_t const* raw = reinterpret_cast<std::uint8_t const*>(positions);
+  bin.insert(bin.end(), raw, raw + 36);
+  std::uint16_t indices[3] = {0U, 1U, static_cast<std::uint16_t>(lastVertexIndex)};
+  std::uint8_t const* rawIndices = reinterpret_cast<std::uint8_t const*>(indices);
+  bin.insert(bin.end(), rawIndices, rawIndices + 6);
+  return bin;
+}
+
+} // namespace fixtures
+
+void testGlbLoader() {
+  using namespace fixtures;
+  Model model;
+  std::string error;
+
+  std::vector<std::uint8_t> bytes = buildGlb(kTriangleJson, triangleBin(2));
+  CHECK(loadGlb(bytes, model, error));
+
+  CHECK(model.meshes.size() == 1U);
+  CHECK_NEAR3(model.meshes[0].colour, {0.5F, 0.25F, 0.125F});
+  CHECK(model.meshes[0].data.vertices.size() == 3U);
+  CHECK(model.meshes[0].data.indices.size() == 3U);
+  CHECK(model.meshes[0].data.indices[2] == 2U);
+  CHECK_NEAR3(model.meshes[0].data.vertices[1].pos, {1.0F, 0.0F, 0.0F});
+  CHECK_NEAR3(model.meshes[0].data.vertices[0].normal, {0.0F, 0.0F, 1.0F}); // generated
+
+  CHECK(model.nodes.size() == 2U);
+  CHECK(model.nodes[0].name == "parent");
+  CHECK_NEAR3(model.nodes[0].local.translation, {1.0F, 2.0F, 3.0F});
+  CHECK(model.nodes[0].parent == -1);
+  CHECK(model.nodes[0].mesh == -1);
+  CHECK(model.nodes[1].name == "child");
+  CHECK(model.nodes[1].parent == 0);
+  CHECK(model.nodes[1].mesh == 0);
+  CHECK_NEAR3(model.nodes[1].local.scale, {2.0F, 2.0F, 2.0F});
+  CHECK(model.roots.size() == 1U);
+  CHECK(model.roots[0] == 0);
+
+  // Failure cases.
+  CHECK(!loadGlb({1, 2, 3}, model, error));                    // too small
+  CHECK(!loadGlb(buildGlb("not json", {}), model, error));     // bad JSON
+  CHECK(!loadGlb(buildGlb(kTriangleJson, triangleBin(9)), model, error)); // index out of range
+  std::vector<std::uint8_t> noMagic = buildGlb(kTriangleJson, triangleBin(2));
+  noMagic[0] = 0;
+  CHECK(!loadGlb(noMagic, model, error));
+
+  // End-to-end fixture for the renderer smoke run (best effort).
+  writeFile(".build/test-model.glb", buildGlb(kTriangleJson, triangleBin(2)));
+}
+
+void testGlbInterleavedAccessors() {
+  using namespace fixtures;
+  // One bufferView with byteStride 24: [pos(12) normal(12)] x3, then indices.
+  std::vector<std::uint8_t> bin;
+  for (int i = 0; i < 3; ++i) {
+    float pos[3] = {static_cast<float>(i), 0.0F, 0.0F};
+    float normal[3] = {0.0F, 0.0F, 1.0F};
+    std::uint8_t const* rawPos = reinterpret_cast<std::uint8_t const*>(pos);
+    std::uint8_t const* rawNormal = reinterpret_cast<std::uint8_t const*>(normal);
+    bin.insert(bin.end(), rawPos, rawPos + 12);
+    bin.insert(bin.end(), rawNormal, rawNormal + 12);
+  }
+  std::uint16_t indices[3] = {0U, 1U, 2U};
+  std::uint8_t const* rawIndices = reinterpret_cast<std::uint8_t const*>(indices);
+  bin.insert(bin.end(), rawIndices, rawIndices + 6);
+
+  std::string const json =
+      R"({"asset": {"version": "2.0"},)"
+      R"( "scenes": [{"nodes": [0]}], "scene": 0,)"
+      R"( "nodes": [{"name": "strip", "mesh": 0}],)"
+      R"( "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "indices": 2}]}],)"
+      R"( "accessors": [{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"},)"
+      R"(                {"bufferView": 0, "byteOffset": 12, "componentType": 5126, "count": 3, "type": "VEC3"},)"
+      R"(                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}],)"
+      R"( "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 72, "byteStride": 24},)"
+      R"(                 {"buffer": 0, "byteOffset": 72, "byteLength": 6}],)"
+      R"( "buffers": [{"byteLength": 80}]})";
+
+  Model model;
+  std::string error;
+  CHECK(loadGlb(buildGlb(json, bin), model, error));
+  CHECK(model.meshes.size() == 1U);
+  CHECK(model.meshes[0].data.vertices.size() == 3U);
+  CHECK_NEAR3(model.meshes[0].data.vertices[2].pos, {2.0F, 0.0F, 0.0F});
+  CHECK_NEAR3(model.meshes[0].data.vertices[1].normal, {0.0F, 0.0F, 1.0F}); // strided read
+}
+
+void testGlbSizeWrapRejected() {
+  using namespace fixtures;
+  Model model;
+  std::string error;
+
+  // 2^63 byteOffset + 2^63 byteLength wraps to 0 in unchecked size_t maths and
+  // would pass a naive bounds check; it must be rejected.
+  std::string const wrapBufferView =
+      R"({"asset": {"version": "2.0"}, "scenes": [{"nodes": []}], "scene": 0,)"
+      R"( "nodes": [], "meshes": [],)"
+      R"( "bufferViews": [{"buffer": 0, "byteOffset": 9223372036854775808, )"
+      R"("byteLength": 9223372036854775808}],)"
+      R"( "buffers": [{"byteLength": 4}]})";
+  CHECK(!loadGlb(buildGlb(wrapBufferView, {0, 0, 0, 0}), model, error));
+
+  // A hostile byteStride makes the classic (count-1)*stride+size span wrap to a
+  // small value; it must be rejected before any read.
+  std::string const wrapStride =
+      R"({"asset": {"version": "2.0"}, "scenes": [{"nodes": [0]}], "scene": 0,)"
+      R"( "nodes": [{"mesh": 0}], "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],)"
+      R"( "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"}],)"
+      R"( "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 12, )"
+      R"("byteStride": 9223372036854775808}],)"
+      R"( "buffers": [{"byteLength": 12}]})";
+  std::vector<std::uint8_t> bin(12, 0);
+  CHECK(!loadGlb(buildGlb(wrapStride, bin), model, error));
+
+  // Negative or fractional counts and indices are rejected as bad integers.
+  std::string const negativeCount =
+      R"({"asset": {"version": "2.0"}, "scenes": [{"nodes": [0]}], "scene": 0,)"
+      R"( "nodes": [{"mesh": 0}], "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],)"
+      R"( "accessors": [{"bufferView": 0, "componentType": 5126, "count": -1, "type": "VEC3"}],)"
+      R"( "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 12}],)"
+      R"( "buffers": [{"byteLength": 12}]})";
+  CHECK(!loadGlb(buildGlb(negativeCount, bin), model, error));
+}
+
+void testObjLoader() {
+  MtlColours materials;
+  CHECK(parseMtl("newmtl Red\nKd 1 0 0\nnewmtl Blue\nKd 0 0 1\n", materials));
+  CHECK(materials.size() == 2U);
+
+  std::string text =
+      "# comment\n"
+      "mtllib ignored.mtl\n"
+      "o First\n"
+      "usemtl Red\n"
+      "v 0 0 0\n"
+      "v 1 0 0\n"
+      "v 1 1 0\n"
+      "v 0 1 0\n"
+      "vn 0 0 1\n"
+      "f 1//1 2//1 3//1\n"
+      "f 1//1 3//1 4//1\n"
+      "usemtl Blue\n"
+      "f 1//1 4//1 2//1\n"
+      "o Second\n"
+      "v 2 0 0\n"
+      "v 3 0 0\n"
+      "v 3 1 0\n"
+      "f -3 -2 -1\n";
+
+  Model model;
+  std::string error;
+  CHECK(loadObj(text, materials, model, error));
+
+  CHECK(model.nodes.size() == 3U);  // First, material split, Second
+  CHECK(model.meshes.size() == 3U);
+  CHECK(model.nodes[0].name == "First");
+  CHECK(model.roots.size() == 3U);
+  CHECK_NEAR3(model.meshes[0].colour, {1.0F, 0.0F, 0.0F});
+  CHECK_NEAR3(model.meshes[1].colour, {0.0F, 0.0F, 1.0F});
+  CHECK(model.meshes[0].data.vertices.size() == 6U); // two triangles
+  CHECK(model.meshes[1].data.vertices.size() == 3U);
+  CHECK(model.meshes[2].data.vertices.size() == 3U);
+  CHECK_NEAR3(model.meshes[0].data.vertices[0].normal, {0.0F, 0.0F, 1.0F});
+  CHECK_NEAR3(model.meshes[1].data.vertices[0].normal, {0.0F, 0.0F, 1.0F}); // file normal
+  CHECK_NEAR3(model.meshes[2].data.vertices[0].pos, {2.0F, 0.0F, 0.0F});    // negative index
+  CHECK_NEAR3(model.meshes[2].data.vertices[0].normal, {0.0F, 0.0F, 1.0F}); // generated flat
+
+  CHECK(!loadObj("f 1 2 3\n", materials, model, error));           // no vertices
+  CHECK(!loadObj("v 0 0 0\nf 1 2 3\n", materials, model, error));  // out of range
+  CHECK(!loadObj("v x y z\n", materials, model, error));           // bad number
+  CHECK(!loadObj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1x 2 3\n", materials, model, error)); // strict tokens
+  CHECK(!loadObj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n", materials, model, error));  // 0 is invalid
+  CHECK(!loadObj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1//1 2//1 3//1\n", materials, model,
+                 error)); // no vn defined
+  CHECK(model.nodes.empty()); // failed loads leave a clean model
+  CHECK(loadObj("  v 0 0 0\n  v 1 0 0\n  v 0 1 0\n  f 1 2 3\n", materials, model, error));
+  CHECK(loadObj("v 0 0 0\nv 1 0 0\nv 0 1 0\nl 1 2\nf 1 2 3\n", materials, model, error));
+
+  // End-to-end fixture for the renderer smoke run (best effort).
+  std::vector<std::uint8_t> objBytes(text.begin(), text.end());
+  fixtures::writeFile(".build/test-model.obj", objBytes);
+}
+
 } // namespace
 
 int main() {
@@ -692,6 +986,12 @@ int main() {
   testSegmentAndPolygonPicking();
   testHandlePicking();
   testHandlePickingBehindCamera();
+  testJsonParser();
+  testMeshBounds();
+  testGlbLoader();
+  testGlbInterleavedAccessors();
+  testGlbSizeWrapRejected();
+  testObjLoader();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

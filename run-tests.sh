@@ -6,6 +6,7 @@ CXX_BIN="${CXX:-g++}"
 mkdir -p .build
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
   src/scene.cpp src/picking.cpp src/gizmo.cpp src/camera.cpp src/handles.cpp \
+  src/mesh.cpp src/json.cpp src/gltf.cpp src/obj.cpp \
   tests/test_core.cpp \
   -o .build/test-core
 exec ./.build/test-core

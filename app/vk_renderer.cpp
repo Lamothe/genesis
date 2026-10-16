@@ -65,6 +65,14 @@ static_assert(sizeof(PushData) == 96, "push constants must match the shader layo
 } // namespace
 
 struct VkRenderer::Impl {
+  struct MeshRecord {
+    VkBuffer vertexBuffer{VK_NULL_HANDLE};
+    VkDeviceMemory vertexMemory{VK_NULL_HANDLE};
+    VkBuffer indexBuffer{VK_NULL_HANDLE};
+    VkDeviceMemory indexMemory{VK_NULL_HANDLE};
+    std::uint32_t indexCount{0};
+  };
+
   bool windowed{false};
   std::uint32_t width{0};
   std::uint32_t height{0};
@@ -90,9 +98,6 @@ struct VkRenderer::Impl {
   VkPipeline lineDepthPipeline{VK_NULL_HANDLE};
   VkPipeline lineOverlayPipeline{VK_NULL_HANDLE};
 
-  VkBuffer cubeBuffer{VK_NULL_HANDLE};
-  VkDeviceMemory cubeMemory{VK_NULL_HANDLE};
-  void* cubeMapped{nullptr};
   VkBuffer lineBuffer{VK_NULL_HANDLE};
   VkDeviceMemory lineMemory{VK_NULL_HANDLE};
   void* lineMapped{nullptr};
@@ -115,6 +120,7 @@ struct VkRenderer::Impl {
   VkSwapchainKHR swapchain{VK_NULL_HANDLE};
   std::vector<VkImage> swapchainImages;
   std::vector<VkImageView> swapchainViews;
+  std::vector<MeshRecord> meshes; // 0 = built-in cube
   std::uint32_t swapchainIndex{0};
   VkSemaphore imageAvailable{VK_NULL_HANDLE};
   VkSemaphore renderFinished{VK_NULL_HANDLE};
@@ -147,16 +153,37 @@ struct VkRenderer::Impl {
     std::uint32_t memoryType = findMemoryType(requirements.memoryTypeBits, memFlags);
     if (memoryType == UINT32_MAX) {
       std::printf("[vk] no suitable memory type\n");
+      vkDestroyBuffer(device, buffer, nullptr);
+      buffer = VK_NULL_HANDLE;
       return false;
     }
     VkMemoryAllocateInfo allocInfo =
         vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
     allocInfo.allocationSize = requirements.size;
     allocInfo.memoryTypeIndex = memoryType;
-    VK_CHECK(vkAllocateMemory(device, &allocInfo, nullptr, &memory));
-    VK_CHECK(vkBindBufferMemory(device, buffer, memory, 0));
+    VkResult allocResult = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
+    if (allocResult != VK_SUCCESS) {
+      vkDestroyBuffer(device, buffer, nullptr);
+      buffer = VK_NULL_HANDLE;
+      return checkVk(allocResult, "vkAllocateMemory");
+    }
+    VkResult bindResult = vkBindBufferMemory(device, buffer, memory, 0);
+    if (bindResult != VK_SUCCESS) {
+      vkFreeMemory(device, memory, nullptr);
+      memory = VK_NULL_HANDLE;
+      vkDestroyBuffer(device, buffer, nullptr);
+      buffer = VK_NULL_HANDLE;
+      return checkVk(bindResult, "vkBindBufferMemory");
+    }
     if (mapped != nullptr) {
-      VK_CHECK(vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, mapped));
+      VkResult mapResult = vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, mapped);
+      if (mapResult != VK_SUCCESS) {
+        vkFreeMemory(device, memory, nullptr);
+        memory = VK_NULL_HANDLE;
+        vkDestroyBuffer(device, buffer, nullptr);
+        buffer = VK_NULL_HANDLE;
+        return checkVk(mapResult, "vkMapMemory");
+      }
     }
     return true;
   }
@@ -476,11 +503,14 @@ struct VkRenderer::Impl {
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
                             &descriptorSet, 0, nullptr);
 
-    // Meshes: one cube draw per item.
+    // Meshes: one indexed draw per item.
     vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline);
-    VkDeviceSize cubeOffset = 0;
-    vkCmdBindVertexBuffers(command, 0, 1, &cubeBuffer, &cubeOffset);
     for (DrawItem const& item : items) {
+      std::size_t handle = item.mesh < meshes.size() ? item.mesh : 0U;
+      MeshRecord const& record = meshes[handle];
+      VkDeviceSize zero = 0;
+      vkCmdBindVertexBuffers(command, 0, 1, &record.vertexBuffer, &zero);
+      vkCmdBindIndexBuffer(command, record.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
       PushData push{};
       std::memcpy(push.model, item.model.m, sizeof(float) * 16U);
       push.tint[0] = item.colour.x;
@@ -491,7 +521,7 @@ struct VkRenderer::Impl {
       vkCmdPushConstants(command, pipelineLayout,
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                          sizeof(PushData), &push);
-      vkCmdDraw(command, 36, 1, 0, 0);
+      vkCmdDrawIndexed(command, record.indexCount, 1, 0, 0, 0);
     }
 
     VkDeviceSize stride = sizeof(RendererVertex);
@@ -777,15 +807,18 @@ bool VkRenderer::init(Config const& config) {
   setAllocInfo.pSetLayouts = &g.setLayout;
   VK_CHECK(vkAllocateDescriptorSets(g.device, &setAllocInfo, &g.descriptorSet));
 
-  std::vector<RendererVertex> cubeVerts;
+  std::vector<MeshVertex> cubeVerts;
   appendCube(cubeVerts);
-  if (!g.createBuffer(sizeof(RendererVertex) * cubeVerts.size(),
-                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                      g.cubeBuffer, g.cubeMemory, &g.cubeMapped)) {
+  MeshData cubeMesh;
+  cubeMesh.vertices = cubeVerts;
+  cubeMesh.indices.resize(cubeVerts.size());
+  for (std::size_t i = 0; i < cubeMesh.indices.size(); ++i) {
+    cubeMesh.indices[i] = static_cast<std::uint32_t>(i);
+  }
+  if (addMesh(cubeMesh) != 0U || g.meshes.size() != 1U) {
+    std::printf("[vk] built-in cube must register as mesh 0\n");
     return false;
   }
-  std::memcpy(g.cubeMapped, cubeVerts.data(), sizeof(RendererVertex) * cubeVerts.size());
   if (!g.createBuffer(sizeof(RendererVertex) * kMaxLineVerts, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       g.lineBuffer, g.lineMemory, &g.lineMapped)) {
@@ -874,8 +907,22 @@ void VkRenderer::shutdown() {
   g.destroySwapchain();
   g.destroyImage2D(g.depthImage, g.depthMemory, g.depthView);
   g.destroyImage2D(g.colourImage, g.colourMemory, g.colourView);
-  for (auto [buffer, memory] : {std::pair<VkBuffer, VkDeviceMemory>{g.cubeBuffer, g.cubeMemory},
-                                std::pair<VkBuffer, VkDeviceMemory>{g.lineBuffer, g.lineMemory},
+  for (Impl::MeshRecord& record : g.meshes) {
+    if (record.vertexBuffer != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
+    }
+    if (record.vertexMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, record.vertexMemory, nullptr);
+    }
+    if (record.indexBuffer != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
+    }
+    if (record.indexMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, record.indexMemory, nullptr);
+    }
+  }
+  g.meshes.clear();
+  for (auto [buffer, memory] : {std::pair<VkBuffer, VkDeviceMemory>{g.lineBuffer, g.lineMemory},
                                 std::pair<VkBuffer, VkDeviceMemory>{g.uniformBuffer, g.uniformMemory},
                                 std::pair<VkBuffer, VkDeviceMemory>{g.readbackBuffer,
                                                                    g.readbackMemory}}) {
@@ -910,6 +957,51 @@ void VkRenderer::shutdown() {
   }
 }
 
+MeshHandle VkRenderer::addMesh(MeshData const& data) {
+  Impl& g = *impl_;
+  if (g.device == VK_NULL_HANDLE || data.vertices.empty() || data.indices.empty() ||
+      data.indices.size() > UINT32_MAX || data.vertices.size() > UINT32_MAX) {
+    return kInvalidMesh;
+  }
+  vkDeviceWaitIdle(g.device); // buffers may be rewritten between frames
+
+  Impl::MeshRecord record{};
+  void* vertexMapped = nullptr;
+  void* indexMapped = nullptr;
+  bool ok = g.createBuffer(sizeof(MeshVertex) * data.vertices.size(),
+                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                           record.vertexBuffer, record.vertexMemory, &vertexMapped);
+  if (ok) {
+    ok = g.createBuffer(sizeof(std::uint32_t) * data.indices.size(),
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        record.indexBuffer, record.indexMemory, &indexMapped);
+  }
+  if (!ok) {
+    // createBuffer cleans its own outputs; drop anything created here.
+    if (record.vertexBuffer != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
+    }
+    if (record.vertexMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, record.vertexMemory, nullptr);
+    }
+    if (record.indexBuffer != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
+    }
+    if (record.indexMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, record.indexMemory, nullptr);
+    }
+    return kInvalidMesh;
+  }
+
+  std::memcpy(vertexMapped, data.vertices.data(), sizeof(MeshVertex) * data.vertices.size());
+  std::memcpy(indexMapped, data.indices.data(), sizeof(std::uint32_t) * data.indices.size());
+  record.indexCount = static_cast<std::uint32_t>(data.indices.size());
+  g.meshes.push_back(record);
+  return static_cast<MeshHandle>(g.meshes.size() - 1U);
+}
+
 bool VkRenderer::resize(std::uint32_t width, std::uint32_t height) {
   Impl& g = *impl_;
   if (!g.windowed || width == 0U || height == 0U) {
@@ -934,6 +1026,10 @@ bool VkRenderer::draw(Camera const& camera,
                       std::vector<RendererVertex> const& depthLines,
                       std::vector<RendererVertex> const& overlayLines) {
   Impl& g = *impl_;
+  if (g.meshes.empty()) {
+    std::printf("[vk] no meshes registered\n");
+    return false;
+  }
   if (depthLines.size() + overlayLines.size() > kMaxLineVerts) {
     std::printf("[vk] line buffer overflow\n");
     return false;

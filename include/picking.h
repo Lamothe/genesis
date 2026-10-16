@@ -8,11 +8,6 @@
 
 namespace vredit {
 
-struct Aabb {
-  Vec3 min{};
-  Vec3 max{};
-};
-
 bool rayAabb(Ray const& ray, Aabb const& box, float& tOut);
 bool rayTriangle(Ray const& ray, Vec3 const& a, Vec3 const& b, Vec3 const& c, float& tOut);
 

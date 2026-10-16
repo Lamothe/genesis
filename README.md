@@ -7,7 +7,7 @@ have the neural renderer bolted on later through the seam contract
 
 ## Layout
 
-- `include/vecmath.h` — Vec2/Vec3/Quat/Mat4/Ray, TRS, affine inverse, decompose
+- `include/vecmath.h` — Vec2/Vec3/Quat/Mat4/Ray/Aabb, TRS, affine inverse, decompose
 - `include/scene.h`, `src/scene.cpp` — transform hierarchy, cached world
   matrices, `epoch()` discontinuity counter
 - `include/picking.h`, `src/picking.cpp` — ray/AABB, ray/triangle (Möller–
@@ -17,20 +17,28 @@ have the neural renderer bolted on later through the seam contract
 - `include/camera.h`, `src/camera.cpp` — orbit camera, screen→ray, pan/dolly
 - `include/handles.h`, `src/handles.cpp` — gizmo handle geometry (single source
   for drawing *and* hit testing) + screen-space pick resolution
+- `include/mesh.h`, `src/mesh.cpp` — vertex/mesh/model data types
+- `include/json.h`, `src/json.cpp` — strict JSON DOM (arena-based) for glTF
+- `include/gltf.h`, `src/gltf.cpp` — glTF 2.0 binary (`.glb`) loader
+- `include/obj.h`, `src/obj.cpp` — Wavefront OBJ + MTL (`Kd`) loader
 - `app/vk_renderer.*` — Vulkan 1.3 viewport renderer (dynamic rendering;
-  XCB/swapchain windowed mode, offscreen mode with RGBA8 readback)
+  XCB/swapchain windowed mode, offscreen mode with RGBA8 readback; registered
+  indexed meshes, built-in cube is mesh 0)
 - `app/geometry.*` — cube, floor grid, handle-line geometry
-- `app/editor_app.cpp` — XCB window, input, selection, gizmo wiring, smoke modes
+- `app/editor_app.cpp` — XCB window, input, selection, gizmo wiring, model
+  loading (`.glb`/`.obj` on the command line), smoke modes
 - `shaders/` — GLSL (compiled by `glslc` at launch)
-- `tests/test_core.cpp` — maths and behaviour tests
+- `tests/test_core.cpp` — maths, parser and behaviour tests
 
 ## Build and test
 
 ```sh
-bash vr/editor/run-tests.sh        # core tests (129 checks)
+bash vr/editor/run-tests.sh        # core tests (203 checks)
 bash vr/editor/run-editor.sh       # build + interactive editor
-bash vr/editor/run-editor.sh --smoke-offscreen   # render + pixel assertions
-bash vr/editor/run-editor.sh --smoke-window 30   # windowed present path
+bash vr/editor/run-editor.sh model.glb other.obj   # load models
+bash vr/editor/run-editor.sh --smoke-offscreen     # render + pixel assertions
+bash vr/editor/run-editor.sh --smoke-offscreen m.glb m.obj   # loader end-to-end
+bash vr/editor/run-editor.sh --smoke-window 30     # windowed present path
 ```
 
 `run-tests.sh` compiles with `g++ -std=c++20 -Wall -Wextra -Werror`;
@@ -60,7 +68,9 @@ G translate, R rotate, S scale, L world/local space, Ctrl snap, Esc quit.
 
 1. ~~Vulkan desktop shell~~ — done: windowed + offscreen renderer, camera,
    selection, gizmo handles and drag wiring (16/10/2026).
-2. glTF 2.0 (`.glb`) + OBJ loading in C++ (no converter scripts).
+2. ~~glTF 2.0 (`.glb`) + OBJ loading in C++~~ — done (17/10/2026): strict JSON
+   DOM, GLB container/accessor reader (strided/interleaved, normalised colours),
+   OBJ/MTL loader, registered indexed meshes, per-mesh bounds picking.
 3. WiVRn/OpenXR VR shell: stereo views through the same interface.
 4. Bind `neural_seam_evaluate` to the native evaluator when the migration
    stream's full native evaluation lands; conform the seam's convention table to

@@ -20,6 +20,11 @@ struct Ray {
   Vec3 direction{}; // expected normalised
 };
 
+struct Aabb {
+  Vec3 min{};
+  Vec3 max{};
+};
+
 inline constexpr Vec3 operator+(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 inline constexpr Vec3 operator-(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
 inline constexpr Vec3 operator-(Vec3 a) { return {-a.x, -a.y, -a.z}; }

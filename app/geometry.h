@@ -3,20 +3,19 @@
 #include <vector>
 
 #include "handles.h"
+#include "mesh.h"
 #include "vecmath.h"
 
 namespace vredit {
 
-// CPU-side geometry for the viewport: a unit cube (per-node draws), the floor
-// grid and axis lines, and gizmo handle lines with per-handle colours.
+// CPU-side geometry for the viewport: a unit cube (registered as mesh 0), the
+// floor grid and axis lines, gizmo handle lines, and per-item draws of
+// renderer-registered meshes.
 
-struct RendererVertex {
-  Vec3 pos;
-  Vec3 normal;
-  Vec3 colour;
-};
+using RendererVertex = MeshVertex; // single vertex format for the pipeline
 
 struct DrawItem {
+  MeshHandle mesh{0}; // renderer-registered mesh; 0 = built-in cube
   Mat4 model;
   Vec3 colour{1.0F, 1.0F, 1.0F};
   bool lit{true};
