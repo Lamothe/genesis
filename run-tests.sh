@@ -5,6 +5,7 @@ cd "$(dirname "$0")"
 CXX_BIN="${CXX:-g++}"
 mkdir -p .build
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
-  src/scene.cpp src/picking.cpp src/gizmo.cpp tests/test_core.cpp \
+  src/scene.cpp src/picking.cpp src/gizmo.cpp src/camera.cpp src/handles.cpp \
+  tests/test_core.cpp \
   -o .build/test-core
 exec ./.build/test-core

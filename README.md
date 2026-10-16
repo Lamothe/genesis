@@ -7,24 +7,40 @@ have the neural renderer bolted on later through the seam contract
 
 ## Layout
 
-- `include/vecmath.h` — Vec3/Quat/Mat4, TRS, affine inverse, decompose
+- `include/vecmath.h` — Vec2/Vec3/Quat/Mat4/Ray, TRS, affine inverse, decompose
 - `include/scene.h`, `src/scene.cpp` — transform hierarchy, cached world
   matrices, `epoch()` discontinuity counter
 - `include/picking.h`, `src/picking.cpp` — ray/AABB, ray/triangle (Möller–
   Trumbore), closest-hit selection
 - `include/gizmo.h`, `src/gizmo.cpp` — translate/rotate/scale drags, world/local
   space, axis/plane/free handles, snapping, drift-free cumulative application
+- `include/camera.h`, `src/camera.cpp` — orbit camera, screen→ray, pan/dolly
+- `include/handles.h`, `src/handles.cpp` — gizmo handle geometry (single source
+  for drawing *and* hit testing) + screen-space pick resolution
+- `app/vk_renderer.*` — Vulkan 1.3 viewport renderer (dynamic rendering;
+  XCB/swapchain windowed mode, offscreen mode with RGBA8 readback)
+- `app/geometry.*` — cube, floor grid, handle-line geometry
+- `app/editor_app.cpp` — XCB window, input, selection, gizmo wiring, smoke modes
+- `shaders/` — GLSL (compiled by `glslc` at launch)
 - `tests/test_core.cpp` — maths and behaviour tests
 
 ## Build and test
 
 ```sh
-bash vr/editor/run-tests.sh
+bash vr/editor/run-tests.sh        # core tests (129 checks)
+bash vr/editor/run-editor.sh       # build + interactive editor
+bash vr/editor/run-editor.sh --smoke-offscreen   # render + pixel assertions
+bash vr/editor/run-editor.sh --smoke-window 30   # windowed present path
 ```
 
-Compiles with `g++ -std=c++20 -Wall -Wextra -Werror` and runs the test binary.
-Thin shell launcher only: **all project logic is typed C/C++ (project rule — no
-Python)**.
+`run-tests.sh` compiles with `g++ -std=c++20 -Wall -Wextra -Werror`;
+`run-editor.sh` compiles the shell and shaders and runs it. Thin shell launchers
+only: **all project logic is typed C/C++ (project rule — no Python)**.
+
+## Controls
+
+LMB select / drag gizmo, RMB orbit, MMB or Shift+RMB pan, wheel zoom.
+G translate, R rotate, S scale, L world/local space, Ctrl snap, Esc quit.
 
 ## Design notes
 
@@ -42,8 +58,8 @@ Python)**.
 
 ## Roadmap
 
-1. Vulkan desktop shell (single stack; matches the native CUDA evaluator) —
-   viewport, camera, handle drawing, mesh picking.
+1. ~~Vulkan desktop shell~~ — done: windowed + offscreen renderer, camera,
+   selection, gizmo handles and drag wiring (16/10/2026).
 2. glTF 2.0 (`.glb`) + OBJ loading in C++ (no converter scripts).
 3. WiVRn/OpenXR VR shell: stereo views through the same interface.
 4. Bind `neural_seam_evaluate` to the native evaluator when the migration

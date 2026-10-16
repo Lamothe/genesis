@@ -3,10 +3,13 @@
 
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <optional>
 #include <vector>
 
+#include "camera.h"
 #include "gizmo.h"
+#include "handles.h"
 #include "picking.h"
 #include "scene.h"
 #include "vecmath.h"
@@ -556,6 +559,106 @@ void testEpochStructuralChanges() {
   CHECK(scene.epoch() == e3 + 2U);
 }
 
+void testCameraFraming() {
+  Camera camera;
+  camera.target = {0.0F, 0.0F, 0.0F};
+  camera.yaw = 0.0F;
+  camera.pitch = 0.0F;
+  camera.distance = 5.0F;
+
+  CHECK_NEAR3(cameraPosition(camera), {0.0F, 0.0F, 5.0F});
+  CHECK_NEAR3(cameraForward(camera), {0.0F, 0.0F, -1.0F});
+  CHECK_NEAR3(transformPoint(cameraView(camera), camera.target), {0.0F, 0.0F, -5.0F});
+
+  Vec2 viewport{800.0F, 600.0F};
+  float aspect = viewport.x / viewport.y;
+  Ray centre = cameraRay(camera, aspect, {400.0F, 300.0F}, viewport);
+  CHECK_NEAR3(centre.origin, {0.0F, 0.0F, 5.0F});
+  CHECK_NEAR3(centre.direction, {0.0F, 0.0F, -1.0F});
+
+  Ray right = cameraRay(camera, aspect, {600.0F, 300.0F}, viewport);
+  CHECK(right.direction.x > 0.0F);
+  Ray below = cameraRay(camera, aspect, {400.0F, 450.0F}, viewport);
+  CHECK(below.direction.y < 0.0F); // pixel Y grows downward
+  Ray above = cameraRay(camera, aspect, {400.0F, 150.0F}, viewport);
+  CHECK(above.direction.y > 0.0F);
+
+  // At the right edge the ray's x/-z ratio is (aspect / (1/tan(fovY/2))).
+  Ray edge = cameraRay(camera, aspect, {800.0F, 300.0F}, viewport);
+  CHECK_NEAR(edge.direction.x / -edge.direction.z, 0.7283687F, 1e-4F);
+}
+
+void testCameraManipulation() {
+  Camera camera;
+  camera.target = {0.0F, 0.0F, 0.0F};
+  camera.yaw = 0.0F;
+  camera.pitch = 0.0F;
+  camera.distance = 5.0F;
+
+  cameraOrbit(camera, kHalfPi, 0.0F);
+  CHECK_NEAR3(cameraPosition(camera), {5.0F, 0.0F, 0.0F});
+
+  cameraOrbit(camera, -kHalfPi, 0.0F);
+  float before = camera.distance;
+  cameraDolly(camera, 1.0F);
+  CHECK(camera.distance < before);
+  CHECK(camera.distance > 4.0F);
+
+  cameraPan(camera, 10.0F, 0.0F, 600.0F);
+  // Dragging right moves the world right: the target moves left along +X.
+  CHECK(camera.target.x < 0.0F);
+  CHECK_NEAR(camera.target.y, 0.0F, 1e-6F);
+}
+
+void testSegmentAndPolygonPicking() {
+  CHECK_NEAR(pointSegmentDistance({0.0F, 1.0F}, {0.0F, 0.0F}, {1.0F, 0.0F}), 1.0F, 1e-5F);
+  CHECK_NEAR(pointSegmentDistance({0.5F, 1.0F}, {0.0F, 0.0F}, {1.0F, 0.0F}), 1.0F, 1e-5F);
+  CHECK_NEAR(pointSegmentDistance({2.0F, 0.0F}, {0.0F, 0.0F}, {1.0F, 0.0F}), 1.0F, 1e-5F);
+
+  std::vector<Vec2> square{{0.0F, 0.0F}, {1.0F, 0.0F}, {1.0F, 1.0F}, {0.0F, 1.0F}};
+  CHECK(pointInPolygon(square, {0.5F, 0.5F}));
+  CHECK(!pointInPolygon(square, {1.5F, 0.5F}));
+  CHECK(!pointInPolygon(square, {0.5F, 1.5F}));
+}
+
+void testHandlePicking() {
+  ProjectFn project = [](Vec3 const& p) { return Vec2{p.x, p.y}; };
+
+  auto shapes = buildHandleShapes(GizmoMode::Translate, {0.0F, 0.0F, 0.0F}, Quat{}, 1.0F,
+                                  project);
+  CHECK(pickHandle(shapes, {0.5F, 0.05F}, 0.1F) == GizmoHandle::AxisX);
+  CHECK(pickHandle(shapes, {0.05F, 0.5F}, 0.1F) == GizmoHandle::AxisY);
+  // Plane quad band lives between 0.25 and 0.45 along each axis.
+  CHECK(pickHandle(shapes, {0.35F, 0.35F}, 0.1F) == GizmoHandle::PlaneXY);
+  CHECK(!pickHandle(shapes, {2.0F, 2.0F}, 0.1F).has_value());
+
+  // Rotate: the Z ring lies in the XY plane; pick a point on the ring away
+  // from the other rings' projections.
+  auto rings = buildHandleShapes(GizmoMode::Rotate, {0.0F, 0.0F, 0.0F}, Quat{}, 1.0F, project);
+  float onRing = 0.8F * 0.70710678F;
+  CHECK(pickHandle(rings, {onRing, onRing}, 0.1F) == GizmoHandle::AxisZ);
+
+  // Scale: axis lines carry the pick near the tips.
+  auto scaled = buildHandleShapes(GizmoMode::Scale, {0.0F, 0.0F, 0.0F}, Quat{}, 1.0F, project);
+  CHECK(pickHandle(scaled, {1.0F, 0.02F}, 0.1F) == GizmoHandle::AxisX);
+}
+
+void testHandlePickingBehindCamera() {
+  // A projector that rejects points "behind the camera" (NaN): the X axis is
+  // unpickable, the Y axis still works.
+  ProjectFn projectBehind = [](Vec3 const& p) {
+    if (p.x > 0.9F) {
+      float nan = std::numeric_limits<float>::quiet_NaN();
+      return Vec2{nan, nan};
+    }
+    return Vec2{p.x, p.y};
+  };
+  auto shapes =
+      buildHandleShapes(GizmoMode::Translate, {0.0F, 0.0F, 0.0F}, Quat{}, 1.0F, projectBehind);
+  CHECK(!pickHandle(shapes, {0.5F, 0.05F}, 0.1F).has_value());
+  CHECK(pickHandle(shapes, {0.05F, 0.5F}, 0.1F) == GizmoHandle::AxisY);
+}
+
 } // namespace
 
 int main() {
@@ -584,6 +687,11 @@ int main() {
   testGizmoBeginFailureClean();
   testGizmoPlaneHandle();
   testEpochStructuralChanges();
+  testCameraFraming();
+  testCameraManipulation();
+  testSegmentAndPolygonPicking();
+  testHandlePicking();
+  testHandlePickingBehindCamera();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

@@ -8,11 +8,6 @@
 
 namespace vredit {
 
-struct Ray {
-  Vec3 origin{};
-  Vec3 direction{}; // expected normalised
-};
-
 struct Aabb {
   Vec3 min{};
   Vec3 max{};

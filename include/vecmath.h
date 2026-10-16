@@ -10,6 +10,16 @@ struct Vec3 {
   float z{0.0F};
 };
 
+struct Vec2 {
+  float x{0.0F};
+  float y{0.0F};
+};
+
+struct Ray {
+  Vec3 origin{};
+  Vec3 direction{}; // expected normalised
+};
+
 inline constexpr Vec3 operator+(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 inline constexpr Vec3 operator-(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
 inline constexpr Vec3 operator-(Vec3 a) { return {-a.x, -a.y, -a.z}; }
