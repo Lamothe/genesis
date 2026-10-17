@@ -1237,6 +1237,51 @@ void testObjLoader() {
 
 } // namespace
 
+void testUpscaleToPot() {
+  // NPOT images upscale to power-of-two (the Vulkan NPOT-upload workaround);
+  // POT images pass through with identical dimensions.
+  Image solid;
+  solid.width = 3;
+  solid.height = 5;
+  solid.rgba.assign(3U * 5U * 4U, 200U);
+  Image up = upscaleToPot(solid);
+  CHECK(up.width == 4U && up.height == 8U);
+  CHECK(up.rgba.size() == 4U * 8U * 4U);
+  CHECK(up.rgba[0] == 200U && up.rgba.back() == 200U); // solid stays solid
+
+  // A real bilinear check: 0..255 across 2 texels upscales to 4 with the
+  // interpolated middle values.
+  Image edge;
+  edge.width = 2;
+  edge.height = 1;
+  edge.rgba = {0U, 0U, 0U, 255U, 255U, 255U, 255U, 255U};
+  Image upEdge = upscaleToPot(edge); // 2x1 is POT width/POT height after h->1... 2x1 IS POT
+  CHECK(upEdge.width == 2U && upEdge.height == 1U);
+  Image ramp;
+  ramp.width = 2;
+  ramp.height = 2;
+  ramp.rgba = {0U, 0U, 0U, 255U, 255U, 255U, 255U, 255U,
+               0U, 0U, 0U, 255U, 255U, 255U, 255U, 255U};
+  Image upRamp = upscaleToPot(ramp); // 2x2 is POT: no-op passthrough
+  CHECK(upRamp.width == 2U && upRamp.height == 2U);
+  CHECK(upRamp.rgba == ramp.rgba);
+
+  // Non-trivial bilinear output: a 3x1 edge (3 is NPOT -> 4 wide) with
+  // values 0, 255, 255 interpolates at the boundary.
+  Image line;
+  line.width = 3;
+  line.height = 1;
+  line.rgba = {0U, 0U, 0U, 255U, 255U, 255U, 255U, 255U, 255U, 255U, 255U, 255U};
+  Image upLine = upscaleToPot(line);
+  CHECK(upLine.width == 4U && upLine.height == 1U);
+  CHECK(upLine.rgba[0] == 0U);   // left edge clamps to the first texel
+  CHECK(upLine.rgba[12] == 255U); // right edge clamps to the last
+  CHECK(upLine.rgba[4] > 0U && upLine.rgba[4] < 255U); // interior interpolates
+
+  Image empty;
+  CHECK(upscaleToPot(empty).rgba.empty());
+}
+
 void testMipChain() {
   // 4x4 checkerboard: the first derived level averages each 2x2 block, then
   // the mean. Level 0 (the base) is not part of the output.
@@ -1264,24 +1309,36 @@ void testMipChain() {
   CHECK(levels[1].rgba[0] == 128U);
   CHECK(levels[1].rgba[3] == 255U); // alpha is preserved
 
-  // Odd dimensions ceil-divide and never over-read.
+  // Odd dimensions floor-divide (Vulkan mip extents) and never over-read. The
+  // chain also respects the Vulkan level cap (floor(log2(max))+1 total):
+  // 3x5 -> 1x2 -> 1x1 only.
   Image odd;
   odd.width = 3;
   odd.height = 5;
   odd.rgba.assign(3U * 5U * 4U, 200U);
   auto oddLevels = buildMipLevels(odd);
-  CHECK(oddLevels.size() == 3U); // 2x3 -> 1x2 -> 1x1 below the 3x5 base
-  CHECK(oddLevels[0].width == 2 && oddLevels[0].height == 3);
+  CHECK(oddLevels.size() == 2U); // 1x2 -> 1x1 below the 3x5 base
+  CHECK(oddLevels[0].width == 1 && oddLevels[0].height == 2);
   CHECK(oddLevels[0].rgba[0] == 200U);
-  CHECK(oddLevels[2].width == 1 && oddLevels[2].height == 1);
+  CHECK(oddLevels[1].width == 1 && oddLevels[1].height == 1);
 
-  // Degenerate inputs yield nothing; a 1x1 base has one derived level (1x1).
+  // Non-power-of-two sizes stop under the Vulkan level cap (this is the
+  // 12288^2 case in miniature).
+  Image oddSquare;
+  oddSquare.width = 9;
+  oddSquare.height = 9;
+  oddSquare.rgba.assign(9U * 9U * 4U, 100U);
+  auto cappedLevels = buildMipLevels(oddSquare);
+  CHECK(cappedLevels.size() == 3U); // 4x4 -> 2x2 -> 1x1 below the 9x9 base
+  CHECK(cappedLevels[0].width == 4 && cappedLevels[0].height == 4);
+  CHECK(cappedLevels[2].width == 1 && cappedLevels[2].height == 1);
+
+  // Degenerate inputs yield nothing.
   Image one;
   one.width = 1;
   one.height = 1;
   one.rgba = {1U, 2U, 3U, 4U};
-  auto oneLevels = buildMipLevels(one);
-  CHECK(oneLevels.size() == 1U && oneLevels[0].width == 1 && oneLevels[0].height == 1);
+  CHECK(buildMipLevels(one).empty()); // the level cap allows no derived levels
   CHECK(buildMipLevels(Image{}).empty());
 }
 
@@ -1432,6 +1489,7 @@ int main() {
   testCameraFraming();
   testCameraManipulation();
   testXrMath();
+  testUpscaleToPot();
   testMipChain();
   testSegmentAndPolygonPicking();
   testHandlePicking();

@@ -881,12 +881,14 @@ bool decodeImage(std::uint8_t const* bytes, std::size_t size, Image& out, std::s
 
 namespace {
 
-// One halving box-filter step; odd sizes ceil-divide and edge texels that fall
-// outside contribute nothing (their weight is dropped).
+// One halving box-filter step. Vulkan sizes mip level i as max(1, floor(dim /
+// 2^i)) — floor-divide, never ceil (an over-tall level would make the copy
+// write past the level's extent). Edge texels that fall outside contribute
+// nothing (their weight is dropped).
 Image downsample(Image const& src) {
   Image dst;
-  dst.width = (src.width + 1U) / 2U;
-  dst.height = (src.height + 1U) / 2U;
+  dst.width = std::max(1U, src.width / 2U);
+  dst.height = std::max(1U, src.height / 2U);
   if (dst.width == 0U || dst.height == 0U) {
     return dst;
   }
@@ -921,17 +923,80 @@ Image downsample(Image const& src) {
 
 } // namespace
 
+Image upscaleToPot(Image const& base) {
+  if (base.width == 0U || base.height == 0U || base.rgba.empty()) {
+    return base;
+  }
+  std::uint32_t potWidth = 1U;
+  std::uint32_t potHeight = 1U;
+  while (potWidth < base.width) {
+    potWidth <<= 1U;
+  }
+  while (potHeight < base.height) {
+    potHeight <<= 1U;
+  }
+  if (potWidth == base.width && potHeight == base.height) {
+    return base;
+  }
+  Image out;
+  out.width = potWidth;
+  out.height = potHeight;
+  out.rgba.assign(static_cast<std::size_t>(potWidth) * potHeight * 4U, 0U);
+  for (std::uint32_t y = 0; y < potHeight; ++y) {
+    float const sy = (static_cast<float>(y) + 0.5F) * static_cast<float>(base.height) /
+                         static_cast<float>(potHeight) -
+                     0.5F;
+    float const fy = std::fmin(std::fmax(sy, 0.0F), static_cast<float>(base.height - 1U));
+    std::uint32_t const y0 = std::min(static_cast<std::uint32_t>(fy), base.height - 1U);
+    std::uint32_t const y1 = std::min(y0 + 1U, base.height - 1U);
+    float const wy = fy - static_cast<float>(y0);
+    for (std::uint32_t x = 0; x < potWidth; ++x) {
+      float const sx = (static_cast<float>(x) + 0.5F) * static_cast<float>(base.width) /
+                           static_cast<float>(potWidth) -
+                       0.5F;
+      float const fx = std::fmin(std::fmax(sx, 0.0F), static_cast<float>(base.width - 1U));
+      std::uint32_t const x0 = std::min(static_cast<std::uint32_t>(fx), base.width - 1U);
+      std::uint32_t const x1 = std::min(x0 + 1U, base.width - 1U);
+      float const wx = fx - static_cast<float>(x0);
+      std::size_t const p00 = (static_cast<std::size_t>(y0) * base.width + x0) * 4U;
+      std::size_t const p10 = (static_cast<std::size_t>(y0) * base.width + x1) * 4U;
+      std::size_t const p01 = (static_cast<std::size_t>(y1) * base.width + x0) * 4U;
+      std::size_t const p11 = (static_cast<std::size_t>(y1) * base.width + x1) * 4U;
+      std::size_t const dst = (static_cast<std::size_t>(y) * potWidth + x) * 4U;
+      for (std::size_t c = 0; c < 4U; ++c) {
+        float const top = static_cast<float>(base.rgba[p00 + c]) * (1.0F - wx) +
+                          static_cast<float>(base.rgba[p10 + c]) * wx;
+        float const bottom = static_cast<float>(base.rgba[p01 + c]) * (1.0F - wx) +
+                             static_cast<float>(base.rgba[p11 + c]) * wx;
+        float const value = top * (1.0F - wy) + bottom * wy;
+        out.rgba[dst + c] = static_cast<std::uint8_t>(std::fmin(std::fmax(value + 0.5F, 0.0F), 255.0F));
+      }
+    }
+  }
+  return out;
+}
+
 std::vector<Image> buildMipLevels(Image const& base) {
   std::vector<Image> levels;
   if (base.width == 0U || base.height == 0U || base.rgba.empty()) {
     return levels;
   }
+  // Vulkan caps the chain at floor(log2(max(w, h))) + 1 levels TOTAL
+  // (VUID-VkImageCreateInfo-mipLevels-00958): non-power-of-two sizes stop
+  // before their level count would exceed it, e.g. 12288^2 gets 14 levels.
+  // An over-long chain makes the copies write past the image and kills the
+  // device.
+  std::uint32_t maxSide = std::max(base.width, base.height);
+  std::size_t maxDerived = 0;
+  while ((1U << (maxDerived + 1U)) <= maxSide) {
+    ++maxDerived;
+  }
   Image current = downsample(base);
   while (current.width > 0U && current.height > 0U) {
-    levels.push_back(std::move(current));
-    if (levels.back().width == 1U && levels.back().height == 1U) {
+    if (levels.size() >= maxDerived) {
       break;
     }
+    levels.push_back(std::move(current));
     current = downsample(levels.back());
   }
   return levels;

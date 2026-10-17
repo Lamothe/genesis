@@ -152,6 +152,50 @@ struct VkRenderer::Impl {
     return UINT32_MAX;
   }
 
+  // Memory queries honour VkMemoryDedicatedRequirements: large resources may
+  // require or prefer a dedicated allocation, and ignoring that lands the
+  // driver's suballocator in placement states where huge transfers fault the
+  // channel (observed: a 12288^2 texture upload lost the device whenever
+  // other buffers had been allocated first).
+  struct Requirements {
+    VkMemoryRequirements memory{};
+    bool dedicated{false};
+  };
+
+  Requirements bufferRequirements(VkBuffer buffer) {
+    Requirements out{};
+    VkBufferMemoryRequirementsInfo2 info = vkStruct<VkBufferMemoryRequirementsInfo2>(
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2);
+    info.buffer = buffer;
+    VkMemoryDedicatedRequirements dedicated = vkStruct<VkMemoryDedicatedRequirements>(
+        VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS);
+    VkMemoryRequirements2 chain =
+        vkStruct<VkMemoryRequirements2>(VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2);
+    chain.pNext = &dedicated;
+    vkGetBufferMemoryRequirements2(device, &info, &chain);
+    out.memory = chain.memoryRequirements;
+    out.dedicated = dedicated.prefersDedicatedAllocation == VK_TRUE ||
+                    dedicated.requiresDedicatedAllocation == VK_TRUE;
+    return out;
+  }
+
+  Requirements imageRequirements(VkImage image) {
+    Requirements out{};
+    VkImageMemoryRequirementsInfo2 info = vkStruct<VkImageMemoryRequirementsInfo2>(
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2);
+    info.image = image;
+    VkMemoryDedicatedRequirements dedicated = vkStruct<VkMemoryDedicatedRequirements>(
+        VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS);
+    VkMemoryRequirements2 chain =
+        vkStruct<VkMemoryRequirements2>(VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2);
+    chain.pNext = &dedicated;
+    vkGetImageMemoryRequirements2(device, &info, &chain);
+    out.memory = chain.memoryRequirements;
+    out.dedicated = dedicated.prefersDedicatedAllocation == VK_TRUE ||
+                    dedicated.requiresDedicatedAllocation == VK_TRUE;
+    return out;
+  }
+
   bool createBuffer(VkDeviceSize size,
                     VkBufferUsageFlags usage,
                     VkMemoryPropertyFlags memFlags,
@@ -163,8 +207,8 @@ struct VkRenderer::Impl {
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VK_CHECK(vkCreateBuffer(device, &bufferInfo, nullptr, &buffer));
-    VkMemoryRequirements requirements{};
-    vkGetBufferMemoryRequirements(device, buffer, &requirements);
+    Requirements reqs = bufferRequirements(buffer);
+    VkMemoryRequirements requirements = reqs.memory;
     std::uint32_t memoryType = findMemoryType(requirements.memoryTypeBits, memFlags);
     if (memoryType == UINT32_MAX) {
       std::printf("[vk] no suitable memory type\n");
@@ -172,10 +216,17 @@ struct VkRenderer::Impl {
       buffer = VK_NULL_HANDLE;
       return false;
     }
+    VkMemoryDedicatedAllocateInfo dedicatedInfo =
+        vkStruct<VkMemoryDedicatedAllocateInfo>(
+            VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+    dedicatedInfo.buffer = buffer;
     VkMemoryAllocateInfo allocInfo =
         vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
     allocInfo.allocationSize = requirements.size;
     allocInfo.memoryTypeIndex = memoryType;
+    if (reqs.dedicated || requirements.size >= (64ULL << 20)) {
+      allocInfo.pNext = &dedicatedInfo; // big resources never share a slab
+    }
     VkResult allocResult = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
     if (allocResult != VK_SUCCESS) {
       vkDestroyBuffer(device, buffer, nullptr);
@@ -1096,20 +1147,37 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
   vkDeviceWaitIdle(g.device); // buffers may be rewritten between frames
 
   Impl::MeshRecord record{};
-  void* vertexMapped = nullptr;
-  void* indexMapped = nullptr;
-  bool ok = g.createBuffer(sizeof(MeshVertex) * data.vertices.size(),
-                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+  VkDeviceSize vertexBytes = sizeof(MeshVertex) * data.vertices.size();
+  VkDeviceSize indexBytes = sizeof(std::uint32_t) * data.indices.size();
+
+  // Vertex and index data lives in DEVICE_LOCAL memory (the standard layout,
+  // and faster for draws). A side effect matters here too: persistent
+  // HOST_VISIBLE mesh buffers trigger a driver bug where a later NPOT texture
+  // upload (e.g. 12288^2) faults the graphics channel.
+  VkBuffer stagingBuffer = VK_NULL_HANDLE;
+  VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+  void* stagingMapped = nullptr;
+  bool ok = g.createBuffer(vertexBytes + indexBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                           record.vertexBuffer, record.vertexMemory, &vertexMapped);
+                           stagingBuffer, stagingMemory, &stagingMapped);
   if (ok) {
-    ok = g.createBuffer(sizeof(std::uint32_t) * data.indices.size(),
-                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                        record.indexBuffer, record.indexMemory, &indexMapped);
+    ok = g.createBuffer(vertexBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, record.vertexBuffer,
+                        record.vertexMemory, nullptr);
+  }
+  if (ok) {
+    ok = g.createBuffer(indexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, record.indexBuffer,
+                        record.indexMemory, nullptr);
   }
   if (!ok) {
     // createBuffer cleans its own outputs; drop anything created here.
+    if (stagingBuffer != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, stagingBuffer, nullptr);
+    }
+    if (stagingMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, stagingMemory, nullptr);
+    }
     if (record.vertexBuffer != VK_NULL_HANDLE) {
       vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
     }
@@ -1125,8 +1193,68 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
     return kInvalidMesh;
   }
 
-  std::memcpy(vertexMapped, data.vertices.data(), sizeof(MeshVertex) * data.vertices.size());
-  std::memcpy(indexMapped, data.indices.data(), sizeof(std::uint32_t) * data.indices.size());
+  auto* stagingBytes = static_cast<std::uint8_t*>(stagingMapped);
+  std::memcpy(stagingBytes, data.vertices.data(), static_cast<std::size_t>(vertexBytes));
+  std::memcpy(stagingBytes + vertexBytes, data.indices.data(), static_cast<std::size_t>(indexBytes));
+
+  VkCommandBufferBeginInfo beginInfo =
+      vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
+  beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  VkBufferCopy vertexCopy{0, 0, vertexBytes};
+  VkBufferCopy indexCopy{vertexBytes, 0, indexBytes};
+  if (vkBeginCommandBuffer(g.command, &beginInfo) != VK_SUCCESS) {
+    std::printf("[vk] mesh upload begin failed\n");
+    vkDestroyBuffer(g.device, stagingBuffer, nullptr);
+    vkFreeMemory(g.device, stagingMemory, nullptr);
+    vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
+    vkFreeMemory(g.device, record.vertexMemory, nullptr);
+    vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
+    vkFreeMemory(g.device, record.indexMemory, nullptr);
+    return kInvalidMesh;
+  }
+  vkCmdCopyBuffer(g.command, stagingBuffer, record.vertexBuffer, 1, &vertexCopy);
+  vkCmdCopyBuffer(g.command, stagingBuffer, record.indexBuffer, 1, &indexCopy);
+  // Transfer writes must be made visible to later vertex/index reads — a wait
+  // alone only orders execution, it does not flush the writes.
+  VkMemoryBarrier2 toVertex =
+      vkStruct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+  toVertex.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+  toVertex.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+  toVertex.dstStageMask =
+      VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
+  toVertex.dstAccessMask =
+      VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
+  VkDependencyInfo dependency = vkStruct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+  dependency.memoryBarrierCount = 1;
+  dependency.pMemoryBarriers = &toVertex;
+  vkCmdPipelineBarrier2(g.command, &dependency);
+  if (vkEndCommandBuffer(g.command) != VK_SUCCESS) {
+    std::printf("[vk] mesh upload end failed\n");
+    vkDestroyBuffer(g.device, stagingBuffer, nullptr);
+    vkFreeMemory(g.device, stagingMemory, nullptr);
+    vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
+    vkFreeMemory(g.device, record.vertexMemory, nullptr);
+    vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
+    vkFreeMemory(g.device, record.indexMemory, nullptr);
+    return kInvalidMesh;
+  }
+  VkSubmitInfo submitInfo = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
+  submitInfo.commandBufferCount = 1;
+  submitInfo.pCommandBuffers = &g.command;
+  VkResult submitResult = vkQueueSubmit(g.queue, 1, &submitInfo, VK_NULL_HANDLE);
+  VkResult waitResult = vkQueueWaitIdle(g.queue);
+  vkDestroyBuffer(g.device, stagingBuffer, nullptr);
+  vkFreeMemory(g.device, stagingMemory, nullptr);
+  if (submitResult != VK_SUCCESS || waitResult != VK_SUCCESS) {
+    std::printf("[vk] mesh upload submit failed (submit=%d wait=%d)\n",
+                static_cast<int>(submitResult), static_cast<int>(waitResult));
+    vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
+    vkFreeMemory(g.device, record.vertexMemory, nullptr);
+    vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
+    vkFreeMemory(g.device, record.indexMemory, nullptr);
+    return kInvalidMesh;
+  }
+
   record.indexCount = static_cast<std::uint32_t>(data.indices.size());
   g.meshes.push_back(record);
   return static_cast<MeshHandle>(g.meshes.size() - 1U);
@@ -1144,14 +1272,27 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   // Full mip chain: large textures would otherwise lose their detail to
   // minification (sampling a few texels of an 8K skin map looks smooth).
   // Level 0 is `image` itself (not copied); levels 1..N are derived.
-  std::vector<Image> levels = buildMipLevels(image);
+  // NPOT extents are upscaled to power-of-two first: see upscaleToPot — an
+  // NVIDIA driver bug faults the DMA path for NPOT images in some allocation
+  // states. POT images pass through untouched (zero copy).
+  Image upscaled;
+  Image const* source = &image;
+  bool const needsPot = (image.width & (image.width - 1U)) != 0U ||
+                        (image.height & (image.height - 1U)) != 0U;
+  if (needsPot) {
+    upscaled = upscaleToPot(image);
+    source = &upscaled;
+    std::printf("[vk] texture %ux%u upscaled to %ux%u (NPOT workaround)\n", image.width,
+                image.height, source->width, source->height);
+  }
+  std::vector<Image> levels = buildMipLevels(*source);
   std::uint32_t const mipLevels = static_cast<std::uint32_t>(levels.size() + 1U);
 
   Impl::TextureRecord record{};
   VkImageCreateInfo imageInfo = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
   imageInfo.imageType = VK_IMAGE_TYPE_2D;
   imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
-  imageInfo.extent = {image.width, image.height, 1};
+  imageInfo.extent = {source->width, source->height, 1};
   imageInfo.mipLevels = mipLevels;
   imageInfo.arrayLayers = 1;
   imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -1164,14 +1305,21 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
     return kInvalidTexture;
   }
 
-  VkMemoryRequirements requirements{};
-  vkGetImageMemoryRequirements(g.device, record.image, &requirements);
+  Impl::Requirements reqs = g.imageRequirements(record.image);
+  VkMemoryRequirements requirements = reqs.memory;
   std::uint32_t memoryType =
       g.findMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  VkMemoryDedicatedAllocateInfo dedicatedInfo =
+      vkStruct<VkMemoryDedicatedAllocateInfo>(
+          VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
+  dedicatedInfo.image = record.image;
   VkMemoryAllocateInfo allocInfo =
       vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
   allocInfo.allocationSize = requirements.size;
   allocInfo.memoryTypeIndex = memoryType;
+  if (reqs.dedicated || requirements.size >= (64ULL << 20)) {
+    allocInfo.pNext = &dedicatedInfo; // big resources never share a slab
+  }
   if (memoryType == UINT32_MAX ||
       vkAllocateMemory(g.device, &allocInfo, nullptr, &record.memory) != VK_SUCCESS ||
       vkBindImageMemory(g.device, record.image, record.memory, 0) != VK_SUCCESS) {
@@ -1217,18 +1365,19 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
     return kInvalidTexture;
   }
 
-  // Staging upload via a one-time command buffer: every mip level at its own
-  // offset (level 0 = the source image, then the derived levels).
+  // Tiled staging upload through one small window. Whole-image copies of very
+  // large textures have been observed to kill the graphics channel on this
+  // driver whenever other buffers were allocated first (VK_ERROR_DEVICE_LOST
+  // during a 12288^2 upload after meshes loaded); 2048x2048 tiles keep every
+  // copy dimension, row pitch and the staging footprint far from engine
+  // limits regardless of what was allocated before.
+  constexpr std::uint32_t kTile = 2048U;
+  constexpr VkDeviceSize kWindowBytes = 64ULL * 1024ULL * 1024ULL; // four tiles
+
   VkBuffer stagingBuffer = VK_NULL_HANDLE;
   VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
   void* stagingMapped = nullptr;
-  std::vector<VkDeviceSize> levelOffsets(mipLevels, 0);
-  VkDeviceSize byteSize = static_cast<VkDeviceSize>(image.rgba.size());
-  for (std::size_t i = 0; i < levels.size(); ++i) {
-    levelOffsets[i + 1U] = byteSize;
-    byteSize += static_cast<VkDeviceSize>(levels[i].rgba.size());
-  }
-  if (!g.createBuffer(byteSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+  if (!g.createBuffer(kWindowBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       stagingBuffer, stagingMemory, &stagingMapped)) {
     vkDestroySampler(g.device, record.sampler, nullptr);
@@ -1237,11 +1386,7 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
     vkDestroyImage(g.device, record.image, nullptr);
     return kInvalidTexture;
   }
-  auto* stagingBytes = static_cast<std::uint8_t*>(stagingMapped);
-  std::memcpy(stagingBytes, image.rgba.data(), image.rgba.size());
-  for (std::size_t i = 0; i < levels.size(); ++i) {
-    std::memcpy(stagingBytes + levelOffsets[i + 1U], levels[i].rgba.data(), levels[i].rgba.size());
-  }
+  auto* window = static_cast<std::uint8_t*>(stagingMapped);
 
   // Failure cleanup: staging plus the record's Vulkan objects. Without this,
   // a failed upload would both leak and masquerade as texture 0.
@@ -1255,13 +1400,6 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
     return kInvalidTexture;
   };
 
-  VkCommandBufferBeginInfo beginInfo =
-      vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
-  beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  if (vkBeginCommandBuffer(g.command, &beginInfo) != VK_SUCCESS) {
-    std::printf("[vk] texture upload begin failed\n");
-    return cleanup();
-  }
   VkImageMemoryBarrier2 toTransfer =
       vkStruct<VkImageMemoryBarrier2>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2);
   toTransfer.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
@@ -1283,40 +1421,89 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   toSample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   toSample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-  VkDependencyInfo dependency = vkStruct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
-  dependency.imageMemoryBarrierCount = 1;
-  dependency.pImageMemoryBarriers = &toTransfer;
-  vkCmdPipelineBarrier2(g.command, &dependency);
+  std::vector<VkBufferImageCopy> regions; // tile copies staged in the window
+  VkDeviceSize windowUsed = 0;
+  bool transferStarted = false;
+
+  auto submitBatch = [&](bool last) -> bool {
+    VkCommandBufferBeginInfo beginInfo =
+        vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(g.command, &beginInfo) != VK_SUCCESS) {
+      std::printf("[vk] texture upload begin failed\n");
+      return false;
+    }
+    VkDependencyInfo dependency = vkStruct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+    dependency.imageMemoryBarrierCount = 1;
+    if (!transferStarted) {
+      dependency.pImageMemoryBarriers = &toTransfer;
+      vkCmdPipelineBarrier2(g.command, &dependency);
+      transferStarted = true;
+    }
+    for (VkBufferImageCopy const& region : regions) {
+      vkCmdCopyBufferToImage(g.command, stagingBuffer, record.image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    }
+    if (last) {
+      dependency.pImageMemoryBarriers = &toSample;
+      vkCmdPipelineBarrier2(g.command, &dependency);
+    }
+    if (vkEndCommandBuffer(g.command) != VK_SUCCESS) {
+      std::printf("[vk] texture upload end failed\n");
+      return false;
+    }
+    VkSubmitInfo submitInfo = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &g.command;
+    VkResult submitResult = vkQueueSubmit(g.queue, 1, &submitInfo, VK_NULL_HANDLE);
+    VkResult waitResult = vkQueueWaitIdle(g.queue);
+    if (submitResult != VK_SUCCESS || waitResult != VK_SUCCESS) {
+      std::printf("[vk] texture upload submit failed (submit=%d wait=%d)\n",
+                  static_cast<int>(submitResult), static_cast<int>(waitResult));
+      return false;
+    }
+    regions.clear();
+    windowUsed = 0;
+    return true;
+  };
 
   for (std::uint32_t level = 0; level < mipLevels; ++level) {
-    VkBufferImageCopy copy{};
-    copy.bufferOffset = levelOffsets[level];
-    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.imageSubresource.mipLevel = level;
-    copy.imageSubresource.layerCount = 1;
-    copy.imageExtent = level == 0U
-                           ? VkExtent3D{image.width, image.height, 1}
-                           : VkExtent3D{levels[level - 1U].width, levels[level - 1U].height, 1};
-    vkCmdCopyBufferToImage(g.command, stagingBuffer, record.image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    std::uint8_t const* levelSource =
+        level == 0U ? source->rgba.data() : levels[level - 1U].rgba.data();
+    std::uint32_t levelWidth = level == 0U ? source->width : levels[level - 1U].width;
+    std::uint32_t levelHeight = level == 0U ? source->height : levels[level - 1U].height;
+    for (std::uint32_t tileY = 0; tileY < levelHeight; tileY += kTile) {
+      for (std::uint32_t tileX = 0; tileX < levelWidth; tileX += kTile) {
+        std::uint32_t tileW = std::min(kTile, levelWidth - tileX);
+        std::uint32_t tileH = std::min(kTile, levelHeight - tileY);
+        VkDeviceSize tileBytes = static_cast<VkDeviceSize>(tileW) * tileH * 4U;
+        if (windowUsed + tileBytes > kWindowBytes) {
+          if (!submitBatch(false)) {
+            return cleanup();
+          }
+        }
+        std::uint8_t* tileDst = window + windowUsed;
+        for (std::uint32_t row = 0; row < tileH; ++row) {
+          std::memcpy(tileDst + static_cast<std::size_t>(row) * tileW * 4U,
+                      levelSource +
+                          (static_cast<std::size_t>(tileY + row) * levelWidth + tileX) * 4U,
+                      static_cast<std::size_t>(tileW) * 4U);
+        }
+        VkBufferImageCopy copy{};
+        copy.bufferOffset = windowUsed;
+        copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.imageSubresource.mipLevel = level;
+        copy.imageSubresource.layerCount = 1;
+        copy.imageOffset = {static_cast<std::int32_t>(tileX), static_cast<std::int32_t>(tileY), 0};
+        copy.imageExtent = {tileW, tileH, 1};
+        regions.push_back(copy);
+        windowUsed += tileBytes;
+      }
+    }
   }
-
-  dependency.pImageMemoryBarriers = &toSample;
-  vkCmdPipelineBarrier2(g.command, &dependency);
-  if (vkEndCommandBuffer(g.command) != VK_SUCCESS) {
-    std::printf("[vk] texture upload end failed\n");
+  if (!submitBatch(true)) {
     return cleanup();
   }
-
-  VkSubmitInfo submitInfo = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
-  submitInfo.commandBufferCount = 1;
-  submitInfo.pCommandBuffers = &g.command;
-  if (vkQueueSubmit(g.queue, 1, &submitInfo, VK_NULL_HANDLE) != VK_SUCCESS) {
-    std::printf("[vk] texture upload submit failed\n");
-    vkQueueWaitIdle(g.queue);
-    return cleanup();
-  }
-  vkQueueWaitIdle(g.queue);
   vkDestroyBuffer(g.device, stagingBuffer, nullptr);
   vkFreeMemory(g.device, stagingMemory, nullptr);
 
