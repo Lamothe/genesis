@@ -61,12 +61,13 @@ struct XrShell::ImplData {
   XrAction menuAction{XR_NULL_HANDLE};
   XrAction gripAction{XR_NULL_HANDLE};
   XrAction aimAction{XR_NULL_HANDLE};
-  XrSpace aimSpace{XR_NULL_HANDLE};
+  XrSpace aimSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE}; // left, right
   XrSwapchain swapchains[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
   std::vector<XrSwapchainImageVulkan2KHR> images[2];
   std::vector<VkImageView> imageViews[2];
   std::uint32_t acquiredIndex[2] = {0, 0};
   XrView views[2];
+  bool haveGoodViews{false}; // views[] holds the last successfully located pair
   XrViewConfigurationView viewConfig[2];
   XrSessionState sessionState{XR_SESSION_STATE_UNKNOWN};
   bool sessionRunning{false};
@@ -444,13 +445,19 @@ bool XrShell::createActions() {
     }
   }
 
-  // Right-hand aim space for the manipulation pointer.
+  // Aim spaces for both controller pointers (left, right).
   XrActionSpaceCreateInfo spaceInfo = xrStruct<XrActionSpaceCreateInfo>(XR_TYPE_ACTION_SPACE_CREATE_INFO);
   spaceInfo.action = xr_->aimAction;
-  spaceInfo.subactionPath = rightPath;
   spaceInfo.poseInActionSpace.orientation.w = 1.0F;
-  return xrOk(xrCreateActionSpace(xr_->session, &spaceInfo, &xr_->aimSpace),
-              "xrCreateActionSpace");
+  XrPath const handPaths[2] = {leftPath, rightPath};
+  for (int hand = 0; hand < 2; ++hand) {
+    spaceInfo.subactionPath = handPaths[hand];
+    if (!xrOk(xrCreateActionSpace(xr_->session, &spaceInfo, &xr_->aimSpaces[hand]),
+              "xrCreateActionSpace")) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool XrShell::createSwapchains() {
@@ -559,8 +566,7 @@ void XrShell::pollEvents(bool& running) {
           running = false; // fatal: the session can never end cleanly
         }
         xr_->sessionRunning = false;
-        break;
-      case XR_SESSION_STATE_EXITING:
+        break;      case XR_SESSION_STATE_EXITING:
       case XR_SESSION_STATE_LOSS_PENDING:
         running = false;
         break;
@@ -634,73 +640,90 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   xrGetActionStateFloat(xr_->session, &getInfo, &gripState);
   input.gripHeld = gripState.isActive ? gripState.currentState : 0.0F;
 
-  // Pointer ray: right-hand aim when tracked, otherwise head gaze.
-  XrSpaceLocation location = xrStruct<XrSpaceLocation>(XR_TYPE_SPACE_LOCATION);
-  XrResult locate = xrLocateSpace(xr_->aimSpace, xr_->space,
-                                  static_cast<XrTime>(displayTime), &location);
+  // Per-hand aim rays for the drawn pointers; the right-hand aim doubles as
+  // the manipulation pointer (head gaze fallback when it is untracked).
   uint32_t tracked = XR_SPACE_LOCATION_POSITION_VALID_BIT |
                      XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
-  if (XR_SUCCEEDED(locate) && (location.locationFlags & tracked) == tracked) {
-    input.pointerRay = rayFromPose(location.pose);
-    input.poseValid = true;
+  for (int hand = 0; hand < 2; ++hand) {
+    XrSpaceLocation location = xrStruct<XrSpaceLocation>(XR_TYPE_SPACE_LOCATION);
+    XrResult locate = xrLocateSpace(xr_->aimSpaces[hand], xr_->space,
+                                    static_cast<XrTime>(displayTime), &location);
+    if (XR_SUCCEEDED(locate) && (location.locationFlags & tracked) == tracked) {
+      input.aimRays[hand] = rayFromPose(location.pose);
+      input.aimValid[hand] = true;
+    }
+  }
+  if (input.aimValid[1]) {
+    input.pointerRay = input.aimRays[1];
   } else {
-    input.pointerRay = rayFromPose(xr_->views[0].pose);
-    input.poseValid = false;
+    input.pointerRay = rayFromPose(xr_->views[0].pose); // head gaze fallback
   }
   return true;
 }
 
-bool XrShell::beginFrame(XrFrameInput& inputOut, bool& running) {
+XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   if (xr_ == nullptr) {
-    running = false;
-    return false;
+    return FrameStatus::Exit;
   }
   inputOut = XrFrameInput{};
+  bool running = true;
   pollEvents(running);
   if (!running) {
-    return false;
+    return FrameStatus::Exit;
   }
   if (!xr_->sessionRunning) {
-    return false; // session still starting; keep pumping
+    return FrameStatus::Pump; // session still starting; keep pumping
   }
 
   XrFrameWaitInfo waitInfo = xrStruct<XrFrameWaitInfo>(XR_TYPE_FRAME_WAIT_INFO);
   xr_->frameState = xrStruct<XrFrameState>(XR_TYPE_FRAME_STATE);
   if (!xrOk(xrWaitFrame(xr_->session, &waitInfo, &xr_->frameState), "xrWaitFrame")) {
-    running = false;
-    return false;
+    return FrameStatus::Exit;
   }
   XrFrameBeginInfo beginInfo = xrStruct<XrFrameBeginInfo>(XR_TYPE_FRAME_BEGIN_INFO);
   if (!xrOk(xrBeginFrame(xr_->session, &beginInfo), "xrBeginFrame")) {
-    running = false;
-    return false;
+    return FrameStatus::Exit;
   }
   xr_->frameBegun = true;
   xr_->frameReady = false;
   xr_->predictedDisplayTime = xr_->frameState.predictedDisplayTime;
+  ++stats_.begun;
   // Pairing rule: every xrBeginFrame gets exactly one xrEndFrame. When a
   // frame cannot be rendered, end it here (zero layers) before bailing.
   auto failFrame = [this]() {
-    endFrame();
-    return false;
+    endFrame(); // endFrame counts the zero-layer outcome
+    return FrameStatus::Skipped;
   };
+  // shouldRender is a power hint (spec: "should avoid heavy GPU work"), not a
+  // constraint on xrEndFrame. Zero layers mean "clear the display" — WiVRn
+  // shows that as a passthrough flash — so a hint must never blank the frame.
+  // Rendering is ~3 ms here; the hint is only counted.
   if (!xr_->frameState.shouldRender) {
-    return failFrame(); // spec: skipped frames are still begun and ended
+    ++stats_.renderFalse;
   }
 
-  // Views.
+  // Views. Locate into a scratch pair first: unlocated poses (transient
+  // tracking gaps) keep the last good ones rather than failing the frame.
   XrViewLocateInfo locateInfo = xrStruct<XrViewLocateInfo>(XR_TYPE_VIEW_LOCATE_INFO);
   locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
   locateInfo.displayTime = xr_->frameState.predictedDisplayTime;
   locateInfo.space = xr_->space;
   XrViewState viewState = xrStruct<XrViewState>(XR_TYPE_VIEW_STATE);
-  xr_->views[0] = xrStruct<XrView>(XR_TYPE_VIEW);
-  xr_->views[1] = xrStruct<XrView>(XR_TYPE_VIEW);
+  XrView located[2] = {xrStruct<XrView>(XR_TYPE_VIEW), xrStruct<XrView>(XR_TYPE_VIEW)};
   std::uint32_t viewCount = 0;
-  if (!xrOk(xrLocateViews(xr_->session, &locateInfo, &viewState, 2, &viewCount, xr_->views),
-            "xrLocateViews") ||
-      viewCount != 2U) {
-    return failFrame();
+  bool locateOk = xrOk(xrLocateViews(xr_->session, &locateInfo, &viewState, 2, &viewCount, located),
+                       "xrLocateViews");
+  std::uint32_t const poseFlags = XR_VIEW_STATE_POSITION_VALID_BIT |
+                                  XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+  if (locateOk && viewCount == 2U && (viewState.viewStateFlags & poseFlags) == poseFlags) {
+    xr_->views[0] = located[0];
+    xr_->views[1] = located[1];
+    xr_->haveGoodViews = true;
+  } else if (xr_->haveGoodViews) {
+    ++stats_.stalePose; // transient gap: reuse the last good poses
+  } else {
+    ++stats_.viewFail;
+    return failFrame(); // no poses ever; nothing to show yet
   }
 
   for (int eye = 0; eye < 2; ++eye) {
@@ -728,6 +751,7 @@ bool XrShell::beginFrame(XrFrameInput& inputOut, bool& running) {
       {0.0F, 0.0F, -1.0F});
 
   if (!syncActions(inputOut, static_cast<std::uint64_t>(xr_->frameState.predictedDisplayTime))) {
+    ++stats_.actionFail;
     return failFrame();
   }
 
@@ -739,6 +763,7 @@ bool XrShell::beginFrame(XrFrameInput& inputOut, bool& running) {
     std::uint32_t index = 0;
     if (!xrOk(xrAcquireSwapchainImage(xr_->swapchains[eye], &acquireInfo, &index),
               "xrAcquireSwapchainImage")) {
+      ++stats_.acquireFail;
       return failFrame();
     }
     xr_->acquiredIndex[eye] = index;
@@ -748,11 +773,12 @@ bool XrShell::beginFrame(XrFrameInput& inputOut, bool& running) {
     XrSwapchainImageWaitInfo imageWait = xrStruct<XrSwapchainImageWaitInfo>(XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO);
     imageWait.timeout = XR_INFINITE_DURATION;
     if (!xrOk(xrWaitSwapchainImage(xr_->swapchains[eye], &imageWait), "xrWaitSwapchainImage")) {
+      ++stats_.acquireFail;
       return failFrame();
     }
   }
   xr_->frameReady = true;
-  return true;
+  return FrameStatus::Render;
 }
 
 bool XrShell::endFrame() {
@@ -790,12 +816,15 @@ bool XrShell::endFrame() {
   // endInfo.layers during the call, so the array cannot be scoped to the branch.
   XrCompositionLayerBaseHeader const* layers[] = {
       reinterpret_cast<XrCompositionLayerBaseHeader const*>(&layer)};
-  if (xr_->frameState.shouldRender && xr_->frameReady) {
+  // frameReady is the only gate: we render despite shouldRender (a hint), and
+  // zero layers mean "clear the display" (passthrough on WiVRn).
+  if (xr_->frameReady) {
     endInfo.layerCount = 1;
     endInfo.layers = layers;
   } else {
     // Skipped or failed frames end with zero layers (never with unlocated
     // view poses).
+    ++stats_.zeroLayer;
     endInfo.layerCount = 0;
     endInfo.layers = nullptr;
   }
@@ -822,8 +851,11 @@ void XrShell::shutdown() {
     }
     imagesAcquired_[eye] = false;
   }
-  if (xr_->aimSpace != XR_NULL_HANDLE) {
-    xrDestroySpace(xr_->aimSpace);
+  for (XrSpace& aimSpace : xr_->aimSpaces) {
+    if (aimSpace != XR_NULL_HANDLE) {
+      xrDestroySpace(aimSpace);
+      aimSpace = XR_NULL_HANDLE;
+    }
   }
   if (xr_->space != XR_NULL_HANDLE) {
     xrDestroySpace(xr_->space);

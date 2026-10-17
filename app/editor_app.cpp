@@ -1038,6 +1038,80 @@ int runSmokeWindow(char const* shaderDir, int frames, std::vector<char const*> c
 
 constexpr float kXrTurnSpeed = 2.2F; // radians/second at full stick deflection
 
+// Perf probe: renders the loaded scene at the headset's per-eye resolution
+// (2889x3026 on WiVRn/Quest 3) offscreen and times the draws. Compares the
+// serialised per-eye cost against the 90 Hz frame budget to decide whether
+// choppiness is GPU-bound (needs render scale) or sync-bound (needs frame
+// pipelining) before touching the XR loop.
+int runPerfSmoke(char const* shaderDir, std::vector<char const*> const& modelPaths) {
+  constexpr std::uint32_t kEyeWidth = 2889U;
+  constexpr std::uint32_t kEyeHeight = 3026U;
+  constexpr int kProbeFrames = 60;
+
+  App app;
+  app.width = kEyeWidth;
+  app.height = kEyeHeight;
+  VkRenderer renderer;
+  VkRenderer::Config config;
+  config.windowed = false;
+  config.width = kEyeWidth;
+  config.height = kEyeHeight;
+  config.shaderDir = shaderDir;
+  if (!renderer.init(config)) {
+    std::printf("SMOKE FAIL: renderer init\n");
+    return 1;
+  }
+  if (!modelPaths.empty()) {
+    if (!loadModels(app, renderer, modelPaths)) {
+      std::printf("SMOKE FAIL: model loading\n");
+      return 1;
+    }
+    frameScene(app);
+  } else {
+    buildDemoScene(app);
+  }
+
+  std::vector<DrawItem> items;
+  std::vector<RendererVertex> depthLines;
+  std::vector<RendererVertex> overlayLines;
+  assembleFrame(app, items, depthLines, overlayLines);
+
+  // Warm up (compiles pipelines, faults in memory), then time the draws.
+  for (int warm = 0; warm < 3; ++warm) {
+    if (!renderer.draw(app.camera, items, depthLines, overlayLines)) {
+      std::printf("SMOKE FAIL: draw\n");
+      return 1;
+    }
+  }
+  double totalMs = 0.0;
+  double maxMs = 0.0;
+  for (int frame = 0; frame < kProbeFrames; ++frame) {
+    auto start = std::chrono::steady_clock::now();
+    if (!renderer.draw(app.camera, items, depthLines, overlayLines)) {
+      std::printf("SMOKE FAIL: draw\n");
+      return 1;
+    }
+    double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    totalMs += ms;
+    maxMs = ms > maxMs ? ms : maxMs;
+  }
+  std::vector<std::uint8_t> pixels;
+  if (!renderer.readback(pixels)) {
+    std::printf("SMOKE FAIL: readback\n");
+    return 1;
+  }
+
+  double avgMs = totalMs / kProbeFrames;
+  double budgetMs = 1000.0 / 90.0;
+  std::printf("SMOKE PERF: %ux%u per eye, %d draws: avg %.2f ms, max %.2f ms\n", kEyeWidth,
+              kEyeHeight, kProbeFrames, avgMs, maxMs);
+  std::printf("SMOKE PERF: two serialised eyes ~ %.2f ms/frame vs 90 Hz budget %.2f ms (%s)\n",
+              avgMs * 2.0, budgetMs, avgMs * 2.0 < budgetMs ? "GPU has headroom" : "GPU-bound");
+  renderer.shutdown();
+  return 0;
+}
+
 // Interactive or smoke VR session through the OpenXR shell. Returns 0 when no
 // runtime/headset is available (nothing to test against), 2 on setup failure.
 int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, bool smoke) {
@@ -1093,16 +1167,33 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
 
   bool running = true;
   int framesRendered = 0;
+  int skipsInARow = 0;
+  double frameMsTotal = 0.0;
+  double frameMsMax = 0.0;
   std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point frameStart = last;
   while (running) {
     XrFrameInput input;
-    if (!shell.beginFrame(input, running)) {
-      if (!running) {
-        break;
-      }
+    frameStart = std::chrono::steady_clock::now();
+    XrShell::FrameStatus status = shell.beginFrame(input);
+    if (status == XrShell::FrameStatus::Exit) {
+      break;
+    }
+    if (status == XrShell::FrameStatus::Pump) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5)); // session still starting
       continue;
     }
+    if (status == XrShell::FrameStatus::Skipped) {
+      // Frame already begun+ended; go straight to the next one. A persistent
+      // skip streak means the session is broken — fail the smoke rather than
+      // spin forever (interactive mode stays user-escapable).
+      if (smoke && ++skipsInARow >= 600) {
+        std::printf("[xr] %d consecutive skipped frames; giving up\n", skipsInARow);
+        break;
+      }
+      continue;
+    }
+    skipsInARow = 0;
 
     auto now = std::chrono::steady_clock::now();
     float dt = std::chrono::duration<float>(now - last).count();
@@ -1127,6 +1218,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     Mat4 rigView = cameraView(rig);
     Mat4 rigWorld{};
     if (!invertAffine(rigView, rigWorld)) {
+      shell.endFrame(); // frame is begun: pair the begin before bailing
       running = false;
       break;
     }
@@ -1153,6 +1245,18 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;
     assembleFrame(app, items, depthLines, overlayLines);
+    // Controller pointers: one beam per tracked hand, always on top so the
+    // aimed point is visible even against the model. Left is cool, right (the
+    // manipulation pointer) is warm.
+    for (int hand = 0; hand < 2; ++hand) {
+      if (!input.aimValid[hand]) {
+        continue;
+      }
+      Ray aimWorld{transformPoint(rigWorld, input.aimRays[hand].origin),
+                   normalized(transformVector(rigWorld, input.aimRays[hand].direction))};
+      appendRayBeam(overlayLines, aimWorld, 10.0F,
+                    hand == 0 ? Vec3{0.45F, 0.75F, 1.0F} : Vec3{1.0F, 0.82F, 0.35F});
+    }
 
     bool drew = true;
     for (int eye = 0; eye < 2; ++eye) {
@@ -1167,16 +1271,38 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     if (!shell.endFrame() || !drew) {
       running = false;
     }
+    double frameMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frameStart)
+            .count();
+    frameMsTotal += frameMs;
+    frameMsMax = frameMs > frameMsMax ? frameMs : frameMsMax;
     ++framesRendered;
-    if (smoke && framesRendered >= 3) {
+    if (smoke && framesRendered >= 60) {
       std::printf("SMOKE PASS (xr, %d frames)\n", framesRendered);
       break;
     }
   }
 
+  XrShell::FrameStats const& stats = shell.frameStats();
+  if (framesRendered > 0) {
+    std::printf("[xr] frame time: avg %.2f ms, max %.2f ms over %d frames\n",
+                frameMsTotal / framesRendered, frameMsMax, framesRendered);
+    std::printf("[xr] frames begun %llu: zero-layer %llu (viewFail %llu, actionFail %llu, "
+                "acquireFail %llu)\n",
+                static_cast<unsigned long long>(stats.begun),
+                static_cast<unsigned long long>(stats.zeroLayer),
+                static_cast<unsigned long long>(stats.viewFail),
+                static_cast<unsigned long long>(stats.actionFail),
+                static_cast<unsigned long long>(stats.acquireFail));
+    std::printf("[xr] rendered anyway: stalePose %llu (reused last good views), "
+                "renderFalse %llu (runtime hint ignored)\n",
+                static_cast<unsigned long long>(stats.stalePose),
+                static_cast<unsigned long long>(stats.renderFalse));
+  }
+
   renderer.shutdown();
   shell.shutdown();
-  if (smoke && framesRendered < 3) {
+  if (smoke && framesRendered < 60) {
     std::printf("SMOKE FAIL: only %d xr frames rendered\n", framesRendered);
     return 1;
   }
@@ -1285,7 +1411,15 @@ int runInteractive(char const* shaderDir, std::vector<char const*> const& modelP
 } // namespace
 
 int main(int argc, char** argv) {
-  enum class Mode { Interactive, SmokeOffscreen, SmokeTextured, SmokeWindow, Xr, SmokeXr };
+  enum class Mode {
+    Interactive,
+    SmokeOffscreen,
+    SmokeTextured,
+    SmokeWindow,
+    SmokePerf,
+    Xr,
+    SmokeXr
+  };
   Mode mode = Mode::Interactive;
   char const* shaderDir = ".build/shaders";
   int frames = 30;
@@ -1299,6 +1433,8 @@ int main(int argc, char** argv) {
       mode = Mode::SmokeOffscreen;
     } else if (std::strcmp(arg, "--smoke-textured") == 0) {
       mode = Mode::SmokeTextured;
+    } else if (std::strcmp(arg, "--smoke-perf") == 0) {
+      mode = Mode::SmokePerf;
     } else if (std::strcmp(arg, "--smoke-window") == 0) {
       mode = Mode::SmokeWindow;
       if (i + 1 < argc) {
@@ -1325,8 +1461,8 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(arg, "--help") == 0) {
       std::printf(
           "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR]\n"
-          "                [--xr | --smoke-offscreen | --smoke-xr |\n"
-          "                 --smoke-window [FRAMES]]\n");
+          "                [--xr | --smoke-offscreen | --smoke-textured |\n"
+          "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);
@@ -1350,6 +1486,8 @@ int main(int argc, char** argv) {
     return runXr(shaderDir, modelPaths, true);
   case Mode::SmokeWindow:
     return runSmokeWindow(shaderDir, frames, modelPaths);
+  case Mode::SmokePerf:
+    return runPerfSmoke(shaderDir, modelPaths);
   default:
     return runInteractive(shaderDir, modelPaths);
   }

@@ -13,6 +13,8 @@ namespace vredit {
 struct XrFrameInput {
   Mat4 eyeViewProj[2];   // proj * view per eye (renderer conventions)
   Ray pointerRay;        // right-controller aim ray (head gaze fallback)
+  Ray aimRays[2];        // per-hand aim rays in XR local space (left, right)
+  bool aimValid[2] = {false, false}; // aimRays[i] is tracked this frame
   Vec3 headPosition{0.0F, 0.0F, 0.0F}; // midpoint of the eyes
   Vec3 headForward{0.0F, 0.0F, -1.0F};
   Vec2 moveStick{0.0F, 0.0F}; // left stick: x = strafe, y = forward
@@ -22,7 +24,6 @@ struct XrFrameInput {
   bool selectReleased{false};
   bool menuPressed{false};
   float gripHeld{0.0F};
-  bool poseValid{false}; // pointer ray is tracked this frame
 };
 
 // Minimal OpenXR stereo shell (XR_KHR_vulkan_enable2): owns the XR instance,
@@ -37,6 +38,18 @@ public:
     NoRuntime,   // no OpenXR runtime configured (nothing to test against)
     NoHeadset,   // runtime present but no HMD available
     Failed       // unexpected failure; details printed
+  };
+
+  // Frame diagnostics: why frames end with zero layers (WiVRn shows those as
+  // passthrough) and how often.
+  struct FrameStats {
+    std::uint64_t begun{0};
+    std::uint64_t zeroLayer{0};     // ended with no layers (passthrough flash)
+    std::uint64_t renderFalse{0};   // runtime said shouldRender == false (we render anyway)
+    std::uint64_t viewFail{0};      // xrLocateViews failed / wrong count
+    std::uint64_t stalePose{0};     // view poses unlocated; reused the last good ones
+    std::uint64_t actionFail{0};    // xrSyncActions failed
+    std::uint64_t acquireFail{0};   // swapchain acquire/wait failed
   };
 
   XrShell() = default;
@@ -59,12 +72,21 @@ public:
   std::uint32_t eyeWidth() const { return eyeWidth_; }
   std::uint32_t eyeHeight() const { return eyeHeight_; }
 
-  // Frame flow. beginFrame returns false when the session is not rendering
-  // (skip the frame but keep pumping), and sets `running` false on exit.
-  bool beginFrame(XrFrameInput& inputOut, bool& running);
+  // Frame flow. beginFrame paces on the runtime (xrWaitFrame) and returns:
+  //   Render  — frame begun and ready to draw into the eye targets;
+  //   Skipped — frame begun and already ended (nothing to draw this time);
+  //   Pump    — no frame begun yet (session starting); retry after a short sleep;
+  //   Exit    — session over or a fatal failure; stop the loop.
+  // `shouldRender` is treated as a hint only: the spec allows layers in every
+  // xrEndFrame, and zero-layer frames display as a cleared (passthrough) frame
+  // on WiVRn, so a skip is never worth a visible blank.
+  enum class FrameStatus { Render, Skipped, Pump, Exit };
+  FrameStatus beginFrame(XrFrameInput& inputOut);
   VkImageView eyeView(int eye) const { return eyeViews_[eye]; }
   VkImage eyeImage(int eye) const { return eyeImages_[eye]; }
   bool endFrame();
+
+  FrameStats const& frameStats() const { return stats_; }
 
 private:
   bool createActions();
@@ -85,6 +107,7 @@ private:
   VkImage eyeImages_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkImageView eyeViews_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
   bool imagesAcquired_[2] = {false, false};
+  FrameStats stats_;
 };
 
 } // namespace vredit

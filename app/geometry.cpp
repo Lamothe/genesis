@@ -108,4 +108,25 @@ void appendBoundsLines(std::vector<RendererVertex>& out, Aabb const& bounds, Vec
   }
 }
 
+void appendRayBeam(std::vector<RendererVertex>& out, Ray const& ray, float length, Vec3 colour) {
+  Vec3 const up{0.0F, 1.0F, 0.0F};
+  Vec3 const dir = normalized(ray.direction);
+  Vec3 const tip = ray.origin + dir * length;
+  out.push_back({ray.origin, up, colour, {0.0F, 0.0F}});
+  out.push_back({tip, up, colour, {0.0F, 0.0F}});
+  // Tip cross: two short segments perpendicular to the beam, so the aimed
+  // point stays readable when it lands on an untextured surface.
+  float const arm = length * 0.03F;
+  Vec3 side = cross(dir, up);
+  if (dot(side, side) < 1e-8F) {
+    side = cross(dir, Vec3{1.0F, 0.0F, 0.0F});
+  }
+  side = normalized(side);
+  Vec3 const lift = normalized(cross(side, dir));
+  out.push_back({tip - side * arm, up, colour, {0.0F, 0.0F}});
+  out.push_back({tip + side * arm, up, colour, {0.0F, 0.0F}});
+  out.push_back({tip - lift * arm, up, colour, {0.0F, 0.0F}});
+  out.push_back({tip + lift * arm, up, colour, {0.0F, 0.0F}});
+}
+
 } // namespace vredit

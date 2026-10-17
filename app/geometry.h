@@ -39,6 +39,10 @@ void appendHandleLines(std::vector<RendererVertex>& out,
 // 12 edges of an axis-aligned box (line list), e.g. a selection outline.
 void appendBoundsLines(std::vector<RendererVertex>& out, Aabb const& bounds, Vec3 colour);
 
+// Controller pointer: beam from the aim origin along the ray, with a small
+// cross marking the tip so the aimed point is visible on plain surfaces.
+void appendRayBeam(std::vector<RendererVertex>& out, Ray const& ray, float length, Vec3 colour);
+
 Vec3 handleColour(GizmoHandle handle);
 
 } // namespace vredit
