@@ -108,7 +108,33 @@ MtlMaterial const* lookupMaterial(MtlMaterials const& materials, std::string con
 
 bool sameMaterial(MtlMaterial const& a, MtlMaterial const& b) {
   return a.colour.x == b.colour.x && a.colour.y == b.colour.y && a.colour.z == b.colour.z &&
-         a.dissolve == b.dissolve && a.texture == b.texture;
+         a.dissolve == b.dissolve && a.texture == b.texture &&
+         a.normalTexture == b.normalTexture && a.normalScale == b.normalScale;
+}
+
+// MTL map statements may carry option flags (-s u v w, -o u v w, -bm value,
+// ...). Flag arities vary, so the path is the LAST token (paths with unquoted
+// spaces are not supported). A -bm value is captured when requested.
+std::string parseMapStatement(std::string_view rest, float* bumpScaleOut) {
+  std::istringstream stream{std::string(rest)};
+  std::string path;
+  std::string token;
+  std::string previous;
+  while (stream >> token) {
+    if (previous == "-bm" && bumpScaleOut != nullptr) {
+      std::istringstream value{token};
+      float scale = 1.0F;
+      if (value >> scale) {
+        *bumpScaleOut = scale;
+      }
+    }
+    previous = token;
+    if (!token.empty() && token[0] == '-') {
+      continue;
+    }
+    path = token;
+  }
+  return path;
 }
 
 } // namespace
@@ -148,11 +174,15 @@ bool parseMtl(std::string_view text, MtlMaterials& out) {
       } else if (keyword == "Tr" && parseFloats(rest, values) && !values.empty()) {
         material.dissolve = 1.0F - values[0];
       } else if (keyword == "map_Kd") {
-        std::istringstream stream{std::string(rest)};
-        std::string path;
-        stream >> path;
+        std::string path = parseMapStatement(rest, nullptr);
         if (!path.empty()) {
           material.mapKd = path;
+        }
+      } else if (keyword == "map_Bump" || keyword == "bump" || keyword == "norm" ||
+                 keyword == "map_Kn") {
+        std::string path = parseMapStatement(rest, &material.normalScale);
+        if (!path.empty()) {
+          material.mapBump = path;
         }
       }
     }
@@ -318,6 +348,8 @@ bool loadObjImpl(std::string_view text, MtlMaterials const& materials,
       mesh.colour = currentMaterial.colour;
       mesh.alphaFactor = currentMaterial.dissolve;
       mesh.texture = currentMaterial.texture;
+      mesh.normalTexture = currentMaterial.normalTexture;
+      mesh.normalScale = currentMaterial.normalScale;
       mesh.alpha = currentMaterial.dissolve < 1.0F ? AlphaMode::Blend : AlphaMode::Opaque;
       MeshData& data = mesh.data;
 
@@ -407,28 +439,43 @@ bool loadObjFile(char const* path, Model& out, std::string& error) {
     }
   }
 
-  // Resolve map_Kd images (missing or undecodable images load untextured).
+  // Resolve map_Kd / map_Bump images (missing or undecodable images load
+  // untextured / flat). The same path shared by several materials is decoded
+  // once.
   std::vector<ModelTexture> textures;
-  for (MtlMaterial& material : materials) {
-    if (material.mapKd.empty()) {
-      continue;
+  std::vector<std::pair<std::string, std::int32_t>> resolvedImages;
+  auto resolveImage = [&](std::string const& path, char const* what) -> std::int32_t {
+    for (std::pair<std::string, std::int32_t> const& entry : resolvedImages) {
+      if (entry.first == path) {
+        return entry.second;
+      }
     }
-    std::ifstream imageFile(directory + material.mapKd, std::ios::binary);
+    std::ifstream imageFile(directory + path, std::ios::binary);
     if (!imageFile) {
-      std::printf("obj: texture %s not found; material loads untextured\n", material.mapKd.c_str());
-      continue;
+      std::printf("obj: %s %s not found; skipped\n", what, path.c_str());
+      return -1;
     }
     std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(imageFile)),
                                     std::istreambuf_iterator<char>());
     ModelTexture texture;
     if (!decodeImage(bytes.data(), bytes.size(), texture.image, error)) {
-      std::printf("obj: texture %s failed to decode (%s); material loads untextured\n",
-                  material.mapKd.c_str(), error.c_str());
+      std::printf("obj: %s %s failed to decode (%s); skipped\n", what, path.c_str(),
+                  error.c_str());
       error.clear();
-      continue;
+      return -1;
     }
     textures.push_back(std::move(texture));
-    material.texture = static_cast<std::int32_t>(textures.size() - 1U);
+    std::int32_t handle = static_cast<std::int32_t>(textures.size() - 1U);
+    resolvedImages.push_back({path, handle});
+    return handle;
+  };
+  for (MtlMaterial& material : materials) {
+    if (!material.mapKd.empty()) {
+      material.texture = resolveImage(material.mapKd, "texture");
+    }
+    if (!material.mapBump.empty()) {
+      material.normalTexture = resolveImage(material.mapBump, "normal map");
+    }
   }
 
   return loadObj(text, materials, textures, out, error);

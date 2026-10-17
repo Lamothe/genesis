@@ -49,6 +49,8 @@ struct ModelMesh {
   Vec3 colour{1.0F, 1.0F, 1.0F}; // material base colour multiplier
   float alphaFactor{1.0F};       // material alpha (dissolve / baseColorFactor.a)
   std::int32_t texture{-1};      // index into Model::textures; -1 = untextured
+  std::int32_t normalTexture{-1}; // tangent-space normal map; -1 = flat
+  float normalScale{1.0F};        // glTF normalTexture.scale
   AlphaMode alpha{AlphaMode::Opaque};
   float alphaCutoff{0.5F};
 };

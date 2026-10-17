@@ -33,8 +33,9 @@ using namespace vredit;
 namespace {
 
 constexpr float kLookSpeed = 0.005F;     // radians per pixel of mouse look
-constexpr float kFlySpeed = 6.0F;        // metres/second
+constexpr float kFlySpeed = 1.8F;        // metres/second (boost covers distance)
 constexpr float kFlyBoost = 3.0F;
+constexpr float kMinEyeHeight = 0.15F;   // the camera never passes below the grid (y = 0)
 constexpr float kWheelMetres = 1.0F;     // metres per wheel notch
 constexpr float kGizmoPixels = 120.0F;
 constexpr float kPickThresholdPx = 8.0F;
@@ -42,10 +43,34 @@ constexpr float kSnapTranslate = 0.25F;
 constexpr float kSnapRotate = 0.2617994F; // 15 degrees
 constexpr float kSnapScale = 0.25F;
 
+// Free-flight movement with the floor constraint: y = 0 is the ground grid and
+// the camera never passes below it (any axis: even forward flight can descend).
+void clampAboveGround(Camera& camera) {
+  camera.position.y = std::fmax(camera.position.y, kMinEyeHeight);
+}
+
+void flyCamera(Camera& camera, Vec3 const& localDelta) {
+  cameraFly(camera, localDelta);
+  clampAboveGround(camera);
+}
+
+void dollyCamera(Camera& camera, float metres) {
+  cameraDolly(camera, metres);
+  clampAboveGround(camera);
+}
+
+void panCamera(Camera& camera, float dx, float dy, float viewportHeight) {
+  cameraPan(camera, dx, dy, viewportHeight);
+  clampAboveGround(camera);
+}
+
 struct NodeVisual {
   NodeId id{kInvalidNode};
   MeshHandle mesh{0};
   TextureHandle texture{0};
+  TextureHandle normalTexture{0};
+  bool normalMapped{false};
+  float normalScale{1.0F};
   Aabb localBounds{{-0.5F, -0.5F, -0.5F}, {0.5F, 0.5F, 0.5F}};
   Vec3 colour{1.0F, 1.0F, 1.0F};
   float alphaFactor{1.0F};
@@ -167,6 +192,12 @@ bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
       if (mesh.texture >= 0 && static_cast<std::size_t>(mesh.texture) < textureHandles.size()) {
         visual.texture = textureHandles[static_cast<std::size_t>(mesh.texture)];
       }
+      if (mesh.normalTexture >= 0 &&
+          static_cast<std::size_t>(mesh.normalTexture) < textureHandles.size()) {
+        visual.normalTexture = textureHandles[static_cast<std::size_t>(mesh.normalTexture)];
+        visual.normalMapped = true;
+        visual.normalScale = mesh.normalScale;
+      }
       app.visuals.push_back(visual);
     }
   }
@@ -204,6 +235,7 @@ void frameScene(App& app) {
   app.camera.yaw = 0.6F;
   app.camera.pitch = -0.3F;
   app.camera.position = centre - cameraForward(app.camera) * distance;
+  clampAboveGround(app.camera); // framing must never start below the grid
 }
 
 Ray appRay(App const& app, Vec2 pixel) {
@@ -366,6 +398,9 @@ void assembleFrame(App& app,
     DrawItem item;
     item.mesh = visual.mesh;
     item.texture = visual.texture;
+    item.normalTexture = visual.normalTexture;
+    item.normalMapped = visual.normalMapped;
+    item.normalScale = visual.normalScale;
     item.model = app.scene.world(visual.id);
     item.colour = visual.colour;
     item.alphaFactor = visual.alphaFactor;
@@ -487,9 +522,9 @@ void handleEvent(App& app,
       app.panning = true;
       app.panButton = 2U;
     } else if (press->detail == 4U) {
-      cameraDolly(app.camera, kWheelMetres);
+      dollyCamera(app.camera, kWheelMetres);
     } else if (press->detail == 5U) {
-      cameraDolly(app.camera, -kWheelMetres);
+      dollyCamera(app.camera, -kWheelMetres);
     }
     break;
   }
@@ -517,7 +552,7 @@ void handleEvent(App& app,
     } else if (app.looking) {
       cameraLook(app.camera, delta.x * kLookSpeed, -delta.y * kLookSpeed);
     } else if (app.panning) {
-      cameraPan(app.camera, delta.x, delta.y, static_cast<float>(app.height));
+      panCamera(app.camera, delta.x, delta.y, static_cast<float>(app.height));
     }
     break;
   }
@@ -698,6 +733,78 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   writePpm(".build/smoke.ppm", pixels, config.width, config.height);
   std::printf("SMOKE pixels: covered=%d reddish=%d bluish=%d (of %d) -> .build/smoke.ppm\n", covered,
               reddish, bluish, config.width * config.height);
+  if (textured) {
+    // Normal-map TBN check: flat normals vs the fixture's +Y map vs a diagonal
+    // (+X+Y+Z) map registered here. +Y must brighten (bitangent axis), and the
+    // diagonal must brighten further — it fails if any tangent axis is
+    // sign-flipped, which the pure +Y map cannot detect (the light uses abs).
+    bool anyNormal = false;
+    for (DrawItem const& item : items) {
+      anyNormal = anyNormal || item.normalMapped;
+    }
+    Image triImage;
+    std::string triError;
+    std::ifstream triFile(".build/fixtures/normal-tri.png", std::ios::binary);
+    std::vector<std::uint8_t> triBytes((std::istreambuf_iterator<char>(triFile)),
+                                       std::istreambuf_iterator<char>());
+    if (!anyNormal || triBytes.empty() ||
+        !decodeImage(triBytes.data(), triBytes.size(), triImage, triError)) {
+      std::printf("SMOKE FAIL: normal-map fixtures missing\n");
+      return 1;
+    }
+    TextureHandle triTexture = renderer.addTexture(triImage, true, true);
+    if (triTexture == kInvalidTexture) {
+      std::printf("SMOKE FAIL: normal-tri texture registration\n");
+      return 1;
+    }
+
+    std::vector<DrawItem> flatItems = items;
+    std::vector<DrawItem> triItems = items;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      flatItems[i].normalMapped = false;
+      if (triItems[i].normalMapped) {
+        triItems[i].normalTexture = triTexture;
+      }
+    }
+    auto luminanceSum = [&renderer, &app](std::vector<DrawItem> const& drawItems,
+                                          std::vector<RendererVertex> const& depthLines,
+                                          std::vector<RendererVertex> const& overlayLines,
+                                          double& sumOut) {
+      if (!renderer.draw(app.camera, drawItems, depthLines, overlayLines)) {
+        return false;
+      }
+      std::vector<std::uint8_t> pixels;
+      if (!renderer.readback(pixels)) {
+        return false;
+      }
+      sumOut = 0.0;
+      for (std::size_t i = 0; i < pixels.size() / 4U; ++i) {
+        for (std::size_t c = 0; c < 3U; ++c) {
+          sumOut += pixels[i * 4U + c];
+        }
+      }
+      return true;
+    };
+    double flatLum = 0.0;
+    double upLum = 0.0;
+    double triLum = 0.0;
+    if (!luminanceSum(flatItems, depthLines, overlayLines, flatLum) ||
+        !luminanceSum(items, depthLines, overlayLines, upLum) ||
+        !luminanceSum(triItems, depthLines, overlayLines, triLum)) {
+      std::printf("SMOKE FAIL: normal-toggle draws\n");
+      return 1;
+    }
+    std::printf("SMOKE normal map: flat=%.0f up=%.0f tri=%.0f\n", flatLum, upLum, triLum);
+    if (!(upLum > flatLum * 1.002)) {
+      std::printf("SMOKE FAIL: +Y normal map did not brighten the lighting\n");
+      return 1;
+    }
+    if (!(triLum > upLum * 1.002)) {
+      std::printf("SMOKE FAIL: diagonal normal map did not brighten further (tangent axis "
+                  "sign-flipped?)\n");
+      return 1;
+    }
+  }
   int minCovered = modelPaths.empty() ? 2000 : 100;
   int minReddish = modelPaths.empty() ? 200 : 0;
   int minBluish = 0;
@@ -849,7 +956,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     // (mirroring the desktop Shift-boost / Ctrl-snap modifiers).
     app.snap = input.gripHeld > 0.5F;
     float speed = kFlySpeed * (app.snap ? kFlyBoost : 1.0F) * dt;
-    cameraFly(rig, {input.moveStick.x * speed, 0.0F, input.moveStick.y * speed});
+    flyCamera(rig, {input.moveStick.x * speed, 0.0F, input.moveStick.y * speed});
     cameraLook(rig, input.turnStick.x * kXrTurnSpeed * dt, input.turnStick.y * kXrTurnSpeed * dt);
 
     if (input.menuPressed) {
@@ -944,7 +1051,7 @@ void updateFlight(App& app, float dt) {
     return;
   }
   float speed = kFlySpeed * (app.flyBoost ? kFlyBoost : 1.0F) * dt;
-  cameraFly(app.camera, local * speed);
+  flyCamera(app.camera, local * speed);
 }
 
 int runInteractive(char const* shaderDir, std::vector<char const*> const& modelPaths) {

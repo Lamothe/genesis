@@ -8,14 +8,17 @@
 
 namespace vredit {
 
-// An .mtl material: diffuse colour, optional texture path (resolved to an
-// image by loadObjFile) and dissolve (1 = opaque, < 1 = blended).
+// An .mtl material: diffuse colour, optional texture paths (resolved to images
+// by loadObjFile) and dissolve (1 = opaque, < 1 = blended).
 struct MtlMaterial {
   std::string name;
   Vec3 colour{1.0F, 1.0F, 1.0F};
   float dissolve{1.0F};
   std::string mapKd;
-  std::int32_t texture{-1}; // index into the textures passed to loadObj
+  std::string mapBump;                   // map_Bump / bump / norm (a normal map)
+  float normalScale{1.0F};               // -bm <scale> on the bump statement
+  std::int32_t texture{-1};              // index into the textures passed to loadObj
+  std::int32_t normalTexture{-1};        // ditto for the normal map; -1 = flat
 };
 
 using MtlMaterials = std::vector<MtlMaterial>;

@@ -59,8 +59,9 @@ struct PushData {
   float model[16];
   float tint[4];
   float params[4];
+  float normalParams[4]; // x: has normal map, y: texture index, z: scale, w: unused
 };
-static_assert(sizeof(PushData) == 96, "push constants must match the shader layout");
+static_assert(sizeof(PushData) == 112, "push constants must match the shader layout");
 
 } // namespace
 
@@ -567,6 +568,11 @@ struct VkRenderer::Impl {
       push.params[3] = item.alpha == AlphaMode::Mask    ? 1.0F
                        : item.alpha == AlphaMode::Blend ? 2.0F
                                                         : 0.0F;
+      push.normalParams[0] =
+          (item.normalMapped && item.normalTexture < textures.size()) ? 1.0F : 0.0F;
+      push.normalParams[1] =
+          item.normalTexture < textures.size() ? static_cast<float>(item.normalTexture) : 0.0F;
+      push.normalParams[2] = item.normalScale;
       vkCmdPushConstants(command, pipelineLayout,
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                          sizeof(PushData), &push);
@@ -1135,12 +1141,18 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   }
   vkDeviceWaitIdle(g.device);
 
+  // Full mip chain: large textures would otherwise lose their detail to
+  // minification (sampling a few texels of an 8K skin map looks smooth).
+  // Level 0 is `image` itself (not copied); levels 1..N are derived.
+  std::vector<Image> levels = buildMipLevels(image);
+  std::uint32_t const mipLevels = static_cast<std::uint32_t>(levels.size() + 1U);
+
   Impl::TextureRecord record{};
   VkImageCreateInfo imageInfo = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
   imageInfo.imageType = VK_IMAGE_TYPE_2D;
   imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
   imageInfo.extent = {image.width, image.height, 1};
-  imageInfo.mipLevels = 1;
+  imageInfo.mipLevels = mipLevels;
   imageInfo.arrayLayers = 1;
   imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
   imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
@@ -1177,7 +1189,7 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
   viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
   viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-  viewInfo.subresourceRange.levelCount = 1;
+  viewInfo.subresourceRange.levelCount = mipLevels;
   viewInfo.subresourceRange.layerCount = 1;
   if (vkCreateImageView(g.device, &viewInfo, nullptr, &record.view) != VK_SUCCESS) {
     std::printf("[vk] texture view creation failed\n");
@@ -1190,13 +1202,13 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
       vkStruct<VkSamplerCreateInfo>(VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
   samplerInfo.magFilter = VK_FILTER_LINEAR;
   samplerInfo.minFilter = VK_FILTER_LINEAR;
-  samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR; // trilinear
   samplerInfo.addressModeU = repeatU ? VK_SAMPLER_ADDRESS_MODE_REPEAT
                                      : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samplerInfo.addressModeV = repeatV ? VK_SAMPLER_ADDRESS_MODE_REPEAT
                                      : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-  samplerInfo.maxLod = 0.0F;
+  samplerInfo.maxLod = static_cast<float>(mipLevels);
   if (vkCreateSampler(g.device, &samplerInfo, nullptr, &record.sampler) != VK_SUCCESS) {
     std::printf("[vk] texture sampler creation failed\n");
     vkDestroyImageView(g.device, record.view, nullptr);
@@ -1205,11 +1217,17 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
     return kInvalidTexture;
   }
 
-  // Staging upload via a one-time command buffer.
+  // Staging upload via a one-time command buffer: every mip level at its own
+  // offset (level 0 = the source image, then the derived levels).
   VkBuffer stagingBuffer = VK_NULL_HANDLE;
   VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
   void* stagingMapped = nullptr;
+  std::vector<VkDeviceSize> levelOffsets(mipLevels, 0);
   VkDeviceSize byteSize = static_cast<VkDeviceSize>(image.rgba.size());
+  for (std::size_t i = 0; i < levels.size(); ++i) {
+    levelOffsets[i + 1U] = byteSize;
+    byteSize += static_cast<VkDeviceSize>(levels[i].rgba.size());
+  }
   if (!g.createBuffer(byteSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       stagingBuffer, stagingMemory, &stagingMapped)) {
@@ -1219,7 +1237,11 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
     vkDestroyImage(g.device, record.image, nullptr);
     return kInvalidTexture;
   }
-  std::memcpy(stagingMapped, image.rgba.data(), image.rgba.size());
+  auto* stagingBytes = static_cast<std::uint8_t*>(stagingMapped);
+  std::memcpy(stagingBytes, image.rgba.data(), image.rgba.size());
+  for (std::size_t i = 0; i < levels.size(); ++i) {
+    std::memcpy(stagingBytes + levelOffsets[i + 1U], levels[i].rgba.data(), levels[i].rgba.size());
+  }
 
   // Failure cleanup: staging plus the record's Vulkan objects. Without this,
   // a failed upload would both leak and masquerade as texture 0.
@@ -1251,7 +1273,7 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   toTransfer.image = record.image;
   toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-  toTransfer.subresourceRange.levelCount = 1;
+  toTransfer.subresourceRange.levelCount = mipLevels;
   toTransfer.subresourceRange.layerCount = 1;
   VkImageMemoryBarrier2 toSample = toTransfer;
   toSample.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -1266,12 +1288,18 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   dependency.pImageMemoryBarriers = &toTransfer;
   vkCmdPipelineBarrier2(g.command, &dependency);
 
-  VkBufferImageCopy copy{};
-  copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-  copy.imageSubresource.layerCount = 1;
-  copy.imageExtent = {image.width, image.height, 1};
-  vkCmdCopyBufferToImage(g.command, stagingBuffer, record.image,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  for (std::uint32_t level = 0; level < mipLevels; ++level) {
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = levelOffsets[level];
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.mipLevel = level;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = level == 0U
+                           ? VkExtent3D{image.width, image.height, 1}
+                           : VkExtent3D{levels[level - 1U].width, levels[level - 1U].height, 1};
+    vkCmdCopyBufferToImage(g.command, stagingBuffer, record.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  }
 
   dependency.pImageMemoryBarriers = &toSample;
   vkCmdPipelineBarrier2(g.command, &dependency);

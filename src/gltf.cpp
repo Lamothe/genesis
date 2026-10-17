@@ -151,6 +151,10 @@ private:
   // texture references and undecodable images degrade to untextured with a
   // warning (geometry is still useful); only geometry-maths errors fail.
   bool buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mesh);
+  // Binds glTF texture `textureIndex` (image + sampler wrap modes) into a mesh
+  // slot, decoding and deduping on (image, wrap modes). Bad references leave
+  // the slot unbound.
+  void bindTexture(std::size_t textureIndex, std::int32_t& slotOut);
   Transform parseTransform(JsonDocument::NodeId nodeDef);
 
   std::vector<std::uint8_t> const& bytes_;
@@ -418,26 +422,47 @@ bool GlbReader::buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mes
   }
 
   JsonDocument::NodeId baseColorTexture = document_.member(pbr, "baseColorTexture");
-  if (document_.type(document_.member(baseColorTexture, "index")) != JsonDocument::Type::Number) {
-    return true;
+  if (document_.type(document_.member(baseColorTexture, "index")) == JsonDocument::Type::Number) {
+    std::size_t textureIndex = 0;
+    if (readOptionalSize(document_.member(baseColorTexture, "index"), textureIndex,
+                         "baseColorTexture index")) {
+      bindTexture(textureIndex, mesh.texture);
+    } else {
+      error_.clear();
+    }
   }
-  std::size_t textureIndex = 0;
-  if (!readOptionalSize(document_.member(baseColorTexture, "index"), textureIndex,
-                        "baseColorTexture index")) {
-    error_.clear();
-    return true;
+
+  // Tangent-space normal map (core glTF material.normalTexture; `scale` tilts
+  // the xy strength).
+  JsonDocument::NodeId normalTexture = document_.member(materialNode, "normalTexture");
+  if (document_.type(document_.member(normalTexture, "index")) == JsonDocument::Type::Number) {
+    std::size_t textureIndex = 0;
+    if (readOptionalSize(document_.member(normalTexture, "index"), textureIndex,
+                         "normalTexture index")) {
+      bindTexture(textureIndex, mesh.normalTexture);
+    } else {
+      error_.clear();
+    }
+    JsonDocument::NodeId scaleNode = document_.member(normalTexture, "scale");
+    if (document_.type(scaleNode) == JsonDocument::Type::Number) {
+      mesh.normalScale = static_cast<float>(document_.asNumber(scaleNode));
+    }
   }
+  return true;
+}
+
+void GlbReader::bindTexture(std::size_t textureIndex, std::int32_t& slotOut) {
   JsonDocument::NodeId textureNode = document_.element(texturesNode_, textureIndex);
   if (textureNode == JsonDocument::kInvalid) {
-    return true;
+    return;
   }
   std::size_t sourceIndex = 0;
   if (!readSize(document_.member(textureNode, "source"), sourceIndex, "texture source")) {
     error_.clear();
-    return true;
+    return;
   }
   if (sourceIndex >= document_.size(imagesNode_)) {
-    return true;
+    return;
   }
 
   // Sampler wrap modes (mirrored-repeat approximates to repeat). A bad sampler
@@ -464,8 +489,8 @@ bool GlbReader::buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mes
   // different texture, so the cache keys on both.
   for (TextureKey const& key : textureCache_) {
     if (key.source == sourceIndex && key.repeatU == repeatU && key.repeatV == repeatV) {
-      mesh.texture = key.texture;
-      return true;
+      slotOut = key.texture;
+      return;
     }
   }
 
@@ -476,7 +501,7 @@ bool GlbReader::buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mes
       !readSize(viewIndexNode, viewIndex, "image bufferView") || viewIndex >= bufferViews_.size()) {
     error_.clear();
     std::printf("glb: image %zu not embedded; texture skipped\n", sourceIndex);
-    return true;
+    return;
   }
   BufferView const& view = bufferViews_[viewIndex];
   ModelTexture texture;
@@ -486,13 +511,12 @@ bool GlbReader::buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mes
     std::printf("glb: image %zu failed to decode (%s); texture skipped\n", sourceIndex,
                 error_.c_str());
     error_.clear();
-    return true;
+    return;
   }
   model_.textures.push_back(std::move(texture));
   std::int32_t handle = static_cast<std::int32_t>(model_.textures.size() - 1U);
   textureCache_.push_back({sourceIndex, repeatU, repeatV, handle});
-  mesh.texture = handle;
-  return true;
+  slotOut = handle;
 }
 
 bool GlbReader::addPrimitive(JsonDocument::NodeId primitiveNode, std::int32_t& meshIndexOut) {

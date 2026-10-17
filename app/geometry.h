@@ -17,6 +17,9 @@ using RendererVertex = MeshVertex; // single vertex format for the pipeline
 struct DrawItem {
   MeshHandle mesh{0};         // renderer-registered mesh; 0 = built-in cube
   TextureHandle texture{0};   // renderer-registered texture; 0 = white fallback
+  TextureHandle normalTexture{0}; // normal-map slot (used when normalMapped)
+  bool normalMapped{false};
+  float normalScale{1.0F};    // glTF normalTexture.scale
   Mat4 model;
   Vec3 colour{1.0F, 1.0F, 1.0F};
   float alphaFactor{1.0F};

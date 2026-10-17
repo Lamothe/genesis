@@ -18,4 +18,9 @@ struct Image {
 // the magic bytes. On failure the output is reset and error is set.
 bool decodeImage(std::uint8_t const* bytes, std::size_t size, Image& out, std::string& error);
 
+// Builds the derived mip levels below `base`: each halves the dimensions (odd
+// sizes ceil-divide) with a 2x2 box filter, down to 1x1. Level 0 (`base`
+// itself) is not copied — callers upload it directly.
+std::vector<Image> buildMipLevels(Image const& base);
+
 } // namespace vredit

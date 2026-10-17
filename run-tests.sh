@@ -16,6 +16,10 @@ if command -v magick >/dev/null 2>&1; then
   magick -size 8x8 xc:'rgba(255,0,0,0.5)' "$FIX/alpha.png"
   magick -size 8x8 xc:red -colors 4 "PNG8:$FIX/palette.png"
   magick \( xc:'#ff0000' xc:'#0000ff' +append \) \( xc:'#0000ff' xc:'#ff0000' +append \) -append "$FIX/checker2.png"
+  magick -size 2x2 xc:'rgb(128,255,128)' "$FIX/normal-up.png"  # flat tangent-space +Y normal
+  magick -size 2x2 xc:'rgb(201,201,201)' "$FIX/normal-tri.png" # diagonal (+X+Y+Z) tangent normal
+  magick -size 9000x9000 xc:'gray(80)' "$FIX/big9k.png"      # above the old 64M-pixel cap
+  magick -size 20000x20000 xc:'gray(80)' "$FIX/huge20k.png"  # above any sane cap
   magick -size 8x8 xc:'#3060a0' -quality 95 "$FIX/blue.jpg"
   magick -size 8x8 xc:'gray(64)' -quality 95 "$FIX/grey.jpg"
   magick \( -size 8x8 xc:red xc:blue +append \) -quality 95 "$FIX/two.jpg"

@@ -958,6 +958,30 @@ void testGlbInterleavedAccessors() {
   CHECK_NEAR3(model.meshes[0].data.vertices[1].normal, {0.0F, 0.0F, 1.0F}); // strided read
 }
 
+void testDecodeSizeCaps() {
+  // Production textures exceed the old 64M-pixel decode cap (a 12288^2 normal
+  // map is ~151M pixels); absurd declarations must still be rejected up front.
+  auto load = [](char const* path, Image& image, std::string& error) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+      return false;
+    }
+    std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(file)),
+                                    std::istreambuf_iterator<char>());
+    return decodeImage(bytes.data(), bytes.size(), image, error);
+  };
+
+  Image image;
+  std::string error;
+  if (!load(".build/fixtures/big9k.png", image, error)) {
+    std::printf("  (size cap test skipped: .build/fixtures not present)\n");
+    return;
+  }
+  CHECK(image.width == 9000U && image.height == 9000U); // 81M pixels: allowed
+  CHECK(!load(".build/fixtures/huge20k.png", image, error));
+  CHECK(error.find("bad dimensions") != std::string::npos); // 400M pixels: rejected
+}
+
 void testGlbTextureAndUv() {
   using namespace fixtures;
   // Reads the checkerboard PNG fixture and embeds it as an image bufferView.
@@ -968,8 +992,11 @@ void testGlbTextureAndUv() {
   }
   std::vector<std::uint8_t> png((std::istreambuf_iterator<char>(checker)),
                                 std::istreambuf_iterator<char>());
+  std::ifstream normalUpFile(".build/fixtures/normal-up.png", std::ios::binary);
+  std::vector<std::uint8_t> normalUp((std::istreambuf_iterator<char>(normalUpFile)),
+                                     std::istreambuf_iterator<char>());
 
-  // BIN: positions (36) + texcoords (24) + indices (6) + PNG bytes.
+  // BIN: positions (36) + texcoords (24) + indices (6) + PNG bytes + normal PNG.
   std::vector<std::uint8_t> bin;
   float const positions[9] = {0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
   float const uvs[6] = {0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F};
@@ -982,6 +1009,8 @@ void testGlbTextureAndUv() {
   bin.insert(bin.end(), rawIndices, rawIndices + 6);
   std::size_t pngOffset = bin.size();
   bin.insert(bin.end(), png.begin(), png.end());
+  std::size_t normalOffset = bin.size();
+  bin.insert(bin.end(), normalUp.begin(), normalUp.end());
 
   std::string json =
       R"({"asset": {"version": "2.0"}, "scenes": [{"nodes": [0]}], "scene": 0,)"
@@ -989,28 +1018,35 @@ void testGlbTextureAndUv() {
       R"( "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "TEXCOORD_0": 1}, )"
       R"("indices": 2, "material": 0}]}],)"
       R"( "materials": [{"alphaMode": "MASK", "alphaCutoff": 0.4, )"
-      R"("pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],)"
-      R"( "textures": [{"source": 0, "sampler": 0}],)"
+      R"("pbrMetallicRoughness": {"baseColorTexture": {"index": 0}},)"
+      R"( "normalTexture": {"index": 1, "scale": 0.7}}],)"
+      R"( "textures": [{"source": 0, "sampler": 0}, {"source": 1, "sampler": 0}],)"
       R"( "samplers": [{"wrapS": 33071, "wrapT": 10497}],)"
-      R"( "images": [{"bufferView": 2, "mimeType": "image/png"}],)"
+      R"( "images": [{"bufferView": 2, "mimeType": "image/png"},)"
+      R"(             {"bufferView": 3, "mimeType": "image/png"}],)"
       R"( "accessors": [{"bufferView": 0, "byteOffset": 0, "componentType": 5126, "count": 3, "type": "VEC3"},)"
       R"(                {"bufferView": 0, "byteOffset": 36, "componentType": 5126, "count": 3, "type": "VEC2"},)"
       R"(                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}],)"
       R"( "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 60},)"
       R"(                 {"buffer": 0, "byteOffset": 60, "byteLength": 6},)"
       R"(                 {"buffer": 0, "byteOffset": )"
-      + std::to_string(pngOffset) + R"(, "byteLength": )" + std::to_string(png.size()) + R"(}],)"
+      + std::to_string(pngOffset) + R"(, "byteLength": )" + std::to_string(png.size()) + R"(},)"
+      R"(                 {"buffer": 0, "byteOffset": )"
+      + std::to_string(normalOffset) + R"(, "byteLength": )" + std::to_string(normalUp.size()) +
+      R"(}],)"
       R"( "buffers": [{"byteLength": )" + std::to_string(bin.size()) + R"(}]})";
 
   Model model;
   std::string error;
   CHECK(loadGlb(buildGlb(json, bin), model, error));
-  CHECK(model.textures.size() == 1U);
+  CHECK(model.textures.size() == 2U);
   CHECK(model.textures[0].image.width == 2U && model.textures[0].image.height == 2U);
   CHECK(!model.textures[0].repeatU); // wrapS 33071 = clamp
   CHECK(model.textures[0].repeatV);
   CHECK(model.meshes.size() == 1U);
   CHECK(model.meshes[0].texture == 0);
+  CHECK(model.meshes[0].normalTexture == 1); // material.normalTexture index
+  CHECK_NEAR(model.meshes[0].normalScale, 0.7F, 1e-6F);
   CHECK(model.meshes[0].alpha == AlphaMode::Mask);
   CHECK_NEAR(model.meshes[0].alphaCutoff, 0.4F, 1e-6F);
   CHECK_NEAR(model.meshes[0].alphaFactor, 1.0F, 1e-6F);
@@ -1018,7 +1054,9 @@ void testGlbTextureAndUv() {
   CHECK_NEAR2(model.meshes[0].data.vertices[2].uv, {0.0F, 1.0F});
   CHECK(model.meshes[0].data.vertices[0].normal.z > 0.9F); // generated normal (+Z)
 
-  // End-to-end fixture for the renderer smoke run (best effort).
+  // End-to-end fixture for the renderer smoke run (best effort). The normal
+  // map is a flat +Y tangent normal: normal-mapped shading must brighten the
+  // scene vs flat normals (the smoke toggles it and compares luminance).
   writeFile(".build/test-textured.glb", buildGlb(json, bin));
 }
 
@@ -1172,9 +1210,80 @@ void testObjLoader() {
                                   std::istreambuf_iterator<char>());
     fixtures::writeFile(".build/test-texture.png", png);
   }
+
+  // map_Bump binds a normal map through the same texture list (option flags
+  // like -bm are skipped; the last token is the path).
+  MtlMaterials bumpMats;
+  CHECK(parseMtl("newmtl B\nKd 1 1 1\nmap_Bump -bm 0.5 normal-up.png\n", bumpMats));
+  CHECK(bumpMats.size() == 1U);
+  CHECK(bumpMats[0].mapBump == "normal-up.png");
+  CHECK(bumpMats[0].mapKd.empty());
+  CHECK_NEAR(bumpMats[0].normalScale, 0.5F, 1e-6F); // -bm value captured
+  MtlMaterials kdMats;
+  CHECK(parseMtl("newmtl K\nmap_Kd -s 1 1 1 tex.png\n", kdMats));
+  CHECK(kdMats.size() == 1U && kdMats[0].mapKd == "tex.png"); // options skipped
+  ModelTexture flatNormal;
+  flatNormal.image.width = 1;
+  flatNormal.image.height = 1;
+  flatNormal.image.rgba = {128U, 128U, 255U, 255U};
+  std::vector<ModelTexture> bumpTextures{flatNormal};
+  bumpMats[0].normalTexture = 0;
+  Model bumpModel;
+  CHECK(loadObj("o Q\nusemtl B\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", bumpMats, bumpTextures,
+                bumpModel, error));
+  CHECK(bumpModel.meshes.size() == 1U);
+  CHECK(bumpModel.meshes[0].normalTexture == 0);
 }
 
 } // namespace
+
+void testMipChain() {
+  // 4x4 checkerboard: the first derived level averages each 2x2 block, then
+  // the mean. Level 0 (the base) is not part of the output.
+  Image base;
+  base.width = 4;
+  base.height = 4;
+  base.rgba.assign(4U * 4U * 4U, 0U);
+  for (std::uint32_t y = 0; y < 4; ++y) {
+    for (std::uint32_t x = 0; x < 4; ++x) {
+      std::uint8_t v = ((x + y) % 2U) == 0U ? 255U : 0U;
+      std::size_t p = (static_cast<std::size_t>(y) * 4 + x) * 4U;
+      base.rgba[p] = v;
+      base.rgba[p + 1U] = v;
+      base.rgba[p + 2U] = v;
+      base.rgba[p + 3U] = 255U;
+    }
+  }
+  auto levels = buildMipLevels(base);
+  CHECK(levels.size() == 2U); // 2x2 -> 1x1 below the 4x4 base
+  CHECK(levels[0].width == 2 && levels[0].height == 2);
+  CHECK(levels[1].width == 1 && levels[1].height == 1);
+  // Every 2x2 block of the checkerboard averages to half.
+  CHECK(levels[0].rgba[0] == 128U && levels[0].rgba[4] == 128U);
+  CHECK(levels[0].rgba[8] == 128U && levels[0].rgba[12] == 128U);
+  CHECK(levels[1].rgba[0] == 128U);
+  CHECK(levels[1].rgba[3] == 255U); // alpha is preserved
+
+  // Odd dimensions ceil-divide and never over-read.
+  Image odd;
+  odd.width = 3;
+  odd.height = 5;
+  odd.rgba.assign(3U * 5U * 4U, 200U);
+  auto oddLevels = buildMipLevels(odd);
+  CHECK(oddLevels.size() == 3U); // 2x3 -> 1x2 -> 1x1 below the 3x5 base
+  CHECK(oddLevels[0].width == 2 && oddLevels[0].height == 3);
+  CHECK(oddLevels[0].rgba[0] == 200U);
+  CHECK(oddLevels[2].width == 1 && oddLevels[2].height == 1);
+
+  // Degenerate inputs yield nothing; a 1x1 base has one derived level (1x1).
+  Image one;
+  one.width = 1;
+  one.height = 1;
+  one.rgba = {1U, 2U, 3U, 4U};
+  auto oneLevels = buildMipLevels(one);
+  CHECK(oneLevels.size() == 1U && oneLevels[0].width == 1 && oneLevels[0].height == 1);
+  CHECK(buildMipLevels(Image{}).empty());
+}
 
 void testHandlePickingByRay() {
   // Segment distances from a half-line, including behind-origin clamping.
@@ -1323,6 +1432,7 @@ int main() {
   testCameraFraming();
   testCameraManipulation();
   testXrMath();
+  testMipChain();
   testSegmentAndPolygonPicking();
   testHandlePicking();
   testHandlePickingBehindCamera();
@@ -1330,6 +1440,7 @@ int main() {
   testJsonParser();
   testMeshBounds();
   testImageDecode();
+  testDecodeSizeCaps();
   testGlbLoader();
   testGlbInterleavedAccessors();
   testGlbTextureAndUv();

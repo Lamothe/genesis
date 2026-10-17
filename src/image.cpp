@@ -82,9 +82,10 @@ bool decodePng(std::uint8_t const* bytes, std::size_t size, Image& out, std::str
       colourType = chunkData[9];
       interlace = chunkData[12];
       // Same total-pixel cap as the JPEG path: hostile dimensions must not
-      // drive multi-GB allocations.
+      // drive multi-GB allocations. 268M pixels = 16384^2, the typical GPU
+      // 2D texture limit (production texture sets do contain 12K maps).
       if (width == 0U || height == 0U || width > 65536U || height > 65536U ||
-          static_cast<std::uint64_t>(width) * height > 67108864ULL) {
+          static_cast<std::uint64_t>(width) * height > 268435456ULL) {
         return fail(error, "png: bad dimensions");
       }
       if (chunkData[10] != 0U || chunkData[11] != 0U) {
@@ -568,7 +569,8 @@ bool decodeJpeg(std::uint8_t const* bytes, std::size_t size, Image& out, std::st
       frame.height = readU16BE(payload + 1U);
       frame.width = readU16BE(payload + 3U);
       int componentCount = payload[5];
-      if (frame.width == 0U || frame.height == 0U || frame.width * frame.height > 67108864U) {
+      if (frame.width == 0U || frame.height == 0U ||
+          static_cast<std::uint64_t>(frame.width) * frame.height > 268435456ULL) {
         return fail(error, "jpeg: bad dimensions");
       }
       if (componentCount != 1 && componentCount != 3) {
@@ -875,6 +877,64 @@ bool decodeImage(std::uint8_t const* bytes, std::size_t size, Image& out, std::s
   }
   out = std::move(decoded);
   return true;
+}
+
+namespace {
+
+// One halving box-filter step; odd sizes ceil-divide and edge texels that fall
+// outside contribute nothing (their weight is dropped).
+Image downsample(Image const& src) {
+  Image dst;
+  dst.width = (src.width + 1U) / 2U;
+  dst.height = (src.height + 1U) / 2U;
+  if (dst.width == 0U || dst.height == 0U) {
+    return dst;
+  }
+  dst.rgba.assign(static_cast<std::size_t>(dst.width) * dst.height * 4U, 0U);
+  for (std::uint32_t y = 0; y < dst.height; ++y) {
+    for (std::uint32_t x = 0; x < dst.width; ++x) {
+      std::uint32_t sum[4] = {0U, 0U, 0U, 0U};
+      std::uint32_t count = 0U;
+      for (std::uint32_t dy = 0; dy < 2U; ++dy) {
+        for (std::uint32_t dx = 0; dx < 2U; ++dx) {
+          std::uint32_t sx = x * 2U + dx;
+          std::uint32_t sy = y * 2U + dy;
+          if (sx >= src.width || sy >= src.height) {
+            continue;
+          }
+          std::size_t p = (static_cast<std::size_t>(sy) * src.width + sx) * 4U;
+          for (int c = 0; c < 4; ++c) {
+            sum[c] += src.rgba[p + static_cast<std::size_t>(c)];
+          }
+          ++count;
+        }
+      }
+      std::size_t d = (static_cast<std::size_t>(y) * dst.width + x) * 4U;
+      for (int c = 0; c < 4; ++c) {
+        dst.rgba[d + static_cast<std::size_t>(c)] =
+            static_cast<std::uint8_t>(count > 0U ? (sum[c] + count / 2U) / count : 0U);
+      }
+    }
+  }
+  return dst;
+}
+
+} // namespace
+
+std::vector<Image> buildMipLevels(Image const& base) {
+  std::vector<Image> levels;
+  if (base.width == 0U || base.height == 0U || base.rgba.empty()) {
+    return levels;
+  }
+  Image current = downsample(base);
+  while (current.width > 0U && current.height > 0U) {
+    levels.push_back(std::move(current));
+    if (levels.back().width == 1U && levels.back().height == 1U) {
+      break;
+    }
+    current = downsample(levels.back());
+  }
+  return levels;
 }
 
 } // namespace vredit
