@@ -1,9 +1,11 @@
 #include "gltf.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 
+#include "image.h"
 #include "json.h"
 
 namespace vredit {
@@ -145,7 +147,10 @@ private:
   bool addPrimitive(JsonDocument::NodeId primitiveNode, std::int32_t& meshIndexOut);
   bool collectNode(std::size_t nodeIndex, std::int32_t parentModel, std::int32_t& modelIndexOut,
                    std::uint32_t depth);
-  Vec3 materialColour(JsonDocument::NodeId primitiveNode);
+  // Fills material colour, texture index and alpha on the mesh. Bad material/
+  // texture references and undecodable images degrade to untextured with a
+  // warning (geometry is still useful); only geometry-maths errors fail.
+  bool buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mesh);
   Transform parseTransform(JsonDocument::NodeId nodeDef);
 
   std::vector<std::uint8_t> const& bytes_;
@@ -159,6 +164,16 @@ private:
   JsonDocument::NodeId meshesNode_{JsonDocument::kInvalid};
   JsonDocument::NodeId materialsNode_{JsonDocument::kInvalid};
   JsonDocument::NodeId nodesNode_{JsonDocument::kInvalid};
+  JsonDocument::NodeId texturesNode_{JsonDocument::kInvalid};
+  JsonDocument::NodeId samplersNode_{JsonDocument::kInvalid};
+  JsonDocument::NodeId imagesNode_{JsonDocument::kInvalid};
+  struct TextureKey {
+    std::size_t source{0};
+    bool repeatU{true};
+    bool repeatV{true};
+    std::int32_t texture{-1};
+  };
+  std::vector<TextureKey> textureCache_; // dedupe on (image, wrap modes)
   std::vector<bool> visited_;
 };
 
@@ -366,24 +381,118 @@ Transform GlbReader::parseTransform(JsonDocument::NodeId nodeDef) {
   return transform;
 }
 
-Vec3 GlbReader::materialColour(JsonDocument::NodeId primitiveNode) {
-  // Colour is cosmetic: a bad material reference falls back to white rather
-  // than failing the geometry.
+bool GlbReader::buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mesh) {
+  // Colour and alpha are cosmetic: bad references fall back to defaults.
+  JsonDocument::NodeId materialIndexNode = document_.member(primitiveNode, "material");
+  if (document_.type(materialIndexNode) != JsonDocument::Type::Number) {
+    return true;
+  }
   std::size_t materialIndex = 0;
-  if (!readOptionalSize(document_.member(primitiveNode, "material"), materialIndex, "material")) {
+  if (!readOptionalSize(materialIndexNode, materialIndex, "material")) {
     error_.clear();
-    return {1.0F, 1.0F, 1.0F};
+    return true;
   }
   JsonDocument::NodeId materialNode = document_.element(materialsNode_, materialIndex);
   JsonDocument::NodeId pbr = document_.member(materialNode, "pbrMetallicRoughness");
   JsonDocument::NodeId factor = document_.member(pbr, "baseColorFactor");
   if (document_.type(factor) == JsonDocument::Type::Array && document_.size(factor) >= 3U) {
-    return {
+    mesh.colour = {
         static_cast<float>(document_.asNumber(document_.element(factor, 0))),
         static_cast<float>(document_.asNumber(document_.element(factor, 1))),
         static_cast<float>(document_.asNumber(document_.element(factor, 2)))};
   }
-  return {1.0F, 1.0F, 1.0F};
+
+  JsonDocument::NodeId alphaModeNode = document_.member(materialNode, "alphaMode");
+  std::string const& alphaMode = document_.asString(alphaModeNode);
+  if (alphaMode == "MASK") {
+    mesh.alpha = AlphaMode::Mask;
+  } else if (alphaMode == "BLEND") {
+    mesh.alpha = AlphaMode::Blend;
+  }
+  JsonDocument::NodeId cutoffNode = document_.member(materialNode, "alphaCutoff");
+  if (document_.type(cutoffNode) == JsonDocument::Type::Number) {
+    mesh.alphaCutoff = static_cast<float>(document_.asNumber(cutoffNode));
+  }
+  if (document_.type(factor) == JsonDocument::Type::Array && document_.size(factor) >= 4U) {
+    mesh.alphaFactor = static_cast<float>(document_.asNumber(document_.element(factor, 3)));
+  }
+
+  JsonDocument::NodeId baseColorTexture = document_.member(pbr, "baseColorTexture");
+  if (document_.type(document_.member(baseColorTexture, "index")) != JsonDocument::Type::Number) {
+    return true;
+  }
+  std::size_t textureIndex = 0;
+  if (!readOptionalSize(document_.member(baseColorTexture, "index"), textureIndex,
+                        "baseColorTexture index")) {
+    error_.clear();
+    return true;
+  }
+  JsonDocument::NodeId textureNode = document_.element(texturesNode_, textureIndex);
+  if (textureNode == JsonDocument::kInvalid) {
+    return true;
+  }
+  std::size_t sourceIndex = 0;
+  if (!readSize(document_.member(textureNode, "source"), sourceIndex, "texture source")) {
+    error_.clear();
+    return true;
+  }
+  if (sourceIndex >= document_.size(imagesNode_)) {
+    return true;
+  }
+
+  // Sampler wrap modes (mirrored-repeat approximates to repeat). A bad sampler
+  // reference is cosmetic: default to repeat.
+  bool repeatU = true;
+  bool repeatV = true;
+  std::size_t samplerIndex = 0;
+  if (!readOptionalSize(document_.member(textureNode, "sampler"), samplerIndex, "sampler")) {
+    error_.clear();
+  } else if (document_.type(document_.member(textureNode, "sampler")) ==
+             JsonDocument::Type::Number) {
+    JsonDocument::NodeId samplerNode = document_.element(samplersNode_, samplerIndex);
+    JsonDocument::NodeId wrapS = document_.member(samplerNode, "wrapS");
+    JsonDocument::NodeId wrapT = document_.member(samplerNode, "wrapT");
+    if (document_.type(wrapS) == JsonDocument::Type::Number) {
+      repeatU = document_.asNumber(wrapS) != 33071.0;
+    }
+    if (document_.type(wrapT) == JsonDocument::Type::Number) {
+      repeatV = document_.asNumber(wrapT) != 33071.0;
+    }
+  }
+
+  // glTF texture = image + sampler: same image with different wrap modes is a
+  // different texture, so the cache keys on both.
+  for (TextureKey const& key : textureCache_) {
+    if (key.source == sourceIndex && key.repeatU == repeatU && key.repeatV == repeatV) {
+      mesh.texture = key.texture;
+      return true;
+    }
+  }
+
+  JsonDocument::NodeId imageNode = document_.element(imagesNode_, sourceIndex);
+  JsonDocument::NodeId viewIndexNode = document_.member(imageNode, "bufferView");
+  std::size_t viewIndex = 0;
+  if (document_.type(viewIndexNode) != JsonDocument::Type::Number ||
+      !readSize(viewIndexNode, viewIndex, "image bufferView") || viewIndex >= bufferViews_.size()) {
+    error_.clear();
+    std::printf("glb: image %zu not embedded; texture skipped\n", sourceIndex);
+    return true;
+  }
+  BufferView const& view = bufferViews_[viewIndex];
+  ModelTexture texture;
+  texture.repeatU = repeatU;
+  texture.repeatV = repeatV;
+  if (!decodeImage(view.data, view.length, texture.image, error_)) {
+    std::printf("glb: image %zu failed to decode (%s); texture skipped\n", sourceIndex,
+                error_.c_str());
+    error_.clear();
+    return true;
+  }
+  model_.textures.push_back(std::move(texture));
+  std::int32_t handle = static_cast<std::int32_t>(model_.textures.size() - 1U);
+  textureCache_.push_back({sourceIndex, repeatU, repeatV, handle});
+  mesh.texture = handle;
+  return true;
 }
 
 bool GlbReader::addPrimitive(JsonDocument::NodeId primitiveNode, std::int32_t& meshIndexOut) {
@@ -429,8 +538,22 @@ bool GlbReader::addPrimitive(JsonDocument::NodeId primitiveNode, std::int32_t& m
     hasColours = colours.components >= 3U && colours.count == positions.count;
   }
 
+  AccessorView texcoords{};
+  bool hasUvs = false;
+  std::size_t texcoordIndex = 0;
+  if (readOptionalSize(document_.member(attributes, "TEXCOORD_0"), texcoordIndex,
+                       "TEXCOORD_0 accessor") &&
+      document_.type(document_.member(attributes, "TEXCOORD_0")) == JsonDocument::Type::Number) {
+    if (!buildAccessor(document_.element(accessorsNode_, texcoordIndex), texcoords)) {
+      return false;
+    }
+    hasUvs = texcoords.components >= 2U && texcoords.count == positions.count;
+  }
+
   ModelMesh mesh;
-  mesh.colour = materialColour(primitiveNode);
+  if (!buildMaterial(primitiveNode, mesh)) {
+    return false;
+  }
   mesh.data.vertices.resize(positions.count);
   for (std::size_t v = 0; v < positions.count; ++v) {
     MeshVertex& vertex = mesh.data.vertices[v];
@@ -444,6 +567,9 @@ bool GlbReader::addPrimitive(JsonDocument::NodeId primitiveNode, std::int32_t& m
                         ? Vec3{readComponentFloat(normals, v, 0), readComponentFloat(normals, v, 1),
                                readComponentFloat(normals, v, 2)}
                         : Vec3{0.0F, 0.0F, 0.0F};
+    vertex.uv = hasUvs ? Vec2{readComponentFloat(texcoords, v, 0),
+                              readComponentFloat(texcoords, v, 1)}
+                       : Vec2{0.0F, 0.0F};
   }
 
   std::size_t indicesIndex = 0;
@@ -577,6 +703,9 @@ bool GlbReader::run() {
   meshesNode_ = document_.member(root, "meshes");
   materialsNode_ = document_.member(root, "materials");
   nodesNode_ = document_.member(root, "nodes");
+  texturesNode_ = document_.member(root, "textures");
+  samplersNode_ = document_.member(root, "samplers");
+  imagesNode_ = document_.member(root, "images");
   visited_.assign(document_.size(nodesNode_), false);
 
   JsonDocument::NodeId scenesNode = document_.member(root, "scenes");

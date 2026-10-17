@@ -8,21 +8,15 @@ namespace {
 
 constexpr float kPi = 3.14159265359F;
 constexpr float kMaxPitch = 1.55F;
-constexpr float kMinDistance = 0.05F;
-constexpr float kMaxDistance = 500.0F;
 
 } // namespace
 
-Vec3 cameraPosition(Camera const& camera) {
+Vec3 cameraForward(Camera const& camera) {
   float cp = std::cos(camera.pitch);
   float sp = std::sin(camera.pitch);
   float sy = std::sin(camera.yaw);
   float cy = std::cos(camera.yaw);
-  return camera.target + Vec3{cp * sy, sp, cp * cy} * camera.distance;
-}
-
-Vec3 cameraForward(Camera const& camera) {
-  return normalized(camera.target - cameraPosition(camera));
+  return {sy * cp, sp, -cy * cp};
 }
 
 Vec3 cameraRight(Camera const& camera) {
@@ -34,7 +28,7 @@ Vec3 cameraUp(Camera const& camera) {
 }
 
 Mat4 cameraView(Camera const& camera) {
-  Vec3 eye = cameraPosition(camera);
+  Vec3 const& eye = camera.position;
   Vec3 f = cameraForward(camera);
   Vec3 r = cameraRight(camera);
   Vec3 u = cameraUp(camera);
@@ -91,14 +85,14 @@ Ray cameraRay(Camera const& camera, float aspect, Vec2 pixel, Vec2 viewportSize)
   float ndcY = (pixel.y / viewportSize.y) * 2.0F - 1.0F;
   Mat4 invView;
   if (!invertAffine(cameraView(camera), invView)) {
-    return {cameraPosition(camera), cameraForward(camera)};
+    return {camera.position, cameraForward(camera)};
   }
   Vec3 nearWorld = transformPoint(invView, ndcToView(camera, aspect, ndcX, ndcY, camera.nearZ));
   Vec3 farWorld = transformPoint(invView, ndcToView(camera, aspect, ndcX, ndcY, camera.farZ));
-  return {cameraPosition(camera), normalized(farWorld - nearWorld)};
+  return {camera.position, normalized(farWorld - nearWorld)};
 }
 
-void cameraOrbit(Camera& camera, float dYaw, float dPitch) {
+void cameraLook(Camera& camera, float dYaw, float dPitch) {
   camera.yaw += dYaw;
   camera.pitch += dPitch;
   if (camera.pitch > kMaxPitch) {
@@ -106,27 +100,29 @@ void cameraOrbit(Camera& camera, float dYaw, float dPitch) {
   } else if (camera.pitch < -kMaxPitch) {
     camera.pitch = -kMaxPitch;
   }
+  // Keep yaw bounded for float health on long sessions.
+  if (camera.yaw > kPi || camera.yaw < -kPi) {
+    camera.yaw = std::remainder(camera.yaw, 2.0F * kPi);
+  }
+}
+
+void cameraFly(Camera& camera, Vec3 localMetres) {
+  camera.position = camera.position + cameraRight(camera) * localMetres.x +
+                    Vec3{0.0F, 1.0F, 0.0F} * localMetres.y +
+                    cameraForward(camera) * localMetres.z;
 }
 
 void cameraDolly(Camera& camera, float amount) {
-  float factor = std::exp(-amount * 0.15F);
-  float distance = camera.distance * factor;
-  if (distance < kMinDistance) {
-    distance = kMinDistance;
-  } else if (distance > kMaxDistance) {
-    distance = kMaxDistance;
-  }
-  camera.distance = distance;
+  camera.position = camera.position + cameraForward(camera) * amount;
 }
 
 void cameraPan(Camera& camera, float dPixelX, float dPixelY, float viewportHeightPx) {
   if (viewportHeightPx <= 0.0F) {
     return;
   }
-  float worldPerPixel =
-      2.0F * camera.distance * std::tan(camera.fovY * 0.5F) / viewportHeightPx;
-  camera.target = camera.target - cameraRight(camera) * (dPixelX * worldPerPixel) +
-                  cameraUp(camera) * (dPixelY * worldPerPixel);
+  float worldPerPixel = 2.0F * std::tan(camera.fovY * 0.5F) / viewportHeightPx; // at 1 m
+  camera.position = camera.position - cameraRight(camera) * (dPixelX * worldPerPixel) +
+                    cameraUp(camera) * (dPixelY * worldPerPixel);
 }
 
 } // namespace vredit

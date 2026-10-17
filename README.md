@@ -33,11 +33,11 @@ have the neural renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash vr/editor/run-tests.sh        # core tests (203 checks)
+bash vr/editor/run-tests.sh        # core tests (275 checks; image fixtures via ImageMagick)
 bash vr/editor/run-editor.sh       # build + interactive editor
-bash vr/editor/run-editor.sh model.glb other.obj   # load models
+bash vr/editor/run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash vr/editor/run-editor.sh --smoke-offscreen     # render + pixel assertions
-bash vr/editor/run-editor.sh --smoke-offscreen m.glb m.obj   # loader end-to-end
+bash vr/editor/run-editor.sh --smoke-textured      # texture sampling end-to-end
 bash vr/editor/run-editor.sh --smoke-window 30     # windowed present path
 ```
 
@@ -64,6 +64,13 @@ G translate, R rotate, S scale, L world/local space, Ctrl snap, Esc quit.
 - The caller resolves which gizmo handle was grabbed (the renderer knows where
   handles were drawn); this core only does the drag maths and applies it.
 
+## Controls
+
+Free-flight, first-person (VR-friendly): **WASD** move, **Q/E** down/up,
+**Shift** boost, **RMB** mouse-look, **MMB** or **Shift+RMB** pan, **wheel** fly
+forward/back. **LMB** selects and drags the gizmo. **1/2/3** translate/rotate/
+scale, **L** world/local space, **Ctrl** snapping, **Esc** quits.
+
 ## Roadmap
 
 1. ~~Vulkan desktop shell~~ — done: windowed + offscreen renderer, camera,
@@ -71,8 +78,12 @@ G translate, R rotate, S scale, L world/local space, Ctrl snap, Esc quit.
 2. ~~glTF 2.0 (`.glb`) + OBJ loading in C++~~ — done (17/10/2026): strict JSON
    DOM, GLB container/accessor reader (strided/interleaved, normalised colours),
    OBJ/MTL loader, registered indexed meshes, per-mesh bounds picking.
-3. WiVRn/OpenXR VR shell: stereo views through the same interface.
-4. Bind `neural_seam_evaluate` to the native evaluator when the migration
+3. ~~Textures + free-flight camera~~ — done (17/10/2026): hand-written PNG and
+   baseline JPEG decoders (typed C++, zlib for inflate), glTF baseColorTexture
+   and OBJ map_Kd with alpha modes (opaque/mask/blend) and material alpha,
+   first-person free flight (WASD/QE, mouse-look, wheel dolly).
+4. WiVRn/OpenXR VR shell: stereo views through the same interface.
+5. Bind `neural_seam_evaluate` to the native evaluator when the migration
    stream's full native evaluation lands; conform the seam's convention table to
    the pinned native input conventions at that point.
 

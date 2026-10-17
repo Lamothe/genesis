@@ -9,9 +9,9 @@ void appendTriangle(std::vector<RendererVertex>& out,
                     Vec3 b,
                     Vec3 c,
                     Vec3 normal) {
-  out.push_back({a, normal, {1.0F, 1.0F, 1.0F}});
-  out.push_back({b, normal, {1.0F, 1.0F, 1.0F}});
-  out.push_back({c, normal, {1.0F, 1.0F, 1.0F}});
+  out.push_back({a, normal, {1.0F, 1.0F, 1.0F}, {0.0F, 0.0F}});
+  out.push_back({b, normal, {1.0F, 1.0F, 1.0F}, {0.0F, 0.0F}});
+  out.push_back({c, normal, {1.0F, 1.0F, 1.0F}, {0.0F, 0.0F}});
 }
 
 void appendQuad(std::vector<RendererVertex>& out,
@@ -46,10 +46,10 @@ void appendGrid(std::vector<RendererVertex>& out, float extent, float step) {
   for (float v = -extent; v <= extent + 0.5F * step; v += step) {
     bool xAxis = (v == 0.0F);
     bool zAxis = (v == 0.0F);
-    out.push_back({{-extent, 0.0F, v}, up, xAxis ? xColour : gridColour});
-    out.push_back({{extent, 0.0F, v}, up, xAxis ? xColour : gridColour});
-    out.push_back({{v, 0.0F, -extent}, up, zAxis ? zColour : gridColour});
-    out.push_back({{v, 0.0F, extent}, up, zAxis ? zColour : gridColour});
+    out.push_back({{-extent, 0.0F, v}, up, xAxis ? xColour : gridColour, {0.0F, 0.0F}});
+    out.push_back({{extent, 0.0F, v}, up, xAxis ? xColour : gridColour, {0.0F, 0.0F}});
+    out.push_back({{v, 0.0F, -extent}, up, zAxis ? zColour : gridColour, {0.0F, 0.0F}});
+    out.push_back({{v, 0.0F, extent}, up, zAxis ? zColour : gridColour, {0.0F, 0.0F}});
   }
 }
 
@@ -82,12 +82,12 @@ void appendHandleLines(std::vector<RendererVertex>& out,
       continue;
     }
     for (std::size_t i = 1; i < count; ++i) {
-      out.push_back({geom.points[i - 1U], up, colour});
-      out.push_back({geom.points[i], up, colour});
+      out.push_back({geom.points[i - 1U], up, colour, {0.0F, 0.0F}});
+      out.push_back({geom.points[i], up, colour, {0.0F, 0.0F}});
     }
     if (geom.loop) {
-      out.push_back({geom.points[count - 1U], up, colour});
-      out.push_back({geom.points[0], up, colour});
+      out.push_back({geom.points[count - 1U], up, colour, {0.0F, 0.0F}});
+      out.push_back({geom.points[0], up, colour, {0.0F, 0.0F}});
     }
   }
 }

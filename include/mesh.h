@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "image.h"
 #include "scene.h"
 
 namespace vredit {
@@ -14,11 +15,19 @@ using MeshHandle = std::uint32_t;
 // (0 is the built-in cube).
 constexpr MeshHandle kInvalidMesh = UINT32_MAX;
 
+// Renderer-registered texture handle; 0 is the built-in white fallback.
+using TextureHandle = std::uint32_t;
+constexpr TextureHandle kInvalidTexture = UINT32_MAX;
+
+// How a mesh's alpha channel is rendered.
+enum class AlphaMode : std::uint8_t { Opaque, Mask, Blend };
+
 // Single vertex format for the viewport pipeline and all model loaders.
 struct MeshVertex {
   Vec3 pos;
   Vec3 normal;
   Vec3 colour;
+  Vec2 uv;
 };
 
 struct MeshData {
@@ -38,12 +47,24 @@ struct ModelNode {
 struct ModelMesh {
   MeshData data;
   Vec3 colour{1.0F, 1.0F, 1.0F}; // material base colour multiplier
+  float alphaFactor{1.0F};       // material alpha (dissolve / baseColorFactor.a)
+  std::int32_t texture{-1};      // index into Model::textures; -1 = untextured
+  AlphaMode alpha{AlphaMode::Opaque};
+  float alphaCutoff{0.5F};
+};
+
+// A loaded texture image with sampler-relevant wrap modes.
+struct ModelTexture {
+  Image image;
+  bool repeatU{true};
+  bool repeatV{true};
 };
 
 struct Model {
   std::vector<ModelMesh> meshes;
   std::vector<ModelNode> nodes;
   std::vector<std::int32_t> roots;
+  std::vector<ModelTexture> textures;
 };
 
 // Axis-aligned bounds of mesh data (local space).

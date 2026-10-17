@@ -2,6 +2,7 @@
 // selection, gizmo handles. Typed C++ only; the shell is a thin layer over
 // vredit::Scene/GizmoDrag and VkRenderer.
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <xcb/xcb.h>
@@ -28,7 +30,10 @@ using namespace vredit;
 
 namespace {
 
-constexpr float kOrbitSpeed = 0.005F;
+constexpr float kLookSpeed = 0.005F;     // radians per pixel of mouse look
+constexpr float kFlySpeed = 6.0F;        // metres/second
+constexpr float kFlyBoost = 3.0F;
+constexpr float kWheelMetres = 1.0F;     // metres per wheel notch
 constexpr float kGizmoPixels = 120.0F;
 constexpr float kPickThresholdPx = 8.0F;
 constexpr float kSnapTranslate = 0.25F;
@@ -38,8 +43,12 @@ constexpr float kSnapScale = 0.25F;
 struct NodeVisual {
   NodeId id{kInvalidNode};
   MeshHandle mesh{0};
+  TextureHandle texture{0};
   Aabb localBounds{{-0.5F, -0.5F, -0.5F}, {0.5F, 0.5F, 0.5F}};
   Vec3 colour{1.0F, 1.0F, 1.0F};
+  float alphaFactor{1.0F};
+  AlphaMode alpha{AlphaMode::Opaque};
+  float alphaCutoff{0.5F};
 };
 
 struct App {
@@ -51,10 +60,18 @@ struct App {
   GizmoSpace space{GizmoSpace::World};
   GizmoDrag drag;
   bool dragging{false};
-  bool orbiting{false};
+  bool looking{false};
   bool panning{false};
   bool running{true};
   bool snap{false};
+  // Free-flight state (WASD/QE held keys + Shift boost).
+  bool flyForward{false};
+  bool flyBack{false};
+  bool flyLeft{false};
+  bool flyRight{false};
+  bool flyUp{false};
+  bool flyDown{false};
+  bool flyBoost{false};
   std::uint8_t panButton{0};
   Vec2 lastMouse{};
   std::uint32_t width{1280};
@@ -119,6 +136,15 @@ bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
       return false;
     }
   }
+  std::vector<TextureHandle> textureHandles(model.textures.size(), 0U);
+  for (std::size_t t = 0; t < model.textures.size(); ++t) {
+    textureHandles[t] = renderer.addTexture(model.textures[t].image, model.textures[t].repeatU,
+                                            model.textures[t].repeatV);
+    if (textureHandles[t] == kInvalidTexture) {
+      std::printf("texture registration failed for texture %zu\n", t);
+      return false;
+    }
+  }
   std::vector<NodeId> handles(model.nodes.size(), kInvalidNode);
   for (std::size_t n = 0; n < model.nodes.size(); ++n) {
     ModelNode const& node = model.nodes[n];
@@ -133,6 +159,12 @@ bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
       visual.mesh = meshHandles[static_cast<std::size_t>(node.mesh)];
       visual.localBounds = meshBounds(mesh.data);
       visual.colour = mesh.colour;
+      visual.alphaFactor = mesh.alphaFactor;
+      visual.alpha = mesh.alpha;
+      visual.alphaCutoff = mesh.alphaCutoff;
+      if (mesh.texture >= 0 && static_cast<std::size_t>(mesh.texture) < textureHandles.size()) {
+        visual.texture = textureHandles[static_cast<std::size_t>(mesh.texture)];
+      }
       app.visuals.push_back(visual);
     }
   }
@@ -166,10 +198,10 @@ void frameScene(App& app) {
   }
   Vec3 centre = (bounds.min + bounds.max) * 0.5F;
   float radius = length(bounds.max - bounds.min) * 0.5F;
-  app.camera.target = centre;
-  app.camera.distance = std::fmax(2.2F * radius, 1.0F);
-  app.camera.pitch = -0.35F;
+  float distance = std::fmax(2.2F * radius, 1.5F);
   app.camera.yaw = 0.6F;
+  app.camera.pitch = -0.3F;
+  app.camera.position = centre - cameraForward(app.camera) * distance;
 }
 
 Ray appRay(App const& app, Vec2 pixel) {
@@ -209,7 +241,7 @@ bool gizmoFrame(App& app, Vec3& pivot, Quat& orientation) {
 }
 
 float gizmoSize(App const& app, Vec3 pivot) {
-  float distance = length(cameraPosition(app.camera) - pivot);
+  float distance = length(app.camera.position - pivot);
   float worldPerPixel =
       2.0F * distance * std::tan(app.camera.fovY * 0.5F) / static_cast<float>(app.height);
   return kGizmoPixels * worldPerPixel;
@@ -275,8 +307,28 @@ void assembleFrame(App& app,
                     std::vector<RendererVertex>& depthLines,
                     std::vector<RendererVertex>& overlayLines) {
   appendGrid(depthLines, 8.0F, 1.0F);
+  auto appendItem = [&app, &items](NodeVisual const& visual) {
+    DrawItem item;
+    item.mesh = visual.mesh;
+    item.texture = visual.texture;
+    item.model = app.scene.world(visual.id);
+    item.colour = visual.colour;
+    item.alphaFactor = visual.alphaFactor;
+    item.alphaCutoff = visual.alphaCutoff;
+    item.alpha = visual.alpha;
+    item.lit = true;
+    items.push_back(item);
+  };
+  // Opaque and mask-cutout items first, blended items last (painter's order).
   for (NodeVisual const& visual : app.visuals) {
-    items.push_back({visual.mesh, app.scene.world(visual.id), visual.colour, true});
+    if (visual.alpha != AlphaMode::Blend) {
+      appendItem(visual);
+    }
+  }
+  for (NodeVisual const& visual : app.visuals) {
+    if (visual.alpha == AlphaMode::Blend) {
+      appendItem(visual);
+    }
   }
   Vec3 pivot;
   Quat orientation;
@@ -390,15 +442,15 @@ void handleEvent(App& app,
         app.panning = true;
         app.panButton = 3U;
       } else {
-        app.orbiting = true;
+        app.looking = true;
       }
     } else if (press->detail == 2U) {
       app.panning = true;
       app.panButton = 2U;
     } else if (press->detail == 4U) {
-      cameraDolly(app.camera, 1.0F);
+      cameraDolly(app.camera, kWheelMetres);
     } else if (press->detail == 5U) {
-      cameraDolly(app.camera, -1.0F);
+      cameraDolly(app.camera, -kWheelMetres);
     }
     break;
   }
@@ -409,7 +461,7 @@ void handleEvent(App& app,
       app.dragging = false;
     }
     if (release->detail == 3U) {
-      app.orbiting = false;
+      app.looking = false;
     }
     if (app.panning && release->detail == app.panButton) {
       app.panning = false;
@@ -424,29 +476,51 @@ void handleEvent(App& app,
     app.lastMouse = mouse;
     if (app.dragging) {
       app.drag.update(appRay(app, mouse));
-    } else if (app.orbiting) {
-      cameraOrbit(app.camera, delta.x * kOrbitSpeed, -delta.y * kOrbitSpeed);
+    } else if (app.looking) {
+      cameraLook(app.camera, delta.x * kLookSpeed, -delta.y * kLookSpeed);
     } else if (app.panning) {
       cameraPan(app.camera, delta.x, delta.y, static_cast<float>(app.height));
     }
     break;
   }
-  case XCB_KEY_PRESS: {
-    auto* press = reinterpret_cast<xcb_key_press_event_t*>(event);
-    xcb_keysym_t keysym = keysymFor(window, press->detail);
+  case XCB_KEY_PRESS:
+  case XCB_KEY_RELEASE: {
+    bool pressed = (event->response_type & ~0x80U) == XCB_KEY_PRESS;
+    auto* key = reinterpret_cast<xcb_key_press_event_t*>(event);
+    xcb_keysym_t keysym = keysymFor(window, key->detail);
+    // Free-flight movement keys are tracked on press/release and applied per
+    // frame. Both cases are matched because Shift (boost) and Caps Lock change
+    // the keysym but not the physical key.
+    bool movementKey = true;
+    switch (keysym) {
+    case 'w': case 'W': app.flyForward = pressed; break;
+    case 's': case 'S': app.flyBack = pressed; break;
+    case 'a': case 'A': app.flyLeft = pressed; break;
+    case 'd': case 'D': app.flyRight = pressed; break;
+    case 'q': case 'Q': app.flyDown = pressed; break;
+    case 'e': case 'E': app.flyUp = pressed; break;
+    case 0xFFE1: case 0xFFE2: app.flyBoost = pressed; break; // Shift L/R
+    default: movementKey = false; break;
+    }
+    if (movementKey) {
+      break;
+    }
+    if (!pressed) {
+      break;
+    }
     // Only keys that change gizmo state cancel an active drag; modifier presses
     // (e.g. Ctrl for snap) must not.
     bool stateChanged = false;
     if (keysym == 0xFF1BU) {
       app.running = false;
       stateChanged = true;
-    } else if (keysym == 'g' || keysym == 'G') {
+    } else if (keysym == '1' || keysym == 'g' || keysym == 'G') {
       app.mode = GizmoMode::Translate;
       stateChanged = true;
-    } else if (keysym == 'r' || keysym == 'R') {
+    } else if (keysym == '2' || keysym == 'r' || keysym == 'R') {
       app.mode = GizmoMode::Rotate;
       stateChanged = true;
-    } else if (keysym == 's' || keysym == 'S') {
+    } else if (keysym == '3') {
       app.mode = GizmoMode::Scale;
       stateChanged = true;
     } else if (keysym == 'l' || keysym == 'L') {
@@ -526,7 +600,8 @@ bool loadModels(App& app, VkRenderer& renderer, std::vector<char const*> const& 
   return true;
 }
 
-int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& modelPaths) {
+int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& modelPaths,
+                      bool textured) {
   App app;
   if (modelPaths.empty()) {
     buildDemoScene(app);
@@ -567,6 +642,7 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
 
   int covered = 0;
   int reddish = 0;
+  int bluish = 0;
   for (std::size_t i = 0; i < static_cast<std::size_t>(config.width) * config.height; ++i) {
     int r = pixels[i * 4U];
     int g = pixels[i * 4U + 1U];
@@ -577,13 +653,23 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     if (r > 40 && r * 4 > g * 5 && r * 4 > b * 5) {
       ++reddish;
     }
+    if (b > 40 && b * 4 > g * 5 && b * 4 > r * 5) {
+      ++bluish;
+    }
   }
   writePpm(".build/smoke.ppm", pixels, config.width, config.height);
-  std::printf("SMOKE pixels: covered=%d reddish=%d (of %d) -> .build/smoke.ppm\n", covered,
-              reddish, config.width * config.height);
+  std::printf("SMOKE pixels: covered=%d reddish=%d bluish=%d (of %d) -> .build/smoke.ppm\n", covered,
+              reddish, bluish, config.width * config.height);
   int minCovered = modelPaths.empty() ? 2000 : 100;
   int minReddish = modelPaths.empty() ? 200 : 0;
-  if (covered < minCovered || reddish < minReddish) {
+  int minBluish = 0;
+  if (textured) {
+    // The textured fixtures are red/blue checkerboards: both colours must
+    // survive sampling to prove UVs and textures reach the fragment shader.
+    minReddish = 50;
+    minBluish = 50;
+  }
+  if (covered < minCovered || reddish < minReddish || bluish < minBluish) {
     std::printf("SMOKE FAIL: pixel assertions\n");
     return 1;
   }
@@ -629,7 +715,7 @@ int runSmokeWindow(char const* shaderDir, int frames, std::vector<char const*> c
       handleEvent(app, window, event, renderer);
       std::free(event);
     }
-    cameraOrbit(app.camera, 0.01F, 0.0F);
+    cameraLook(app.camera, 0.01F, 0.0F);
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;
@@ -645,6 +731,34 @@ int runSmokeWindow(char const* shaderDir, int frames, std::vector<char const*> c
   renderer.shutdown();
   closeWindow(window);
   return 0;
+}
+
+// Applies held movement keys once per frame (free flight).
+void updateFlight(App& app, float dt) {
+  Vec3 local{};
+  if (app.flyForward) {
+    local.z += 1.0F;
+  }
+  if (app.flyBack) {
+    local.z -= 1.0F;
+  }
+  if (app.flyRight) {
+    local.x += 1.0F;
+  }
+  if (app.flyLeft) {
+    local.x -= 1.0F;
+  }
+  if (app.flyUp) {
+    local.y += 1.0F;
+  }
+  if (app.flyDown) {
+    local.y -= 1.0F;
+  }
+  if (local.x == 0.0F && local.y == 0.0F && local.z == 0.0F) {
+    return;
+  }
+  float speed = kFlySpeed * (app.flyBoost ? kFlyBoost : 1.0F) * dt;
+  cameraFly(app.camera, local * speed);
 }
 
 int runInteractive(char const* shaderDir, std::vector<char const*> const& modelPaths) {
@@ -679,17 +793,27 @@ int runInteractive(char const* shaderDir, std::vector<char const*> const& modelP
   }
   std::printf(
       "vr-editor on %s\n"
-      "  LMB: select / drag gizmo   RMB: orbit   MMB or Shift+RMB: pan   wheel: zoom\n"
-      "  G translate   R rotate   S scale   L world/local space   Ctrl snap   Esc quit\n",
+      "  flight: WASD move   Q/E down/up   Shift boost   RMB look   MMB or Shift+RMB pan\n"
+      "  wheel: fly forward/back   LMB: select / drag gizmo\n"
+      "  1 translate   2 rotate   3 scale   L world/local space   Ctrl snap   Esc quit\n",
       renderer.deviceName());
 
+  auto previous = std::chrono::steady_clock::now();
   while (app.running) {
     xcb_generic_event_t* event = nullptr;
     while ((event = xcb_poll_for_event(window.connection)) != nullptr) {
       handleEvent(app, window, event, renderer);
       std::free(event);
     }
+    auto now = std::chrono::steady_clock::now();
+    float dt = std::chrono::duration<float>(now - previous).count();
+    previous = now;
+    if (dt > 0.1F) {
+      dt = 0.1F; // tab stalls must not teleport the camera
+    }
+    updateFlight(app, dt);
     if (app.width == 0U || app.height == 0U) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(8)); // minimised: no busy spin
       continue;
     }
     std::vector<DrawItem> items;
@@ -700,6 +824,7 @@ int runInteractive(char const* shaderDir, std::vector<char const*> const& modelP
       std::printf("draw failed; exiting\n");
       break;
     }
+    std::this_thread::sleep_for(std::chrono::milliseconds(8)); // pace to ~120 Hz
   }
 
   renderer.shutdown();
@@ -710,7 +835,7 @@ int runInteractive(char const* shaderDir, std::vector<char const*> const& modelP
 } // namespace
 
 int main(int argc, char** argv) {
-  enum class Mode { Interactive, SmokeOffscreen, SmokeWindow };
+  enum class Mode { Interactive, SmokeOffscreen, SmokeTextured, SmokeWindow };
   Mode mode = Mode::Interactive;
   char const* shaderDir = ".build/shaders";
   int frames = 30;
@@ -722,6 +847,8 @@ int main(int argc, char** argv) {
       shaderDir = argv[++i];
     } else if (std::strcmp(arg, "--smoke-offscreen") == 0) {
       mode = Mode::SmokeOffscreen;
+    } else if (std::strcmp(arg, "--smoke-textured") == 0) {
+      mode = Mode::SmokeTextured;
     } else if (std::strcmp(arg, "--smoke-window") == 0) {
       mode = Mode::SmokeWindow;
       if (i + 1 < argc) {
@@ -756,7 +883,12 @@ int main(int argc, char** argv) {
 
   switch (mode) {
   case Mode::SmokeOffscreen:
-    return runSmokeOffscreen(shaderDir, modelPaths);
+    return runSmokeOffscreen(shaderDir, modelPaths, false);
+  case Mode::SmokeTextured: {
+    // Fixed fixtures written by the test binary (checkerboard GLB + OBJ).
+    std::vector<char const*> fixtures{".build/test-textured.glb", ".build/test-texture.obj"};
+    return runSmokeOffscreen(shaderDir, fixtures, true);
+  }
   case Mode::SmokeWindow:
     return runSmokeWindow(shaderDir, frames, modelPaths);
   default:

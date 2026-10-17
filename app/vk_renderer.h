@@ -38,6 +38,10 @@ public:
   // Safe to call at any time; internally synchronises with in-flight frames.
   MeshHandle addMesh(MeshData const& data);
 
+  // Registers an RGBA8 texture and returns a handle (0 is the built-in white
+  // fallback). Up to 32 textures; safe to call at any time.
+  TextureHandle addTexture(Image const& image, bool repeatU, bool repeatV);
+
   // Renders one frame. Windowed: presents to the swapchain. Offscreen:
   // renders into an internal image available through readback().
   bool draw(Camera const& camera,

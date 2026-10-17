@@ -2,24 +2,40 @@
 
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 #include "mesh.h"
 
 namespace vredit {
 
-using MtlColours = std::vector<std::pair<std::string, Vec3>>;
+// An .mtl material: diffuse colour, optional texture path (resolved to an
+// image by loadObjFile) and dissolve (1 = opaque, < 1 = blended).
+struct MtlMaterial {
+  std::string name;
+  Vec3 colour{1.0F, 1.0F, 1.0F};
+  float dissolve{1.0F};
+  std::string mapKd;
+  std::int32_t texture{-1}; // index into the textures passed to loadObj
+};
 
-// Wavefront OBJ: v/vn/f (polygons fan-triangulated, negative indices supported),
-// o/g groups become model nodes, usemtl selects colours from `materials`. Faces
-// without normals get flat per-face normals. Vertices are emitted per face.
-bool loadObj(std::string_view text, MtlColours const& materials, Model& out, std::string& error);
+using MtlMaterials = std::vector<MtlMaterial>;
 
-// Parses .mtl content (best effort): `newmtl` names with `Kd` diffuse colours.
-bool parseMtl(std::string_view text, MtlColours& out);
+// Wavefront OBJ: v/vt/vn/f (polygons fan-triangulated, negative indices
+// supported), o/g groups become model nodes, usemtl selects colours/textures
+// from `materials` (a mid-group material change splits the node). Faces without
+// normals get flat per-face normals. Vertices are emitted per face.
+bool loadObj(std::string_view text,
+             MtlMaterials const& materials,
+             std::vector<ModelTexture> const& textures,
+             Model& out,
+             std::string& error);
 
-// Loads an OBJ file; a sibling .mtl named by `mtllib` is loaded when present.
+// Parses .mtl content (best effort): `newmtl` names with `Kd`, `map_Kd` and
+// `d`/`Tr` entries.
+bool parseMtl(std::string_view text, MtlMaterials& out);
+
+// Loads an OBJ file; a sibling .mtl named by `mtllib` is loaded when present
+// and its `map_Kd` images are decoded (missing images load untextured).
 bool loadObjFile(char const* path, Model& out, std::string& error);
 
 } // namespace vredit

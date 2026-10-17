@@ -15,9 +15,13 @@ namespace vredit {
 using RendererVertex = MeshVertex; // single vertex format for the pipeline
 
 struct DrawItem {
-  MeshHandle mesh{0}; // renderer-registered mesh; 0 = built-in cube
+  MeshHandle mesh{0};         // renderer-registered mesh; 0 = built-in cube
+  TextureHandle texture{0};   // renderer-registered texture; 0 = white fallback
   Mat4 model;
   Vec3 colour{1.0F, 1.0F, 1.0F};
+  float alphaFactor{1.0F};
+  float alphaCutoff{0.5F};
+  AlphaMode alpha{AlphaMode::Opaque};
   bool lit{true};
 };
 
