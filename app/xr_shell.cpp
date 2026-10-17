@@ -149,14 +149,31 @@ XrShell::InitResult XrShell::init() {
             "xrGetVulkanGraphicsRequirements2KHR")) {
     return InitResult::Failed;
   }
-  if (requirements.minApiVersionSupported > VK_API_VERSION_1_3 ||
-      requirements.maxApiVersionSupported < VK_API_VERSION_1_3) {
-    std::printf("[xr] runtime supports Vulkan %u.%u..%u.%u but 1.3 is required\n",
-                VK_API_VERSION_MAJOR(requirements.minApiVersionSupported),
-                VK_API_VERSION_MINOR(requirements.minApiVersionSupported),
-                VK_API_VERSION_MAJOR(requirements.maxApiVersionSupported),
-                VK_API_VERSION_MINOR(requirements.maxApiVersionSupported));
-    return InitResult::Failed;
+  // These fields are spec-encoded with XR_MAKE_VERSION(major, minor, 0)
+  // (major<<48 | minor<<32), but some runtimes return VK_MAKE_VERSION values.
+  // An XR-encoded value carries bits above 32; a VK-encoded one always fits in
+  // 32 bits. Normalise both instead of trusting one convention — reading XR
+  // values through VK_API_VERSION_* macros yields a bogus "0.0".
+  auto vulkanVersion = [](XrVersion version) -> std::uint32_t {
+    if ((version >> 32) != 0) {
+      return VK_MAKE_API_VERSION(0, static_cast<std::uint32_t>((version >> 48) & 0xffffULL),
+                                 static_cast<std::uint32_t>((version >> 32) & 0xffffULL), 0);
+    }
+    return static_cast<std::uint32_t>(version);
+  };
+  std::uint32_t const minSupported = vulkanVersion(requirements.minApiVersionSupported);
+  std::uint32_t const maxSupported = vulkanVersion(requirements.maxApiVersionSupported);
+  // maxApiVersionSupported is advisory ("highest version tested; newer may
+  // still work"), and the renderer needs 1.3 core features, so request1.3 and
+  // let xrCreateVulkanInstanceKHR arbitrate. A runtime floor above 1.3 is
+  // honoured rather than refused: newer instances still expose 1.3 features.
+  std::uint32_t apiVersionRequested = VK_API_VERSION_1_3;
+  if (minSupported > apiVersionRequested) {
+    apiVersionRequested = minSupported;
+  }
+  if (maxSupported != 0 && maxSupported < VK_API_VERSION_1_3) {
+    std::printf("[xr] runtime only tested Vulkan up to %u.%u; trying 1.3 anyway\n",
+                VK_API_VERSION_MAJOR(maxSupported), VK_API_VERSION_MINOR(maxSupported));
   }
 
   // The enable2 create calls make the runtime merge its own Vulkan extensions
@@ -165,7 +182,7 @@ XrShell::InitResult XrShell::init() {
   VkApplicationInfo vkAppInfo = vkStruct<VkApplicationInfo>(VK_STRUCTURE_TYPE_APPLICATION_INFO);
   vkAppInfo.pApplicationName = "vr-editor";
   vkAppInfo.pEngineName = "vredit";
-  vkAppInfo.apiVersion = VK_API_VERSION_1_3;
+  vkAppInfo.apiVersion = apiVersionRequested;
   VkInstanceCreateInfo vkInstanceInfo = vkStruct<VkInstanceCreateInfo>(VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
   vkInstanceInfo.pApplicationInfo = &vkAppInfo;
 
@@ -309,8 +326,10 @@ bool XrShell::createActions() {
 
   XrPath leftPath = XR_NULL_PATH;
   XrPath rightPath = XR_NULL_PATH;
-  xrStringToPath(xr_->instance, "/user/handed/left", &leftPath);
-  xrStringToPath(xr_->instance, "/user/handed/right", &rightPath);
+  if (!xrOk(xrStringToPath(xr_->instance, "/user/hand/left", &leftPath), "path /user/hand/left") ||
+      !xrOk(xrStringToPath(xr_->instance, "/user/hand/right", &rightPath), "path /user/hand/right")) {
+    return false;
+  }
   XrPath hands[2] = {leftPath, rightPath};
 
   auto makeFloat = [&](char const* name, XrAction* out) {
@@ -364,33 +383,33 @@ bool XrShell::createActions() {
   };
   std::vector<Binding> bindings = {
       {"/interaction_profiles/khr/simple_controller",
-       {{"/user/handed/right/input/select/click", xr_->triggerAction},
-        {"/user/handed/left/input/select/click", xr_->triggerAction},
-        {"/user/handed/right/input/menu/click", xr_->menuAction},
-        {"/user/handed/left/input/menu/click", xr_->menuAction},
-        {"/user/handed/right/input/aim/pose", xr_->aimAction},
-        {"/user/handed/left/input/aim/pose", xr_->aimAction}}},
+       {{"/user/hand/right/input/select/click", xr_->triggerAction},
+        {"/user/hand/left/input/select/click", xr_->triggerAction},
+        {"/user/hand/right/input/menu/click", xr_->menuAction},
+        {"/user/hand/left/input/menu/click", xr_->menuAction},
+        {"/user/hand/right/input/aim/pose", xr_->aimAction},
+        {"/user/hand/left/input/aim/pose", xr_->aimAction}}},
       {"/interaction_profiles/oculus/touch_controller",
-       {{"/user/handed/right/input/trigger/value", xr_->triggerAction},
-        {"/user/handed/left/input/trigger/value", xr_->triggerAction},
-        {"/user/handed/left/input/thumbstick", xr_->moveAction},
-        {"/user/handed/right/input/thumbstick", xr_->turnAction},
-        {"/user/handed/left/input/menu/click", xr_->menuAction},
-        {"/user/handed/right/input/squeeze/value", xr_->gripAction},
-        {"/user/handed/left/input/squeeze/value", xr_->gripAction},
-        {"/user/handed/right/input/aim/pose", xr_->aimAction},
-        {"/user/handed/left/input/aim/pose", xr_->aimAction}}},
+       {{"/user/hand/right/input/trigger/value", xr_->triggerAction},
+        {"/user/hand/left/input/trigger/value", xr_->triggerAction},
+        {"/user/hand/left/input/thumbstick", xr_->moveAction},
+        {"/user/hand/right/input/thumbstick", xr_->turnAction},
+        {"/user/hand/left/input/menu/click", xr_->menuAction},
+        {"/user/hand/right/input/squeeze/value", xr_->gripAction},
+        {"/user/hand/left/input/squeeze/value", xr_->gripAction},
+        {"/user/hand/right/input/aim/pose", xr_->aimAction},
+        {"/user/hand/left/input/aim/pose", xr_->aimAction}}},
       {"/interaction_profiles/htc/vive_controller",
-       {{"/user/handed/right/input/trigger/click", xr_->triggerAction},
-        {"/user/handed/left/input/trigger/click", xr_->triggerAction},
-        {"/user/handed/left/input/trackpad", xr_->moveAction},
-        {"/user/handed/right/input/trackpad", xr_->turnAction},
-        {"/user/handed/right/input/menu/click", xr_->menuAction},
-        {"/user/handed/left/input/menu/click", xr_->menuAction},
-        {"/user/handed/right/input/squeeze/click", xr_->gripAction},
-        {"/user/handed/left/input/squeeze/click", xr_->gripAction},
-        {"/user/handed/right/input/aim/pose", xr_->aimAction},
-        {"/user/handed/left/input/aim/pose", xr_->aimAction}}},
+       {{"/user/hand/right/input/trigger/click", xr_->triggerAction},
+        {"/user/hand/left/input/trigger/click", xr_->triggerAction},
+        {"/user/hand/left/input/trackpad", xr_->moveAction},
+        {"/user/hand/right/input/trackpad", xr_->turnAction},
+        {"/user/hand/right/input/menu/click", xr_->menuAction},
+        {"/user/hand/left/input/menu/click", xr_->menuAction},
+        {"/user/hand/right/input/squeeze/click", xr_->gripAction},
+        {"/user/hand/left/input/squeeze/click", xr_->gripAction},
+        {"/user/hand/right/input/aim/pose", xr_->aimAction},
+        {"/user/hand/left/input/aim/pose", xr_->aimAction}}},
   };
 
   for (Binding const& binding : bindings) {
@@ -566,8 +585,8 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
 
   XrPath leftPath = XR_NULL_PATH;
   XrPath rightPath = XR_NULL_PATH;
-  xrStringToPath(xr_->instance, "/user/handed/left", &leftPath);
-  xrStringToPath(xr_->instance, "/user/handed/right", &rightPath);
+  xrStringToPath(xr_->instance, "/user/hand/left", &leftPath);
+  xrStringToPath(xr_->instance, "/user/hand/right", &rightPath);
 
   XrActionStateGetInfo getInfo = xrStruct<XrActionStateGetInfo>(XR_TYPE_ACTION_STATE_GET_INFO);
 
