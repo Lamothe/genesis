@@ -786,9 +786,11 @@ bool XrShell::endFrame() {
   XrFrameEndInfo endInfo = xrStruct<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
   endInfo.displayTime = xr_->frameState.predictedDisplayTime;
   endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+  // Layers must outlive the xrEndFrame call below — the runtime reads through
+  // endInfo.layers during the call, so the array cannot be scoped to the branch.
+  XrCompositionLayerBaseHeader const* layers[] = {
+      reinterpret_cast<XrCompositionLayerBaseHeader const*>(&layer)};
   if (xr_->frameState.shouldRender && xr_->frameReady) {
-    XrCompositionLayerBaseHeader const* layers[] = {
-        reinterpret_cast<XrCompositionLayerBaseHeader const*>(&layer)};
     endInfo.layerCount = 1;
     endInfo.layers = layers;
   } else {
