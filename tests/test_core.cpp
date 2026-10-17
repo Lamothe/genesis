@@ -1176,6 +1176,124 @@ void testObjLoader() {
 
 } // namespace
 
+void testHandlePickingByRay() {
+  // Segment distances from a half-line, including behind-origin clamping.
+  Ray downX{{2.0F, 0.0F, 0.0F}, {-1.0F, 0.0F, 0.0F}};
+  CHECK_NEAR(raySegmentDistance(downX, {0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}), 0.0F, 1e-5F);
+  Ray offByHalf{{2.0F, 0.5F, 0.0F}, {-1.0F, 0.0F, 0.0F}};
+  CHECK_NEAR(raySegmentDistance(offByHalf, {0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}), 0.5F, 1e-5F);
+  Ray awayFromOrigin{{2.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}};
+  CHECK_NEAR(raySegmentDistance(awayFromOrigin, {0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}), 1.0F,
+             1e-5F); // segment behind the ray: distance from the origin
+
+  // Parallel ray and segment: the distance is the line offset, not an endpoint
+  // artefact (this is the "aiming along an axis" case).
+  Ray parallel{{0.0F, 0.5F, 0.0F}, {1.0F, 0.0F, 0.0F}};
+  CHECK_NEAR(raySegmentDistance(parallel, {5.0F, 0.0F, 0.0F}, {6.0F, 0.0F, 0.0F}), 0.5F, 1e-5F);
+  CHECK(raySegmentDistance(parallel, {-6.0F, 0.0F, 0.0F}, {-5.0F, 0.0F, 0.0F}) > 4.9F);
+
+  // Real gizmo geometry (translate mode, unit size, identity orientation).
+  // Rays are aimed away from the pivot region where the axes share points.
+  auto geometry = buildHandleGeometry(GizmoMode::Translate, {0.0F, 0.0F, 0.0F}, Quat{}, 1.0F);
+  Ray ontoX{{0.7F, 3.0F, 0.0F}, {0.0F, -1.0F, 0.0F}};
+  auto hit = pickHandleByRay(geometry, ontoX, 0.1F);
+  CHECK(hit.has_value());
+  CHECK(hit.has_value() && *hit == GizmoHandle::AxisX);
+  Ray ontoY{{5.0F, 0.5F, 0.0F}, {-1.0F, 0.0F, 0.0F}};
+  hit = pickHandleByRay(geometry, ontoY, 0.1F);
+  CHECK(hit.has_value() && *hit == GizmoHandle::AxisY);
+  Ray away{{0.0F, 5.0F, 5.0F}, {0.0F, 1.0F, 0.0F}};
+  CHECK(!pickHandleByRay(geometry, away, 0.1F).has_value());
+  Ray awayAlongX{{2.5F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}};
+  CHECK(!pickHandleByRay(geometry, awayAlongX, 0.1F).has_value());
+
+  // Rotate rings: the ring for axis a is the circle perpendicular to that axis
+  // at radius 0.8 * size. Aim through a rim point unique to the AxisX ring.
+  auto rings = buildHandleGeometry(GizmoMode::Rotate, {0.0F, 0.0F, 0.0F}, Quat{}, 1.0F);
+  float rim = 0.8F * 0.70710678F;
+  Ray throughRim{{0.0F, rim, 3.0F}, {0.0F, 0.0F, -1.0F}};
+  hit = pickHandleByRay(rings, throughRim, 0.1F);
+  CHECK(hit.has_value() && *hit == GizmoHandle::AxisX);
+  // The diagonal misses every ring (each ring stays 0.46 from it).
+  float diag = 0.57735027F;
+  Ray diagonal{{1.0F, 1.0F, 1.0F}, {-diag, -diag, -diag}};
+  CHECK(!pickHandleByRay(rings, diagonal, 0.1F).has_value());
+
+  // Filled polygons and the line-wins-over-filled priority, with synthetic
+  // geometry (decoupled from the builder's exact extents).
+  HandleGeom square;
+  square.handle = GizmoHandle::PlaneXY;
+  square.filled = true;
+  square.loop = true;
+  square.points = {{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 0.0F}, {0.0F, 1.0F, 0.0F}};
+  Ray throughSquare{{0.5F, 0.5F, 3.0F}, {0.0F, 0.0F, -1.0F}};
+  hit = pickHandleByRay({square}, throughSquare, 0.1F);
+  CHECK(hit.has_value() && *hit == GizmoHandle::PlaneXY);
+  Ray besideSquare{{1.5F, 0.5F, 3.0F}, {0.0F, 0.0F, -1.0F}};
+  CHECK(!pickHandleByRay({square}, besideSquare, 0.1F).has_value());
+  Ray behindSquare{{0.5F, 0.5F, 3.0F}, {0.0F, 0.0F, 1.0F}};
+  CHECK(!pickHandleByRay({square}, behindSquare, 0.1F).has_value()); // plane hit behind origin
+
+  HandleGeom axisLine;
+  axisLine.handle = GizmoHandle::AxisY;
+  axisLine.points = {{0.0F, 0.0F, 0.0F}, {0.0F, 2.0F, 0.0F}};
+  Ray throughBoth{{0.05F, 0.5F, 3.0F}, {0.0F, 0.0F, -1.0F}}; // near the line, over the square
+  hit = pickHandleByRay({square, axisLine}, throughBoth, 0.1F);
+  CHECK(hit.has_value() && *hit == GizmoHandle::AxisY); // line-like wins
+}
+
+void testXrMath() {
+  // Symmetric tangents must equal cameraProjection at aspect 1.
+  float a = 0.9F;
+  float nearZ = 0.1F;
+  float farZ = 20.0F;
+  Mat4 fromTangents =
+      cameraProjectionFromTangents(-a, a, a, -a, nearZ, farZ);
+  Camera camera;
+  camera.fovY = 2.0F * std::atan(a);
+  camera.nearZ = nearZ;
+  camera.farZ = farZ;
+  Mat4 fromCamera = cameraProjection(camera, 1.0F);
+  for (int i = 0; i < 16; ++i) {
+    CHECK_NEAR(fromTangents.m[i], fromCamera.m[i], 1e-5F);
+  }
+
+  // Asymmetric frustum: view-space corners map to NDC edges (clip Y down).
+  float tanLeft = -0.5F;
+  float tanRight = 1.0F;
+  float tanUp = 0.25F;
+  float tanDown = -1.0F;
+  Mat4 proj = cameraProjectionFromTangents(tanLeft, tanRight, tanUp, tanDown, nearZ, farZ);
+  Vec3 topRight = transformPoint(proj, {tanRight, tanUp, -1.0F});
+  Vec3 bottomLeft = transformPoint(proj, {tanLeft, tanDown, -1.0F});
+  CHECK_NEAR(topRight.x, 1.0F, 1e-5F);
+  CHECK_NEAR(topRight.y, -1.0F, 1e-5F); // +Y up maps to NDC -1 in Vulkan
+  CHECK_NEAR(bottomLeft.x, -1.0F, 1e-5F);
+  CHECK_NEAR(bottomLeft.y, 1.0F, 1e-5F);
+  CHECK_NEAR(transformPoint(proj, {0.0F, 0.0F, -nearZ}).z, 0.0F, 1e-5F);
+  // transformPoint returns clip coordinates before the perspective divide;
+  // w_clip = farZ at view z = -farZ, so z/w = z_clip / farZ.
+  Vec3 farPoint = transformPoint(proj, {0.0F, 0.0F, -farZ});
+  CHECK_NEAR(farPoint.z / farZ, 1.0F, 1e-3F);
+
+  // Identity pose: view is just the translation inverse.
+  Mat4 view = cameraViewFromPose({1.0F, 2.0F, 3.0F}, {0.0F, 0.0F, 0.0F, 1.0F});
+  CHECK_NEAR3(transformPoint(view, {1.0F, 2.0F, 3.0F}), {0.0F, 0.0F, 0.0F}); // eye at origin
+  CHECK_NEAR3(transformPoint(view, {0.0F, 0.0F, 0.0F}), {-1.0F, -2.0F, -3.0F});
+  CHECK_NEAR3(transformPoint(view, {2.0F, 2.0F, 3.0F}), {1.0F, 0.0F, 0.0F});
+
+  // Yaw +90deg: world +X lies along view +Z (view forward is -Z).
+  Quat yaw90 = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 1.5707964F);
+  Mat4 yawView = cameraViewFromPose({0.0F, 0.0F, 0.0F}, yaw90);
+  CHECK_NEAR3(transformPoint(yawView, {1.0F, 0.0F, 0.0F}), {0.0F, 0.0F, 1.0F});
+  CHECK_NEAR3(transformPoint(yawView, {-1.0F, 0.0F, 0.0F}), {0.0F, 0.0F, -1.0F});
+
+  // Rotated pose: the eye position itself still maps to the view origin.
+  Vec3 eye{0.7F, -1.2F, 3.4F};
+  Mat4 rotated = cameraViewFromPose(eye, yaw90);
+  CHECK_NEAR3(transformPoint(rotated, eye), {0.0F, 0.0F, 0.0F});
+}
+
 int main() {
   testVecBasics();
   testQuatMatchesMatrix();
@@ -1204,9 +1322,11 @@ int main() {
   testEpochStructuralChanges();
   testCameraFraming();
   testCameraManipulation();
+  testXrMath();
   testSegmentAndPolygonPicking();
   testHandlePicking();
   testHandlePickingBehindCamera();
+  testHandlePickingByRay();
   testJsonParser();
   testMeshBounds();
   testImageDecode();

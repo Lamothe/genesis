@@ -55,7 +55,19 @@ std::optional<GizmoHandle> pickHandle(std::vector<HandleShape> const& shapes,
                                       Vec2 mouse,
                                       float thresholdPx);
 
+// Ray-space pick for controller pointers (VR): tests the same world-space
+// geometry pickHandle projects, so what is drawn is what is grabbed here too.
+// Line-like shapes win over filled shapes; `threshold` is world-space distance
+// from the ray. Returns nullopt when nothing is within reach.
+std::optional<GizmoHandle> pickHandleByRay(std::vector<HandleGeom> const& geometry,
+                                           Ray const& ray,
+                                           float threshold);
+
 float pointSegmentDistance(Vec2 point, Vec2 a, Vec2 b);
 bool pointInPolygon(std::vector<Vec2> const& polygon, Vec2 point);
+
+// Distance from a half-line (origin + t*dir, t >= 0) to a segment [a, b].
+// `dir` should be normalised.
+float raySegmentDistance(Ray const& ray, Vec3 a, Vec3 b);
 
 } // namespace vredit

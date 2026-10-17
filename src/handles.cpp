@@ -196,4 +196,155 @@ std::optional<GizmoHandle> pickHandle(std::vector<HandleShape> const& shapes,
   return filledHit;
 }
 
+namespace {
+
+float clamp01(float value) {
+  return value < 0.0F ? 0.0F : (value > 1.0F ? 1.0F : value);
+}
+
+// Ray vs coplanar filled polygon: plane hit, then 2D point-in-polygon in the
+// plane's own basis.
+bool rayHitsPolygon(Ray const& ray, std::vector<Vec3> const& points) {
+  if (points.size() < 3U) {
+    return false;
+  }
+  Vec3 normal{0.0F, 0.0F, 0.0F};
+  for (std::size_t i = 2; i < points.size(); ++i) {
+    normal = cross(points[1] - points[0], points[i] - points[0]);
+    if (length(normal) > 1e-9F) {
+      break;
+    }
+  }
+  if (length(normal) <= 1e-9F) {
+    return false;
+  }
+  normal = normalized(normal);
+  float denom = dot(ray.direction, normal);
+  if (std::fabs(denom) < 1e-8F) {
+    return false;
+  }
+  float t = dot(points[0] - ray.origin, normal) / denom;
+  if (t < 0.0F) {
+    return false;
+  }
+  Vec3 hit = ray.origin + ray.direction * t;
+  Vec3 basisU =
+      normalized(cross(std::fabs(normal.x) < 0.9F ? Vec3{1.0F, 0.0F, 0.0F} : Vec3{0.0F, 1.0F, 0.0F},
+                       normal));
+  Vec3 basisV = cross(normal, basisU);
+  std::vector<Vec2> flat;
+  flat.reserve(points.size());
+  for (Vec3 const& point : points) {
+    Vec3 d = point - points[0];
+    flat.push_back({dot(d, basisU), dot(d, basisV)});
+  }
+  Vec2 q{dot(hit - points[0], basisU), dot(hit - points[0], basisV)};
+  return pointInPolygon(flat, q);
+}
+
+} // namespace
+
+float raySegmentDistance(Ray const& ray, Vec3 a, Vec3 b) {
+  // Closest points between the half-line (s >= 0) and the segment (t in [0,1])
+  // solved directly in double precision: aiming ALONG a handle is the common
+  // case and the float normal equations cancel catastrophically there.
+  double ux = ray.direction.x;
+  double uy = ray.direction.y;
+  double uz = ray.direction.z;
+  double vx = static_cast<double>(b.x) - a.x;
+  double vy = static_cast<double>(b.y) - a.y;
+  double vz = static_cast<double>(b.z) - a.z;
+  double wx = static_cast<double>(ray.origin.x) - a.x;
+  double wy = static_cast<double>(ray.origin.y) - a.y;
+  double wz = static_cast<double>(ray.origin.z) - a.z;
+  double uu = ux * ux + uy * uy + uz * uz;
+  double uv = ux * vx + uy * vy + uz * vz;
+  double vv = vx * vx + vy * vy + vz * vz;
+  double uw = ux * wx + uy * wy + uz * wz;
+  double vw = vx * wx + vy * wy + vz * wz;
+  double const eps = 1e-12;
+
+  double s = 0.0;
+  double t = 0.0;
+  if (vv <= eps) {
+    // Degenerate segment: a point against the half-line.
+    s = uu > eps ? (0.0 - uw) / uu : 0.0;
+    s = s < 0.0 ? 0.0 : s;
+  } else if (uu <= eps) {
+    t = clamp01(static_cast<float>(vw / vv));
+  } else {
+    double denom = uu * vv - uv * uv;
+    if (denom <= eps) {
+      // Parallel: the distance is constant wherever the ray overlaps the
+      // segment; probe the closest t at s = 0 and let the s clamp handle the
+      // fully-behind case.
+      t = clamp01(static_cast<float>(vw / vv));
+      s = (t * uv - uw) / uu;
+      if (s < 0.0) {
+        s = 0.0;
+      }
+    } else {
+      s = (uv * vw - uw * vv) / denom;
+      if (s < 0.0) {
+        s = 0.0;
+      }
+      t = (vw + s * uv) / vv;
+      if (t < 0.0) {
+        t = 0.0;
+        s = -uw / uu;
+        s = s < 0.0 ? 0.0 : s;
+      } else if (t > 1.0) {
+        t = 1.0;
+        s = (uv - uw) / uu;
+        s = s < 0.0 ? 0.0 : s;
+      }
+    }
+  }
+
+  double dx = wx + s * ux - t * vx;
+  double dy = wy + s * uy - t * vy;
+  double dz = wz + s * uz - t * vz;
+  return static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz));
+}
+
+std::optional<GizmoHandle> pickHandleByRay(std::vector<HandleGeom> const& geometry,
+                                           Ray const& ray, float threshold) {
+  std::optional<GizmoHandle> lineHit;
+  float lineHitDistance = threshold;
+  std::optional<GizmoHandle> filledHit;
+
+  for (HandleGeom const& shape : geometry) {
+    std::size_t count = shape.points.size();
+    if (shape.filled) {
+      if (!filledHit.has_value() && rayHitsPolygon(ray, shape.points)) {
+        filledHit = shape.handle;
+      }
+      continue;
+    }
+    if (count < 2U) {
+      continue;
+    }
+    for (std::size_t i = 1; i < count; ++i) {
+      float d = raySegmentDistance(ray, shape.points[i - 1U], shape.points[i]);
+      if (d < lineHitDistance) {
+        lineHitDistance = d;
+        lineHit = shape.handle;
+      }
+    }
+    if (shape.loop && count >= 3U) {
+      float d = raySegmentDistance(ray, shape.points[count - 1U], shape.points[0]);
+      if (d < lineHitDistance) {
+        lineHitDistance = d;
+        lineHit = shape.handle;
+      }
+    }
+  }
+
+  // Line-like shapes (axes, rings) win over filled plane regions.
+  if (lineHit.has_value()) {
+    return lineHit;
+  }
+  return filledHit;
+}
+
 } // namespace vredit

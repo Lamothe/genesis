@@ -26,6 +26,18 @@ Mat4 cameraView(Camera const& camera);
 Mat4 cameraProjection(Camera const& camera, float aspect);
 Mat4 cameraViewProjection(Camera const& camera, float aspect);
 
+// Vulkan clip-space projection for an asymmetric frustum given as tangent
+// box (the tan() of OpenXR XrFovf angles; tanLeft/tanDown are typically
+// negative). Matches cameraProjection's depth [0,1] and clip-Y-down
+// conventions; the symmetric case is exactly cameraProjection at aspect 1.
+Mat4 cameraProjectionFromTangents(float tanLeft, float tanRight, float tanUp, float tanDown,
+                                  float nearZ, float farZ);
+
+// World -> eye view matrix for a rigid pose (position + orientation), the
+// inverse of the eye's world transform. Matches cameraView's conventions
+// (view forward is -Z).
+Mat4 cameraViewFromPose(Vec3 const& position, Quat const& orientation);
+
 // Ray through a pixel; direction is normalised and points into the scene.
 Ray cameraRay(Camera const& camera, float aspect, Vec2 pixel, Vec2 viewportSize);
 

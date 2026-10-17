@@ -33,12 +33,14 @@ have the neural renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash vr/editor/run-tests.sh        # core tests (275 checks; image fixtures via ImageMagick)
+bash vr/editor/run-tests.sh        # core tests (319 checks; image fixtures via ImageMagick)
 bash vr/editor/run-editor.sh       # build + interactive editor
 bash vr/editor/run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
+bash vr/editor/run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
 bash vr/editor/run-editor.sh --smoke-offscreen     # render + pixel assertions
 bash vr/editor/run-editor.sh --smoke-textured      # texture sampling end-to-end
 bash vr/editor/run-editor.sh --smoke-window 30     # windowed present path
+bash vr/editor/run-editor.sh --smoke-xr            # XR frame loop (SKIP without a runtime)
 ```
 
 `run-tests.sh` compiles with `g++ -std=c++20 -Wall -Wextra -Werror`;
@@ -82,7 +84,13 @@ scale, **L** world/local space, **Ctrl** snapping, **Esc** quits.
    baseline JPEG decoders (typed C++, zlib for inflate), glTF baseColorTexture
    and OBJ map_Kd with alpha modes (opaque/mask/blend) and material alpha,
    first-person free flight (WASD/QE, mouse-look, wheel dolly).
-4. WiVRn/OpenXR VR shell: stereo views through the same interface.
+4. ~~WiVRn/OpenXR VR shell: stereo views through the same interface~~ — done
+   (17/10/2026): XR_KHR_vulkan_enable2 shell in app/xr_shell.cpp (per-eye
+   swapchains, LOCAL space, action set for Quest/Vive/simple controllers),
+   rig-based free-flight locomotion composed with the head pose, controller
+   aim-ray gizmo interaction (pickHandleByRay in the core), `--xr` /
+   `--smoke-xr` (honest SKIP without a runtime). Needs a live OpenXR runtime
+   (WiVRn) for first in-headset tuning of bindings and comfort.
 5. Bind `neural_seam_evaluate` to the native evaluator when the migration
    stream's full native evaluation lands; conform the seam's convention table to
    the pinned native input conventions at that point.

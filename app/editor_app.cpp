@@ -16,6 +16,8 @@
 
 #include <xcb/xcb.h>
 
+#include "xr_shell.h"
+
 #include "camera.h"
 #include "gizmo.h"
 #include "gltf.h"
@@ -302,6 +304,59 @@ float snapStepFor(App const& app) {
   }
 }
 
+// Pointer interaction shared by the mouse and the VR controller ray. The
+// caller resolves the handle under the pointer (screen-space for the mouse,
+// ray-space for VR); a handle press starts a drag, anything else selects.
+void pointerPress(App& app,
+                  Ray const& ray,
+                  Vec3 const& viewDir,
+                  std::optional<GizmoHandle> handle) {
+  if (handle.has_value()) {
+    Vec3 pivot;
+    Quat orientation;
+    if (gizmoFrame(app, pivot, orientation)) {
+      GizmoSettings settings;
+      settings.mode = app.mode;
+      settings.space = app.space;
+      settings.snapStep = snapStepFor(app);
+      app.dragging =
+          app.drag.begin(app.scene, app.selection, pivot, orientation, *handle, ray, viewDir,
+                         settings);
+    }
+    return;
+  }
+  auto hit = pickNode(app, ray);
+  app.selection.clear();
+  if (hit.has_value()) {
+    app.selection.push_back(*hit);
+  }
+}
+
+void pointerMove(App& app, Ray const& ray) {
+  if (app.dragging) {
+    app.drag.update(ray);
+  }
+}
+
+void pointerRelease(App& app) {
+  if (app.dragging) {
+    app.drag.end();
+    app.dragging = false;
+  }
+}
+
+// Ray-space handle pick for controller pointers (VR).
+std::optional<GizmoHandle> handleUnderRay(App& app, Ray const& ray) {
+  Vec3 pivot;
+  Quat orientation;
+  if (!gizmoFrame(app, pivot, orientation)) {
+    return std::nullopt;
+  }
+  float size = gizmoSize(app, pivot);
+  auto geometry = buildHandleGeometry(app.mode, pivot, orientation, size);
+  return pickHandleByRay(geometry, ray, size * (kPickThresholdPx / kGizmoPixels));
+}
+
 void assembleFrame(App& app,
                     std::vector<DrawItem>& items,
                     std::vector<RendererVertex>& depthLines,
@@ -419,24 +474,8 @@ void handleEvent(App& app,
     app.lastMouse = mouse;
     app.snap = (press->state & XCB_MOD_MASK_CONTROL) != 0U;
     if (press->detail == 1U) {
-      if (auto handle = handleUnderCursor(app, mouse)) {
-        Vec3 pivot;
-        Quat orientation;
-        if (gizmoFrame(app, pivot, orientation)) {
-          GizmoSettings settings;
-          settings.mode = app.mode;
-          settings.space = app.space;
-          settings.snapStep = snapStepFor(app);
-          app.dragging = app.drag.begin(app.scene, app.selection, pivot, orientation, *handle,
-                                        appRay(app, mouse), cameraForward(app.camera), settings);
-        }
-      } else {
-        auto hit = pickNode(app, appRay(app, mouse));
-        app.selection.clear();
-        if (hit.has_value()) {
-          app.selection.push_back(*hit);
-        }
-      }
+      pointerPress(app, appRay(app, mouse), cameraForward(app.camera),
+                   handleUnderCursor(app, mouse));
     } else if (press->detail == 3U) {
       if ((press->state & XCB_MOD_MASK_SHIFT) != 0U) {
         app.panning = true;
@@ -457,8 +496,7 @@ void handleEvent(App& app,
   case XCB_BUTTON_RELEASE: {
     auto* release = reinterpret_cast<xcb_button_release_event_t*>(event);
     if (release->detail == 1U) {
-      app.drag.end();
-      app.dragging = false;
+      pointerRelease(app);
     }
     if (release->detail == 3U) {
       app.looking = false;
@@ -475,7 +513,7 @@ void handleEvent(App& app,
     Vec2 delta{mouse.x - app.lastMouse.x, mouse.y - app.lastMouse.y};
     app.lastMouse = mouse;
     if (app.dragging) {
-      app.drag.update(appRay(app, mouse));
+      pointerMove(app, appRay(app, mouse));
     } else if (app.looking) {
       cameraLook(app.camera, delta.x * kLookSpeed, -delta.y * kLookSpeed);
     } else if (app.panning) {
@@ -734,6 +772,154 @@ int runSmokeWindow(char const* shaderDir, int frames, std::vector<char const*> c
 }
 
 // Applies held movement keys once per frame (free flight).
+constexpr float kXrTurnSpeed = 2.2F; // radians/second at full stick deflection
+
+// Interactive or smoke VR session through the OpenXR shell. Returns 0 when no
+// runtime/headset is available (nothing to test against), 2 on setup failure.
+int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, bool smoke) {
+  XrShell shell;
+  XrShell::InitResult initResult = shell.init();
+  if (initResult == XrShell::InitResult::NoRuntime ||
+      initResult == XrShell::InitResult::NoHeadset) {
+    std::printf(smoke ? "SMOKE SKIP: no OpenXR runtime/headset\n"
+                      : "no OpenXR runtime/headset; install WiVRn and configure the active "
+                        "OpenXR runtime, then retry\n");
+    return 0;
+  }
+  if (initResult != XrShell::InitResult::Ready) {
+    std::printf(smoke ? "SMOKE FAIL: xr init\n" : "xr init failed\n");
+    return 1;
+  }
+
+  App app;
+  app.width = shell.eyeWidth();
+  app.height = shell.eyeHeight();
+
+  VkRenderer renderer;
+  VkRenderer::Config config;
+  config.windowed = false;
+  config.width = shell.eyeWidth();
+  config.height = shell.eyeHeight();
+  config.shaderDir = shaderDir;
+  if (!renderer.initExternal(config, shell.vulkanInstance(), shell.physicalDevice(),
+                             shell.device(), shell.queueFamily(), shell.swapchainFormat())) {
+    std::printf(smoke ? "SMOKE FAIL: renderer init\n" : "renderer init failed\n");
+    renderer.shutdown(); // release any partial resources before the device dies
+    shell.shutdown();
+    return 2;
+  }
+  if (!modelPaths.empty()) {
+    if (!loadModels(app, renderer, modelPaths)) {
+      std::printf(smoke ? "SMOKE FAIL: model loading\n" : "model loading failed\n");
+      renderer.shutdown();
+      shell.shutdown();
+      return 2;
+    }
+    frameScene(app);
+  } else {
+    buildDemoScene(app);
+    if (smoke) {
+      app.selection.push_back(app.visuals[0].id);
+    }
+  }
+
+  // The headset drives the eye views; locomotion is a rig transform composed
+  // with the head pose (per-eye viewProj = proj*viewHead * rigView).
+  Camera rig = app.camera;
+
+  bool running = true;
+  int framesRendered = 0;
+  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  while (running) {
+    XrFrameInput input;
+    if (!shell.beginFrame(input, running)) {
+      if (!running) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(5)); // session still starting
+      continue;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    float dt = std::chrono::duration<float>(now - last).count();
+    last = now;
+    dt = dt > 0.1F ? 0.1F : dt;
+
+    // Left stick moves/strafes, right stick turns; grip boosts and snaps
+    // (mirroring the desktop Shift-boost / Ctrl-snap modifiers).
+    app.snap = input.gripHeld > 0.5F;
+    float speed = kFlySpeed * (app.snap ? kFlyBoost : 1.0F) * dt;
+    cameraFly(rig, {input.moveStick.x * speed, 0.0F, input.moveStick.y * speed});
+    cameraLook(rig, input.turnStick.x * kXrTurnSpeed * dt, input.turnStick.y * kXrTurnSpeed * dt);
+
+    if (input.menuPressed) {
+      app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
+                 : app.mode == GizmoMode::Rotate  ? GizmoMode::Scale
+                                                  : GizmoMode::Translate;
+      if (app.dragging) {
+        app.drag.end();
+        app.dragging = false;
+      }
+    }
+
+    // Head and pointer in world space (rig-transformed).
+    Mat4 rigView = cameraView(rig);
+    Mat4 rigWorld{};
+    if (!invertAffine(rigView, rigWorld)) {
+      running = false;
+      break;
+    }
+    Vec3 headWorld = transformPoint(rigWorld, input.headPosition);
+    Vec3 headForward = normalized(transformVector(rigWorld, input.headForward));
+    Ray worldRay{transformPoint(rigWorld, input.pointerRay.origin),
+                 normalized(transformVector(rigWorld, input.pointerRay.direction))};
+
+    // The right controller's aim ray drives the same state machine as the
+    // mouse; the head pose sizes the gizmo.
+    app.camera.position = headWorld;
+    if (input.selectPressed) {
+      pointerPress(app, worldRay, headForward, handleUnderRay(app, worldRay));
+    } else if (input.selectHeld) {
+      pointerMove(app, worldRay);
+    }
+    if (input.selectReleased) {
+      pointerRelease(app);
+    }
+
+    std::vector<DrawItem> items;
+    std::vector<RendererVertex> depthLines;
+    std::vector<RendererVertex> overlayLines;
+    assembleFrame(app, items, depthLines, overlayLines);
+
+    bool drew = true;
+    for (int eye = 0; eye < 2; ++eye) {
+      Mat4 viewProj = mul(input.eyeViewProj[eye], rigView);
+      if (!renderer.drawToView(shell.eyeView(eye), shell.eyeImage(eye), viewProj, items,
+                               depthLines, overlayLines)) {
+        std::printf("[xr] eye draw failed\n");
+        drew = false;
+        break;
+      }
+    }
+    if (!shell.endFrame() || !drew) {
+      running = false;
+    }
+    ++framesRendered;
+    if (smoke && framesRendered >= 3) {
+      std::printf("SMOKE PASS (xr, %d frames)\n", framesRendered);
+      break;
+    }
+  }
+
+  renderer.shutdown();
+  shell.shutdown();
+  if (smoke && framesRendered < 3) {
+    std::printf("SMOKE FAIL: only %d xr frames rendered\n", framesRendered);
+    return 1;
+  }
+  return 0;
+}
+
 void updateFlight(App& app, float dt) {
   Vec3 local{};
   if (app.flyForward) {
@@ -835,7 +1021,7 @@ int runInteractive(char const* shaderDir, std::vector<char const*> const& modelP
 } // namespace
 
 int main(int argc, char** argv) {
-  enum class Mode { Interactive, SmokeOffscreen, SmokeTextured, SmokeWindow };
+  enum class Mode { Interactive, SmokeOffscreen, SmokeTextured, SmokeWindow, Xr, SmokeXr };
   Mode mode = Mode::Interactive;
   char const* shaderDir = ".build/shaders";
   int frames = 30;
@@ -868,10 +1054,15 @@ int main(int argc, char** argv) {
           ++i;
         }
       }
+    } else if (std::strcmp(arg, "--xr") == 0) {
+      mode = Mode::Xr;
+    } else if (std::strcmp(arg, "--smoke-xr") == 0) {
+      mode = Mode::SmokeXr;
     } else if (std::strcmp(arg, "--help") == 0) {
       std::printf(
           "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR]\n"
-          "                [--smoke-offscreen | --smoke-window [FRAMES]]\n");
+          "                [--xr | --smoke-offscreen | --smoke-xr |\n"
+          "                 --smoke-window [FRAMES]]\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);
@@ -889,6 +1080,10 @@ int main(int argc, char** argv) {
     std::vector<char const*> fixtures{".build/test-textured.glb", ".build/test-texture.obj"};
     return runSmokeOffscreen(shaderDir, fixtures, true);
   }
+  case Mode::Xr:
+    return runXr(shaderDir, modelPaths, false);
+  case Mode::SmokeXr:
+    return runXr(shaderDir, modelPaths, true);
   case Mode::SmokeWindow:
     return runSmokeWindow(shaderDir, frames, modelPaths);
   default:

@@ -70,6 +70,64 @@ Mat4 cameraViewProjection(Camera const& camera, float aspect) {
   return mul(cameraProjection(camera, aspect), cameraView(camera));
 }
 
+Mat4 cameraProjectionFromTangents(float tanLeft, float tanRight, float tanUp, float tanDown,
+                                  float nearZ, float farZ) {
+  Mat4 proj;
+  for (float& element : proj.m) {
+    element = 0.0F;
+  }
+  proj.m[0] = 2.0F / (tanRight - tanLeft);
+  proj.m[5] = -2.0F / (tanUp - tanDown); // clip Y grows downward in Vulkan
+  proj.m[8] = (tanRight + tanLeft) / (tanRight - tanLeft);
+  proj.m[9] = -(tanUp + tanDown) / (tanUp - tanDown);
+  proj.m[10] = farZ / (nearZ - farZ);
+  proj.m[11] = -1.0F;
+  proj.m[14] = (nearZ * farZ) / (nearZ - farZ);
+  return proj;
+}
+
+Mat4 cameraViewFromPose(Vec3 const& position, Quat const& orientation) {
+  // Orientation is world <- eye; the view needs its inverse: R^T and -R^T t.
+  Quat const& q = orientation;
+  float xx = q.x * q.x;
+  float yy = q.y * q.y;
+  float zz = q.z * q.z;
+  float xy = q.x * q.y;
+  float xz = q.x * q.z;
+  float yz = q.y * q.z;
+  float xw = q.x * q.w;
+  float yw = q.y * q.w;
+  float zw = q.z * q.w;
+  float r00 = 1.0F - 2.0F * (yy + zz);
+  float r01 = 2.0F * (xy - zw);
+  float r02 = 2.0F * (xz + yw);
+  float r10 = 2.0F * (xy + zw);
+  float r11 = 1.0F - 2.0F * (xx + zz);
+  float r12 = 2.0F * (yz - xw);
+  float r20 = 2.0F * (xz - yw);
+  float r21 = 2.0F * (yz + xw);
+  float r22 = 1.0F - 2.0F * (xx + yy);
+
+  Mat4 view;
+  view.m[0] = r00;
+  view.m[4] = r10;
+  view.m[8] = r20;
+  view.m[1] = r01;
+  view.m[5] = r11;
+  view.m[9] = r21;
+  view.m[2] = r02;
+  view.m[6] = r12;
+  view.m[10] = r22;
+  view.m[12] = -(r00 * position.x + r10 * position.y + r20 * position.z);
+  view.m[13] = -(r01 * position.x + r11 * position.y + r21 * position.z);
+  view.m[14] = -(r02 * position.x + r12 * position.y + r22 * position.z);
+  view.m[3] = 0.0F;
+  view.m[7] = 0.0F;
+  view.m[11] = 0.0F;
+  view.m[15] = 1.0F;
+  return view;
+}
+
 namespace {
 
 // Maps NDC (x, y) at view-space distance d along the view axis to view space.

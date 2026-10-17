@@ -74,6 +74,7 @@ struct VkRenderer::Impl {
   };
 
   bool windowed{false};
+  bool external{false}; // caller-owned instance/device (XR path)
   std::uint32_t width{0};
   std::uint32_t height{0};
   char deviceName[256] = {0};
@@ -128,6 +129,8 @@ struct VkRenderer::Impl {
   VkImageView colourView{VK_NULL_HANDLE};
 
   VkFormat swapchainFormat{VK_FORMAT_B8G8R8A8_UNORM};
+  VkSurfaceFormatKHR surfaceFormat{};
+  VkFormat pipelineColourFormat{VK_FORMAT_B8G8R8A8_UNORM}; // set by createCommonResources
   VkSwapchainKHR swapchain{VK_NULL_HANDLE};
   std::vector<VkImage> swapchainImages;
   std::vector<VkImageView> swapchainViews;
@@ -257,23 +260,34 @@ struct VkRenderer::Impl {
     }
   }
 
-  bool createSwapchain() {
-    VkSurfaceCapabilitiesKHR caps{};
-    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps));
-
+  // Picks the surface format up front so the pipelines bake the format the
+  // swapchain will actually use (the two must match in dynamic rendering).
+  bool chooseSurfaceFormat() {
     std::uint32_t formatCount = 0;
     VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &formatCount, nullptr));
     std::vector<VkSurfaceFormatKHR> formats(formatCount);
     VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(physical, surface, &formatCount, formats.data()));
-    VkSurfaceFormatKHR chosen = formats[0];
+    if (formats.empty()) {
+      std::printf("[vk] surface reports no formats\n");
+      return false;
+    }
+    surfaceFormat = formats[0];
     for (VkSurfaceFormatKHR const& format : formats) {
       if (format.format == VK_FORMAT_B8G8R8A8_UNORM &&
           format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-        chosen = format;
+        surfaceFormat = format;
         break;
       }
     }
-    swapchainFormat = chosen.format;
+    swapchainFormat = surfaceFormat.format;
+    return true;
+  }
+
+  bool createSwapchain() {
+    VkSurfaceCapabilitiesKHR caps{};
+    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps));
+
+    VkSurfaceFormatKHR chosen = surfaceFormat;
 
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
@@ -428,7 +442,7 @@ struct VkRenderer::Impl {
     dynamic.dynamicStateCount = 2;
     dynamic.pDynamicStates = dynamicStates;
 
-    VkFormat colourFormat = windowed ? swapchainFormat : VK_FORMAT_R8G8B8A8_UNORM;
+    VkFormat colourFormat = pipelineColourFormat;
     VkPipelineRenderingCreateInfo rendering =
         vkStruct<VkPipelineRenderingCreateInfo>(VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO);
     rendering.colorAttachmentCount = 1;
@@ -453,9 +467,16 @@ struct VkRenderer::Impl {
     return true;
   }
 
+  // Creates command/fence, shaders, descriptors, depth image and pipelines on
+  // the already-created device. Shared by init() and initExternal().
+
+  enum class Target { Window, Readback, External };
+
   bool recordCommands(std::size_t depthLineCount,
                       std::size_t overlayLineCount,
-                      VkImageView colourViewUsed) {
+                      VkImageView colourViewUsed,
+                      VkImage colourImageUsed,
+                      Target target) {
     VkCommandBufferBeginInfo beginInfo =
         vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -470,7 +491,7 @@ struct VkRenderer::Impl {
     colourBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colourBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     colourBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    colourBarrier.image = windowed ? swapchainImages[swapchainIndex] : colourImage;
+    colourBarrier.image = colourImageUsed;
     colourBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     colourBarrier.subresourceRange.levelCount = 1;
     colourBarrier.subresourceRange.layerCount = 1;
@@ -584,20 +605,26 @@ struct VkRenderer::Impl {
     afterBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     afterBarrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     afterBarrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    if (windowed) {
+    if (target == Target::Window) {
       afterBarrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
       afterBarrier.dstAccessMask = VK_ACCESS_2_NONE;
       afterBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    } else {
+    } else if (target == Target::Readback) {
       afterBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
       afterBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
       afterBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    } else {
+      // XR swapchain images are released to the runtime in
+      // COLOR_ATTACHMENT_OPTIMAL; writes just need to be visible.
+      afterBarrier.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+      afterBarrier.dstAccessMask = VK_ACCESS_2_NONE;
+      afterBarrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     }
     dependency.imageMemoryBarrierCount = 1;
     dependency.pImageMemoryBarriers = &afterBarrier;
     vkCmdPipelineBarrier2(command, &dependency);
 
-    if (!windowed) {
+    if (target == Target::Readback) {
       VkBufferImageCopy copy{};
       copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       copy.imageSubresource.layerCount = 1;
@@ -610,7 +637,7 @@ struct VkRenderer::Impl {
 
     VkSubmitInfo submit = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    if (windowed) {
+    if (target == Target::Window) {
       submit.waitSemaphoreCount = 1;
       submit.pWaitSemaphores = &imageAvailable;
       submit.pWaitDstStageMask = &waitStage;
@@ -622,7 +649,17 @@ struct VkRenderer::Impl {
     // Reset immediately before submit: any earlier failure leaves the fence
     // signalled, so a failed or skipped frame can never deadlock the next one.
     VK_CHECK(vkResetFences(device, 1, &fence));
-    VK_CHECK(vkQueueSubmit(queue, 1, &submit, fence));
+    VkResult submitResult = vkQueueSubmit(queue, 1, &submit, fence);
+    if (submitResult != VK_SUCCESS) {
+      // A failed submit leaves the fence unsignalled forever: recreate it
+      // signalled so the next frame's wait cannot deadlock.
+      vkDestroyFence(device, fence, nullptr);
+      VkFenceCreateInfo freshInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
+      freshInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+      fence = VK_NULL_HANDLE;
+      vkCreateFence(device, &freshInfo, nullptr, &fence);
+      return checkVk(submitResult, "vkQueueSubmit");
+    }
     return true;
   }
 
@@ -761,6 +798,42 @@ bool VkRenderer::init(Config const& config) {
   VK_CHECK(vkCreateDevice(g.physical, &deviceInfo, nullptr, &g.device));
   vkGetDeviceQueue(g.device, g.queueFamily, 0, &g.queue);
 
+  if (g.windowed && !g.chooseSurfaceFormat()) {
+    return false;
+  }
+  if (!createCommonResources(config.shaderDir,
+                             g.windowed ? g.swapchainFormat : VK_FORMAT_R8G8B8A8_UNORM)) {
+    return false;
+  }
+  if (g.windowed) {
+    VkSemaphoreCreateInfo semaphoreInfo =
+        vkStruct<VkSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
+    VK_CHECK(vkCreateSemaphore(g.device, &semaphoreInfo, nullptr, &g.imageAvailable));
+    VK_CHECK(vkCreateSemaphore(g.device, &semaphoreInfo, nullptr, &g.renderFinished));
+    if (!g.createSwapchain()) {
+      return false;
+    }
+  } else {
+    if (!g.createImage2D(VK_FORMAT_R8G8B8A8_UNORM,
+                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                         VK_IMAGE_ASPECT_COLOR_BIT, g.colourImage, g.colourMemory,
+                         g.colourView)) {
+      return false;
+    }
+    if (!g.createBuffer(static_cast<VkDeviceSize>(g.width) * g.height * 4U,
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        g.readbackBuffer, g.readbackMemory, &g.readbackMapped)) {
+      return false;
+    }
+  }
+  std::printf("[vk] device: %s (%s)\n", g.deviceName, g.windowed ? "windowed" : "offscreen");
+  return true;
+}
+
+bool VkRenderer::createCommonResources(char const* shaderDir, VkFormat colourFormat) {
+  Impl& g = *impl_;
+  g.pipelineColourFormat = colourFormat;
   VkCommandPoolCreateInfo poolInfo =
       vkStruct<VkCommandPoolCreateInfo>(VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
   poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -775,17 +848,11 @@ bool VkRenderer::init(Config const& config) {
   VkFenceCreateInfo fenceInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
   fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
   VK_CHECK(vkCreateFence(g.device, &fenceInfo, nullptr, &g.fence));
-  if (g.windowed) {
-    VkSemaphoreCreateInfo semaphoreInfo =
-        vkStruct<VkSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
-    VK_CHECK(vkCreateSemaphore(g.device, &semaphoreInfo, nullptr, &g.imageAvailable));
-    VK_CHECK(vkCreateSemaphore(g.device, &semaphoreInfo, nullptr, &g.renderFinished));
-  }
 
   std::vector<char> vertCode;
   std::vector<char> fragCode;
-  std::string vertPath = std::string(config.shaderDir) + "/mesh.vert.spv";
-  std::string fragPath = std::string(config.shaderDir) + "/mesh.frag.spv";
+  std::string vertPath = std::string(shaderDir) + "/mesh.vert.spv";
+  std::string fragPath = std::string(shaderDir) + "/mesh.frag.spv";
   if (!readBinaryFile(vertPath.c_str(), vertCode) || !readBinaryFile(fragPath.c_str(), fragCode)) {
     return false;
   }
@@ -904,24 +971,6 @@ bool VkRenderer::init(Config const& config) {
                        VK_IMAGE_ASPECT_DEPTH_BIT, g.depthImage, g.depthMemory, g.depthView)) {
     return false;
   }
-  if (g.windowed) {
-    if (!g.createSwapchain()) {
-      return false;
-    }
-  } else {
-    if (!g.createImage2D(VK_FORMAT_R8G8B8A8_UNORM,
-                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                         VK_IMAGE_ASPECT_COLOR_BIT, g.colourImage, g.colourMemory,
-                         g.colourView)) {
-      return false;
-    }
-    if (!g.createBuffer(static_cast<VkDeviceSize>(g.width) * g.height * 4U,
-                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                        g.readbackBuffer, g.readbackMemory, &g.readbackMapped)) {
-      return false;
-    }
-  }
   if (!g.createPipeline(true, true, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, g.meshPipeline) ||
       !g.createPipeline(true, false, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true, g.blendPipeline) ||
       !g.createPipeline(true, false, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false, g.lineDepthPipeline) ||
@@ -929,8 +978,6 @@ bool VkRenderer::init(Config const& config) {
                         g.lineOverlayPipeline)) {
     return false;
   }
-
-  std::printf("[vk] device: %s (%s)\n", g.deviceName, g.windowed ? "windowed" : "offscreen");
   return true;
 }
 
@@ -1020,13 +1067,15 @@ void VkRenderer::shutdown() {
   if (g.commandPool != VK_NULL_HANDLE) {
     vkDestroyCommandPool(g.device, g.commandPool, nullptr);
   }
-  vkDestroyDevice(g.device, nullptr);
-  g.device = VK_NULL_HANDLE;
+  if (!g.external) {
+    vkDestroyDevice(g.device, nullptr);
+  }
+  g.device = VK_NULL_HANDLE; // external: the caller owns the device teardown
   if (g.surface != VK_NULL_HANDLE) {
     vkDestroySurfaceKHR(g.instance, g.surface, nullptr);
     g.surface = VK_NULL_HANDLE;
   }
-  if (g.instance != VK_NULL_HANDLE) {
+  if (g.instance != VK_NULL_HANDLE && !g.external) {
     vkDestroyInstance(g.instance, nullptr);
     g.instance = VK_NULL_HANDLE;
   }
@@ -1325,7 +1374,10 @@ bool VkRenderer::draw(Camera const& camera,
   }
 
   g.items = items;
-  if (!g.recordCommands(depthCount, overlayLines.size(), colourViewUsed)) {
+  Impl::Target target = g.windowed ? Impl::Target::Window : Impl::Target::Readback;
+  VkImage colourImageUsed = g.windowed ? g.swapchainImages[g.swapchainIndex] : g.colourImage;
+  if (!g.recordCommands(depthCount, overlayLines.size(), colourViewUsed, colourImageUsed,
+                        target)) {
     return false;
   }
 
@@ -1346,6 +1398,64 @@ bool VkRenderer::draw(Camera const& camera,
       return checkVk(presentResult, "vkQueuePresentKHR");
     }
   }
+  return true;
+}
+
+bool VkRenderer::initExternal(Config const& config, VkInstance instance, VkPhysicalDevice physical,
+                              VkDevice device, std::uint32_t queueFamily, VkFormat colourFormat) {
+  Impl& g = *impl_;
+  g.windowed = false;
+  g.external = true;
+  g.width = config.width;
+  g.height = config.height;
+  g.instance = instance;
+  g.physical = physical;
+  g.device = device;
+  g.queueFamily = queueFamily;
+  vkGetDeviceQueue(g.device, g.queueFamily, 0, &g.queue);
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(g.physical, &props);
+  std::snprintf(g.deviceName, sizeof(g.deviceName), "%s", props.deviceName);
+  if (!createCommonResources(config.shaderDir, colourFormat)) {
+    return false;
+  }
+  std::printf("[vk] device: %s (external)\n", g.deviceName);
+  return true;
+}
+
+bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const& viewProj,
+                            std::vector<DrawItem> const& items,
+                            std::vector<RendererVertex> const& depthLines,
+                            std::vector<RendererVertex> const& overlayLines) {
+  Impl& g = *impl_;
+  if (g.meshes.empty()) {
+    std::printf("[vk] no meshes registered\n");
+    return false;
+  }
+  if (depthLines.size() + overlayLines.size() > kMaxLineVerts) {
+    std::printf("[vk] line buffer overflow\n");
+    return false;
+  }
+
+  VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
+  std::memcpy(g.uniformMapped, viewProj.m, sizeof(float) * 16U);
+
+  std::size_t depthCount = depthLines.size();
+  if (depthCount > 0U) {
+    std::memcpy(g.lineMapped, depthLines.data(), sizeof(RendererVertex) * depthCount);
+  }
+  if (!overlayLines.empty()) {
+    std::memcpy(static_cast<char*>(g.lineMapped) + sizeof(RendererVertex) * depthCount,
+                overlayLines.data(), sizeof(RendererVertex) * overlayLines.size());
+  }
+
+  g.items = items;
+  if (!g.recordCommands(depthCount, overlayLines.size(), target, targetImage,
+                        Impl::Target::External)) {
+    return false;
+  }
+  // The caller releases the swapchain image only after rendering completes.
+  VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
   return true;
 }
 
