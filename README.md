@@ -1,9 +1,9 @@
-# vr/editor — 3D scene editor core
+# Genesis — 3D scene editor
 
-Multi-model scene manipulator (move, rotate, scale) for the DLSS5 VR testbed,
-built to run **in parallel** with the native neural-render migration stream and
-have the neural renderer bolted on later through the seam contract
-(`vr/NEURAL-SEAM.md`, `vr/neural-seam.h`).
+Multi-model scene manipulator (move, rotate, scale) for VR, with free-flight
+first-person controls and an OpenXR shell. Built to have the DLSS5 neural
+renderer bolted on later through the seam contract
+(`NEURAL-SEAM.md`, `neural-seam.h`).
 
 ## Layout
 
@@ -33,14 +33,14 @@ have the neural renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash vr/editor/run-tests.sh        # core tests (435 checks; image fixtures via ImageMagick)
-bash vr/editor/run-editor.sh       # build + interactive editor
-bash vr/editor/run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
-bash vr/editor/run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
-bash vr/editor/run-editor.sh --smoke-offscreen     # render + pixel assertions
-bash vr/editor/run-editor.sh --smoke-textured      # texture sampling end-to-end
-bash vr/editor/run-editor.sh --smoke-window 30     # windowed present path
-bash vr/editor/run-editor.sh --smoke-xr            # XR frame loop (SKIP without a runtime)
+bash run-tests.sh        # core tests (435 checks; image fixtures via ImageMagick)
+bash run-editor.sh       # build + interactive editor
+bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
+bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
+bash run-editor.sh --smoke-offscreen     # render + pixel assertions
+bash run-editor.sh --smoke-textured      # texture sampling end-to-end
+bash run-editor.sh --smoke-window 30     # windowed present path
+bash run-editor.sh --smoke-xr            # XR frame loop (SKIP without a runtime)
 ```
 
 `run-tests.sh` compiles with `g++ -std=c++20 -Wall -Wextra -Werror`;
@@ -100,6 +100,7 @@ modifier, mirroring Ctrl's desktop overlap.
 
 ## Git
 
-Developed on branch `scene-editor` (worktree `~/Projects/dlss-testbed-editor`)
-to stay isolated from the migration session working on `main`. Merge into
-`main` when the native evaluation stream is ready to consume the seam.
+Standalone project at `~/Projects/Genesis`, extracted from the DLSS5 VR
+repo's `scene-editor` branch (history preserved). The DLSS5 side consumes
+the seam contract (`NEURAL-SEAM.md`) when the native evaluation stream is
+ready.

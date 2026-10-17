@@ -46,7 +46,7 @@ typedef struct NeuralSeamFrame {
   /* Monotonic counter: the frame producer bumps it on any scene change that
    * invalidates temporal history — moving, rotating, scaling, creating,
    * deleting or reparenting an object (vredit::Scene::epoch() in
-   * vr/editor/include/scene.h). Discontinuity handling:
+   * include/scene.h). Discontinuity handling:
    *   - First frame, or a context with no prior evaluation: reset = 1.
    *   - The code invoking neural_seam_evaluate tracks the last evaluated value;
    *     if it differs, it ORs 1 into both eyes' reset before the call.

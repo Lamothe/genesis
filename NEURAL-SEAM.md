@@ -1,8 +1,8 @@
 # Neural seam contract — 16/10/2026
 
 Single boundary between any renderer and the neural evaluator. The scene editor
-(`vr/editor/`) produces `NeuralSeamFrame` inputs and consumes `NeuralSeamOutput`
-results through `vr/neural-seam.h`; the native evaluation stream binds
+(this project) produces `NeuralSeamFrame` inputs and consumes `NeuralSeamOutput`
+results through `neural-seam.h`; the native evaluation stream binds
 `neural_seam_evaluate` when the full native chain lands. The editor itself never
 touches evaluator internals.
 

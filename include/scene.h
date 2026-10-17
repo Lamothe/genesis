@@ -57,7 +57,7 @@ inline bool sameSnapshot(SceneSnapshot const& a, SceneSnapshot const& b) {
 // Transform hierarchy with cached world matrices. All transforms are TRS
 // (translation, rotation, scale); nested non-uniform scale under rotation can
 // introduce shear that TRS cannot represent, so the gizmo layer assumes
-// shear-free hierarchies (see vr/editor/README.md).
+// shear-free hierarchies (see README.md).
 class Scene {
 public:
   Scene();
@@ -81,7 +81,7 @@ public:
   void restoreTransforms(SceneSnapshot const& snapshot);
 
   // Monotonic counter, bumps on any structural or transform change. The neural
-  // seam maps a change here to a temporal discontinuity (vr/NEURAL-SEAM.md).
+  // seam maps a change here to a temporal discontinuity (NEURAL-SEAM.md).
   std::uint64_t epoch() const { return epoch_; }
 
 private:
