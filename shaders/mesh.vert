@@ -13,7 +13,7 @@ layout(push_constant) uniform Push {
   mat4 model;
   vec4 tint;
   vec4 params; // x: lit, y: texture index, z: alpha cutoff, w: alpha mode
-  vec4 normalParams; // x: has normal map, y: texture index, z: scale, w: unused
+  vec4 normalParams; // x: has normal map, y: texture index, z: scale, w: highlight
 } push;
 
 layout(location = 0) out vec3 vNormal;

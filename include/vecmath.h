@@ -165,6 +165,37 @@ inline Vec3 transformVector(Mat4 const& a, Vec3 v) {
   };
 }
 
+// Exact bounds of the transformed box: transforms all 8 corners.
+inline Aabb transformAabb(Mat4 const& a, Aabb const& box) {
+  Aabb out{};
+  for (int corner = 0; corner < 8; ++corner) {
+    Vec3 local{(corner & 1) != 0 ? box.max.x : box.min.x,
+               (corner & 2) != 0 ? box.max.y : box.min.y,
+               (corner & 4) != 0 ? box.max.z : box.min.z};
+    Vec3 point = transformPoint(a, local);
+    if (corner == 0) {
+      out = {point, point};
+    } else {
+      out.min = {std::fmin(out.min.x, point.x), std::fmin(out.min.y, point.y),
+                 std::fmin(out.min.z, point.z)};
+      out.max = {std::fmax(out.max.x, point.x), std::fmax(out.max.y, point.y),
+                 std::fmax(out.max.z, point.z)};
+    }
+  }
+  return out;
+}
+
+inline Aabb unite(Aabb const& a, Aabb const& b) {
+  return {{std::fmin(a.min.x, b.min.x), std::fmin(a.min.y, b.min.y),
+           std::fmin(a.min.z, b.min.z)},
+          {std::fmax(a.max.x, b.max.x), std::fmax(a.max.y, b.max.y),
+           std::fmax(a.max.z, b.max.z)}};
+}
+
+inline Vec3 aabbCentre(Aabb const& box) {
+  return (box.min + box.max) * 0.5F;
+}
+
 // Inverts the affine part (last row 0,0,0,1). Returns false if singular.
 inline bool invertAffine(Mat4 const& a, Mat4& out) {
   Vec3 c0{a.m[0], a.m[1], a.m[2]};

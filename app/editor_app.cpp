@@ -2,6 +2,7 @@
 // selection, gizmo handles. Typed C++ only; the shell is a thin layer over
 // vredit::Scene/GizmoDrag and VkRenderer.
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -88,6 +89,11 @@ struct App {
   Scene scene;
   std::vector<NodeVisual> visuals;
   std::vector<NodeId> selection;
+  // Model grouping: every node created for one loaded model shares a group id,
+  // so a plain click selects the whole model and a secondary click (shift/
+  // ctrl, or grip+trigger in VR) selects a single part. Group 0 = ungrouped.
+  std::vector<std::pair<NodeId, std::uint32_t>> modelGroups;
+  std::uint32_t nextModelGroup{1};
   UndoHistory undo;
   Camera camera;
   GizmoMode mode{GizmoMode::Translate};
@@ -132,11 +138,18 @@ void addCubeVisual(App& app, NodeId id, Vec3 colour) {
 }
 
 void buildDemoScene(App& app) {
+  // Two single-part models and one two-part model (the parent/child assembly),
+  // so model-vs-part selection is exercised by the demo scene itself.
+  std::uint32_t const groupA = app.nextModelGroup++;
+  std::uint32_t const groupB = app.nextModelGroup++;
+  std::uint32_t const groupAssembly = app.nextModelGroup++;
+
   NodeId a = app.scene.create();
   Transform ta;
   ta.translation = {1.2F, 0.5F, 0.0F};
   app.scene.setLocal(a, ta);
   addCubeVisual(app, a, {0.85F, 0.25F, 0.20F});
+  app.modelGroups.push_back({a, groupA});
 
   NodeId b = app.scene.create();
   Transform tb;
@@ -144,6 +157,7 @@ void buildDemoScene(App& app) {
   tb.scale = {0.7F, 0.7F, 0.7F};
   app.scene.setLocal(b, tb);
   addCubeVisual(app, b, {0.25F, 0.45F, 0.85F});
+  app.modelGroups.push_back({b, groupB});
 
   NodeId parent = app.scene.create();
   Transform tp;
@@ -151,6 +165,7 @@ void buildDemoScene(App& app) {
   tp.rotation = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 0.7853982F);
   app.scene.setLocal(parent, tp);
   addCubeVisual(app, parent, {0.35F, 0.75F, 0.35F});
+  app.modelGroups.push_back({parent, groupAssembly});
 
   NodeId child = app.scene.create(parent);
   Transform tc;
@@ -158,6 +173,7 @@ void buildDemoScene(App& app) {
   tc.scale = {0.55F, 0.55F, 0.55F};
   app.scene.setLocal(child, tc);
   addCubeVisual(app, child, {0.85F, 0.75F, 0.25F});
+  app.modelGroups.push_back({child, groupAssembly});
 }
 
 // Adds a loaded model's meshes and node hierarchy to the scene and visuals.
@@ -194,12 +210,14 @@ bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
     }
   }
   std::vector<NodeId> handles(model.nodes.size(), kInvalidNode);
+  std::uint32_t const modelGroup = app.nextModelGroup++;
   for (std::size_t n = 0; n < model.nodes.size(); ++n) {
     ModelNode const& node = model.nodes[n];
     NodeId parent = node.parent >= 0 ? handles[static_cast<std::size_t>(node.parent)] : kInvalidNode;
     NodeId id = app.scene.create(parent);
     app.scene.setLocal(id, node.local);
     handles[n] = id;
+    app.modelGroups.push_back({id, modelGroup}); // one file = one model
     if (node.mesh >= 0 && static_cast<std::size_t>(node.mesh) < model.meshes.size()) {
       ModelMesh const& mesh = model.meshes[static_cast<std::size_t>(node.mesh)];
       NodeVisual visual;
@@ -282,11 +300,44 @@ ProjectFn makeProject(App const& app) {
   };
 }
 
+// Combined world bounds of the selection: visuals contribute their exact
+// transformed bounds, hierarchy-only nodes (no mesh) their origin point.
+bool selectionBounds(App& app, Aabb& boundsOut) {
+  bool any = false;
+  Aabb bounds{};
+  for (NodeId id : app.selection) {
+    if (!app.scene.valid(id)) {
+      continue;
+    }
+    Aabb contribution;
+    bool found = false;
+    for (NodeVisual const& visual : app.visuals) {
+      if (visual.id == id) {
+        contribution = transformAabb(app.scene.world(id), visual.localBounds);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      Vec3 point = app.scene.worldPosition(id);
+      contribution = {point, point};
+    }
+    bounds = any ? unite(bounds, contribution) : contribution;
+    any = true;
+  }
+  boundsOut = bounds;
+  return any;
+}
+
 bool gizmoFrame(App& app, Vec3& pivot, Quat& orientation) {
   if (app.selection.empty()) {
     return false;
   }
-  pivot = app.scene.worldPosition(app.selection[0]);
+  // Handles sit at the centre of the selection's bounds, not at the node
+  // origin (which is often at the model's feet).
+  Aabb bounds{};
+  pivot = selectionBounds(app, bounds) ? aabbCentre(bounds)
+                                       : app.scene.worldPosition(app.selection[0]);
   orientation = Quat{};
   if (app.space == GizmoSpace::Local) {
     Vec3 t;
@@ -369,10 +420,13 @@ bool endDrag(App& app);
 // Pointer interaction shared by the mouse and the VR controller ray. The
 // caller resolves the handle under the pointer (screen-space for the mouse,
 // ray-space for VR); a handle press starts a drag, anything else selects.
+// partSelect (shift/ctrl click, grip+trigger in VR) limits the selection to
+// the single picked part instead of the whole model.
 void pointerPress(App& app,
                   Ray const& ray,
                   Vec3 const& viewDir,
-                  std::optional<GizmoHandle> handle) {
+                  std::optional<GizmoHandle> handle,
+                  bool partSelect) {
   // A press while a drag is live means its release was never seen (pointer
   // left the window); commit that drag as one undo step before starting over,
   // or its transforms would be silently lost from history.
@@ -400,7 +454,7 @@ void pointerPress(App& app,
   auto hit = pickNode(app, ray);
   app.selection.clear();
   if (hit.has_value()) {
-    app.selection.push_back(*hit);
+    app.selection = vredit::expandSelection(app.modelGroups, *hit, partSelect);
   }
 }
 
@@ -442,7 +496,10 @@ void assembleFrame(App& app,
                     std::vector<RendererVertex>& depthLines,
                     std::vector<RendererVertex>& overlayLines) {
   appendGrid(depthLines, 8.0F, 1.0F);
-  auto appendItem = [&app, &items](NodeVisual const& visual) {
+  auto isSelected = [&app](NodeId id) {
+    return std::find(app.selection.begin(), app.selection.end(), id) != app.selection.end();
+  };
+  auto appendItem = [&app, &items, &isSelected](NodeVisual const& visual) {
     DrawItem item;
     item.mesh = visual.mesh;
     item.texture = visual.texture;
@@ -455,6 +512,7 @@ void assembleFrame(App& app,
     item.alphaCutoff = visual.alphaCutoff;
     item.alpha = visual.alpha;
     item.lit = true;
+    item.highlight = isSelected(visual.id) ? 1.0F : 0.0F;
     items.push_back(item);
   };
   // Opaque and mask-cutout items first, blended items last (painter's order).
@@ -473,6 +531,12 @@ void assembleFrame(App& app,
   if (gizmoFrame(app, pivot, orientation)) {
     auto geometry = buildHandleGeometry(app.mode, pivot, orientation, gizmoSize(app, pivot));
     appendHandleLines(overlayLines, geometry);
+  }
+  Aabb selectedBounds{};
+  if (selectionBounds(app, selectedBounds)) {
+    // Selection outline sits on top of everything, so the selected model is
+    // identifiable even when its tint alone is not obvious.
+    appendBoundsLines(overlayLines, selectedBounds, {1.0F, 0.62F, 0.22F});
   }
 }
 
@@ -560,8 +624,9 @@ void handleEvent(App& app,
       break; // minimised: pointer maths would divide by zero
     }
     if (press->detail == 1U) {
+      bool const partSelect = (press->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
       pointerPress(app, appRay(app, mouse), cameraForward(app.camera),
-                   handleUnderCursor(app, mouse));
+                   handleUnderCursor(app, mouse), partSelect);
     } else if (press->detail == 3U) {
       if ((press->state & XCB_MOD_MASK_SHIFT) != 0U) {
         app.panning = true;
@@ -651,15 +716,15 @@ void handleEvent(App& app,
         break; // unmoved grab: nothing to cancel, history untouched
       }
       bool const redo = (key->state & XCB_MOD_MASK_SHIFT) != 0U;
-      if (redo ? app.undo.redo(app.scene) : app.undo.undo(app.scene)) {
-        std::printf("%s\n", redo ? "redo" : "undo");
+      if (redo) {
+        app.undo.redo(app.scene);
+      } else {
+        app.undo.undo(app.scene);
       }
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
       endDrag(app);
-      if (app.undo.redo(app.scene)) {
-        std::printf("redo\n");
-      }
+      app.undo.redo(app.scene);
     } else if (keysym == 0xFF1BU) {
       app.running = false;
       stateChanged = true;
@@ -1066,7 +1131,9 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     // mouse; the head pose sizes the gizmo.
     app.camera.position = headWorld;
     if (input.selectPressed) {
-      pointerPress(app, worldRay, headForward, handleUnderRay(app, worldRay));
+      // Grip + trigger selects a single part; trigger alone the whole model.
+      bool const partSelect = input.gripHeld > 0.5F;
+      pointerPress(app, worldRay, headForward, handleUnderRay(app, worldRay), partSelect);
     } else if (input.selectHeld) {
       pointerMove(app, worldRay);
     }

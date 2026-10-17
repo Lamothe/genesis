@@ -136,4 +136,33 @@ std::optional<PickHit> pickClosestSurface(Ray const& ray,
   return best;
 }
 
+std::vector<NodeId> expandSelection(std::vector<std::pair<NodeId, std::uint32_t>> const& groups,
+                                    NodeId picked,
+                                    bool partOnly) {
+  std::vector<NodeId> out;
+  if (partOnly) {
+    out.push_back(picked);
+    return out;
+  }
+  std::uint32_t group = 0;
+  bool found = false;
+  for (auto const& entry : groups) {
+    if (entry.first == picked) {
+      group = entry.second;
+      found = true;
+      break;
+    }
+  }
+  if (!found || group == 0) {
+    out.push_back(picked); // ungrouped nodes stay individually selectable
+    return out;
+  }
+  for (auto const& entry : groups) {
+    if (entry.second == group) {
+      out.push_back(entry.first);
+    }
+  }
+  return out;
+}
+
 } // namespace vredit

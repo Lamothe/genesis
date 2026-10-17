@@ -431,6 +431,127 @@ void testUndoHistory() {
   CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F); // dangling edit too
 }
 
+void testExpandSelection() {
+  // One model file = one group: a plain pick selects every node of the group,
+  // a secondary pick just the single part.
+  std::vector<std::pair<vredit::NodeId, std::uint32_t>> groups{
+      {10, 1U}, {11, 1U}, {12, 1U}, {20, 2U}};
+  auto whole = vredit::expandSelection(groups, 11, false);
+  CHECK(whole.size() == 3U);
+  CHECK(whole[0] == 10U && whole[1] == 11U && whole[2] == 12U);
+  auto part = vredit::expandSelection(groups, 11, true);
+  CHECK(part.size() == 1U);
+  CHECK(part[0] == 11U);
+  // Group 0 (ungrouped) selects individually; unknown nodes select themselves.
+  std::vector<std::pair<vredit::NodeId, std::uint32_t>> loose{{5, 0U}, {6, 0U}};
+  auto single = vredit::expandSelection(loose, 5, false);
+  CHECK(single.size() == 1U);
+  CHECK(single[0] == 5U);
+  auto unknown = vredit::expandSelection(groups, 99, false);
+  CHECK(unknown.size() == 1U);
+  CHECK(unknown[0] == 99U);
+}
+
+void testBoundsHelpers() {
+  // transformAabb must be the exact box of the transformed corners (rotation
+  // included), and the centre/union helpers the obvious things.
+  vredit::Aabb box{{-1.0F, -2.0F, -3.0F}, {1.0F, 2.0F, 3.0F}};
+  vredit::Mat4 translated = vredit::translationMatrix({10.0F, 0.0F, 0.0F});
+  vredit::Aabb moved = vredit::transformAabb(translated, box);
+  CHECK_NEAR3(moved.min, {9.0F, -2.0F, -3.0F});
+  CHECK_NEAR3(moved.max, {11.0F, 2.0F, 3.0F});
+  CHECK_NEAR3(vredit::aabbCentre(moved), {10.0F, 0.0F, 0.0F});
+
+  // 90 degrees about Z: x and y swap extents.
+  vredit::Mat4 rotated = vredit::rotationMatrix(
+      vredit::quatFromAxisAngle({0.0F, 0.0F, 1.0F}, kHalfPi));
+  vredit::Aabb spun = vredit::transformAabb(rotated, box);
+  CHECK_NEAR3(spun.min, {-2.0F, -1.0F, -3.0F});
+  CHECK_NEAR3(spun.max, {2.0F, 1.0F, 3.0F});
+
+  vredit::Aabb u = vredit::unite(moved, spun);
+  CHECK_NEAR3(u.min, {-2.0F, -2.0F, -3.0F});
+  CHECK_NEAR3(u.max, {11.0F, 2.0F, 3.0F});
+}
+
+void testGizmoParentChildSelectionRides() {
+  // Rigid-group regression: selecting both a parent and its child and moving
+  // them must advance the child's world position by exactly one delta. The
+  // child rides along with its parent instead of receiving the delta twice.
+  vredit::Scene scene;
+  vredit::NodeId parent = scene.create();
+  vredit::Transform tp;
+  tp.translation = {0.0F, 0.0F, 0.0F};
+  scene.setLocal(parent, tp);
+  vredit::NodeId child = scene.create(parent);
+  vredit::Transform tc;
+  tc.translation = {2.0F, 0.0F, 0.0F};
+  scene.setLocal(child, tc);
+
+  vredit::GizmoDrag drag;
+  vredit::GizmoSettings settings;
+  settings.mode = vredit::GizmoMode::Translate;
+  CHECK(drag.begin(scene, {parent, child}, {1.0F, 0.0F, 0.0F}, {}, vredit::GizmoHandle::AxisX,
+                   {{1.0F, 0.0F, 5.0F}, {0.0F, 0.0F, -1.0F}}, {0.0F, 0.0F, -1.0F}, settings));
+  drag.update({{3.0F, 0.0F, 5.0F}, {0.0F, 0.0F, -1.0F}}); // +2 along X
+  CHECK_NEAR3(scene.worldPosition(parent), {2.0F, 0.0F, 0.0F});
+  CHECK_NEAR3(scene.worldPosition(child), {4.0F, 0.0F, 0.0F}); // 2 (parent) + 2 (local)
+  drag.end();
+
+  // Selecting only the child still moves it independently of the parent.
+  vredit::GizmoDrag partDrag;
+  CHECK(partDrag.begin(scene, {child}, {4.0F, 0.0F, 0.0F}, {}, vredit::GizmoHandle::AxisY,
+                       {{4.0F, 0.0F, 5.0F}, {0.0F, 0.0F, -1.0F}}, {0.0F, 0.0F, -1.0F}, settings));
+  partDrag.update({{4.0F, 1.5F, 5.0F}, {0.0F, 0.0F, -1.0F}});
+  CHECK_NEAR3(scene.worldPosition(child), {4.0F, 1.5F, 0.0F});
+  CHECK_NEAR3(scene.worldPosition(parent), {2.0F, 0.0F, 0.0F}); // parent untouched
+
+  // Rotate rides along too: parent+child rotate about the pivot by exactly
+  // one angle, so the child stays rigidly attached to its parent.
+  vredit::Scene rotScene;
+  vredit::NodeId rotParent = rotScene.create();
+  vredit::Transform rp;
+  rp.translation = {1.0F, 0.0F, 0.0F};
+  rotScene.setLocal(rotParent, rp);
+  vredit::NodeId rotChild = rotScene.create(rotParent);
+  vredit::Transform rc;
+  rc.translation = {1.0F, 0.0F, 0.0F};
+  rotScene.setLocal(rotChild, rc);
+  vredit::GizmoDrag rotDrag;
+  vredit::GizmoSettings rotSettings;
+  rotSettings.mode = vredit::GizmoMode::Rotate;
+  // The start ray must land off-pivot: the angle needs a reference vector.
+  CHECK(rotDrag.begin(rotScene, {rotParent, rotChild}, {1.0F, 0.0F, 0.0F}, {},
+                      vredit::GizmoHandle::AxisZ,
+                      {{2.0F, 0.0F, 5.0F}, {0.0F, 0.0F, -1.0F}}, {0.0F, 0.0F, -1.0F},
+                      rotSettings));
+  // Rotate the drag plane point 90 degrees around the pivot on the Z axis.
+  rotDrag.update({{1.0F, 1.0F, 5.0F}, {0.0F, 0.0F, -1.0F}});
+  CHECK_NEAR3(rotScene.worldPosition(rotParent), {1.0F, 0.0F, 0.0F}); // on the pivot
+  CHECK_NEAR3(rotScene.worldPosition(rotChild), {1.0F, 1.0F, 0.0F});  // one quarter-turn
+  rotDrag.end();
+
+  // Three-level chain with the MIDDLE node unselected: the grandchild still
+  // rides along with its selected grandparent through the unselected parent.
+  vredit::Scene chain;
+  vredit::NodeId grand = chain.create();
+  vredit::NodeId middle = chain.create(grand);
+  vredit::Transform mid;
+  mid.translation = {1.0F, 0.0F, 0.0F};
+  chain.setLocal(middle, mid);
+  vredit::NodeId leaf = chain.create(middle);
+  vredit::Transform lf;
+  lf.translation = {1.0F, 0.0F, 0.0F};
+  chain.setLocal(leaf, lf);
+  vredit::GizmoDrag chainDrag;
+  CHECK(chainDrag.begin(chain, {grand, leaf}, {1.0F, 0.0F, 0.0F}, {}, vredit::GizmoHandle::AxisX,
+                        {{1.0F, 0.0F, 5.0F}, {0.0F, 0.0F, -1.0F}}, {0.0F, 0.0F, -1.0F},
+                        settings));
+  chainDrag.update({{2.0F, 0.0F, 5.0F}, {0.0F, 0.0F, -1.0F}}); // +1 along X
+  CHECK_NEAR3(chain.worldPosition(grand), {1.0F, 0.0F, 0.0F});
+  CHECK_NEAR3(chain.worldPosition(leaf), {3.0F, 0.0F, 0.0F}); // one delta, not two
+}
+
 void testGizmoTranslateWorld() {
   vredit::Scene scene;
   vredit::NodeId n = scene.create();
@@ -1632,6 +1753,9 @@ int main() {
   testPickClosestSurface();
   testSceneSnapshotRestore();
   testUndoHistory();
+  testExpandSelection();
+  testBoundsHelpers();
+  testGizmoParentChildSelectionRides();
   testGizmoTranslateWorld();
   testGizmoTranslateRotatedParent();
   testGizmoRotateSnapped();

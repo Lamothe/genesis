@@ -92,4 +92,20 @@ void appendHandleLines(std::vector<RendererVertex>& out,
   }
 }
 
+void appendBoundsLines(std::vector<RendererVertex>& out, Aabb const& bounds, Vec3 colour) {
+  Vec3 const up{0.0F, 1.0F, 0.0F};
+  Vec3 c[8];
+  for (int i = 0; i < 8; ++i) {
+    c[i] = {(i & 1) != 0 ? bounds.max.x : bounds.min.x,
+            (i & 2) != 0 ? bounds.max.y : bounds.min.y,
+            (i & 4) != 0 ? bounds.max.z : bounds.min.z};
+  }
+  int const edges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
+                            {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+  for (auto const& edge : edges) {
+    out.push_back({c[edge[0]], up, colour, {0.0F, 0.0F}});
+    out.push_back({c[edge[1]], up, colour, {0.0F, 0.0F}});
+  }
+}
+
 } // namespace vredit

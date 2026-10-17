@@ -59,7 +59,7 @@ struct PushData {
   float model[16];
   float tint[4];
   float params[4];
-  float normalParams[4]; // x: has normal map, y: texture index, z: scale, w: unused
+  float normalParams[4]; // x: has normal map, y: texture index, z: scale, w: highlight
 };
 static_assert(sizeof(PushData) == 112, "push constants must match the shader layout");
 
@@ -656,6 +656,7 @@ struct VkRenderer::Impl {
       push.normalParams[1] =
           item.normalTexture < textures.size() ? static_cast<float>(item.normalTexture) : 0.0F;
       push.normalParams[2] = item.normalScale;
+      push.normalParams[3] = item.highlight;
       vkCmdPushConstants(command, pipelineLayout,
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                          sizeof(PushData), &push);
@@ -663,28 +664,33 @@ struct VkRenderer::Impl {
     }
 
     VkDeviceSize stride = sizeof(RendererVertex);
+    // Line passes always push their own identity transform: overlay lines must
+    // never inherit the last mesh item's model/tint/highlight.
+    PushData linePush{};
+    linePush.model[0] = 1.0F;
+    linePush.model[5] = 1.0F;
+    linePush.model[10] = 1.0F;
+    linePush.model[15] = 1.0F;
+    linePush.tint[0] = 1.0F;
+    linePush.tint[1] = 1.0F;
+    linePush.tint[2] = 1.0F;
+    linePush.tint[3] = 1.0F;
     if (depthLineCount > 0U) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, lineDepthPipeline);
       VkDeviceSize offset = 0;
       vkCmdBindVertexBuffers(command, 0, 1, &lineBuffer, &offset);
-      PushData push{};
-      push.model[0] = 1.0F;
-      push.model[5] = 1.0F;
-      push.model[10] = 1.0F;
-      push.model[15] = 1.0F;
-      push.tint[0] = 1.0F;
-      push.tint[1] = 1.0F;
-      push.tint[2] = 1.0F;
-      push.tint[3] = 1.0F;
       vkCmdPushConstants(command, pipelineLayout,
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                         sizeof(PushData), &push);
+                         sizeof(PushData), &linePush);
       vkCmdDraw(command, static_cast<std::uint32_t>(depthLineCount), 1, 0, 0);
     }
     if (overlayLineCount > 0U) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, lineOverlayPipeline);
       VkDeviceSize offset = stride * depthLineCount;
       vkCmdBindVertexBuffers(command, 0, 1, &lineBuffer, &offset);
+      vkCmdPushConstants(command, pipelineLayout,
+                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                         sizeof(PushData), &linePush);
       vkCmdDraw(command, static_cast<std::uint32_t>(overlayLineCount), 1, 0, 0);
     }
 

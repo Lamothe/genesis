@@ -50,8 +50,10 @@ only: **all project logic is typed C/C++ (project rule — no Python)**.
 ## Controls
 
 WASD move, Q/E down/up, Shift boost, RMB mouse-look, wheel fly forward/back.
-LMB select / drag gizmo. G translate, R rotate, S scale (or 1/2/3), L
-world/local space, Ctrl snap, Ctrl-Z undo, Ctrl-Y / Ctrl-Shift-Z redo, Esc quit.
+LMB select (whole model) / drag gizmo; Shift+LMB or Ctrl+LMB selects a single
+part. G translate, R rotate, S scale (or 1/2/3), L world/local space, Ctrl
+snap, Ctrl-Z undo, Ctrl-Y / Ctrl-Shift-Z redo, Esc quit. The gizmo sits at the
+centre of the selection's bounds; the selection is tinted and outlined.
 
 ## Design notes
 

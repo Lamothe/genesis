@@ -1,5 +1,6 @@
 #include "gizmo.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace vredit {
@@ -176,6 +177,19 @@ bool GizmoDrag::begin(Scene& scene,
     if (!scene.valid(id)) {
       continue;
     }
+    // Rigid-group semantics: a node whose ancestor is also selected rides
+    // along with that ancestor's transform instead of receiving the delta
+    // itself, which would apply it twice through the hierarchy.
+    bool ancestorSelected = false;
+    for (NodeId p = scene.parent(id); p != kInvalidNode && scene.valid(p); p = scene.parent(p)) {
+      if (std::find(selection.begin(), selection.end(), p) != selection.end()) {
+        ancestorSelected = true;
+        break;
+      }
+    }
+    if (ancestorSelected) {
+      continue;
+    }
     StartNode start;
     start.id = id;
     NodeId parentId = scene.parent(id);
@@ -184,6 +198,10 @@ bool GizmoDrag::begin(Scene& scene,
       parentWorld = scene.world(parentId);
     }
     if (!invertAffine(parentWorld, start.invParent)) {
+      // Singular parent world (a zero-scale ancestor): drop the node. Its
+      // skipped descendants inherit the same singular chain and would fail
+      // identically as their own entries, so nothing moves — no silent
+      // half-transform.
       continue;
     }
     start.startWorld = mul(parentWorld, toMatrix(scene.local(id)));

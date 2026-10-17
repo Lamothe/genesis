@@ -13,7 +13,7 @@ layout(push_constant) uniform Push {
   mat4 model;
   vec4 tint;
   vec4 params; // x: lit, y: texture index, z: alpha cutoff, w: alpha mode
-  vec4 normalParams; // x: has normal map, y: texture index, z: scale, w: unused
+  vec4 normalParams; // x: has normal map, y: texture index, z: scale, w: highlight
 } push;
 
 void main() {
@@ -51,5 +51,8 @@ void main() {
   if (mode > 0.5 && mode < 1.5 && base.a < push.params.z) {
     discard; // AlphaMode::Mask
   }
+  // Selection highlight: warm orange lift that survives textures and lighting.
+  base.rgb = mix(base.rgb, vec3(1.0, 0.62, 0.22), 0.35 * push.normalParams.w) +
+             vec3(0.18, 0.10, 0.0) * push.normalParams.w;
   outColour = base;
 }
