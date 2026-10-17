@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <thread>
@@ -26,6 +27,7 @@
 #include "obj.h"
 #include "picking.h"
 #include "scene.h"
+#include "undo.h"
 #include "vk_renderer.h"
 
 using namespace vredit;
@@ -72,6 +74,10 @@ struct NodeVisual {
   bool normalMapped{false};
   float normalScale{1.0F};
   Aabb localBounds{{-0.5F, -0.5F, -0.5F}, {0.5F, 0.5F, 0.5F}};
+  // Exact picking triangles (node-local); shared between visuals that loaded
+  // the same mesh. Null for box-shaped visuals (demo cubes), where the bounds
+  // are the shape.
+  std::shared_ptr<const vredit::PickGeometry> pickGeometry;
   Vec3 colour{1.0F, 1.0F, 1.0F};
   float alphaFactor{1.0F};
   AlphaMode alpha{AlphaMode::Opaque};
@@ -82,6 +88,7 @@ struct App {
   Scene scene;
   std::vector<NodeVisual> visuals;
   std::vector<NodeId> selection;
+  UndoHistory undo;
   Camera camera;
   GizmoMode mode{GizmoMode::Translate};
   GizmoSpace space{GizmoSpace::World};
@@ -154,14 +161,28 @@ void buildDemoScene(App& app) {
 }
 
 // Adds a loaded model's meshes and node hierarchy to the scene and visuals.
+// Node-local picking triangles derived from loaded mesh data, shared per mesh
+// so meshes referenced by several nodes cost one copy.
+std::shared_ptr<const vredit::PickGeometry> makePickGeometry(MeshData const& data) {
+  auto geometry = std::make_shared<vredit::PickGeometry>();
+  geometry->positions.reserve(data.vertices.size());
+  for (MeshVertex const& vertex : data.vertices) {
+    geometry->positions.push_back(vertex.pos);
+  }
+  geometry->indices = data.indices;
+  return geometry;
+}
+
 bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
   std::vector<MeshHandle> meshHandles(model.meshes.size(), 0U);
+  std::vector<std::shared_ptr<const vredit::PickGeometry>> pickGeometries(model.meshes.size());
   for (std::size_t m = 0; m < model.meshes.size(); ++m) {
     meshHandles[m] = renderer.addMesh(model.meshes[m].data);
     if (meshHandles[m] == kInvalidMesh) {
       std::printf("mesh registration failed for mesh %zu\n", m);
       return false;
     }
+    pickGeometries[m] = makePickGeometry(model.meshes[m].data);
   }
   std::vector<TextureHandle> textureHandles(model.textures.size(), 0U);
   for (std::size_t t = 0; t < model.textures.size(); ++t) {
@@ -185,6 +206,7 @@ bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
       visual.id = id;
       visual.mesh = meshHandles[static_cast<std::size_t>(node.mesh)];
       visual.localBounds = meshBounds(mesh.data);
+      visual.pickGeometry = pickGeometries[static_cast<std::size_t>(node.mesh)];
       visual.colour = mesh.colour;
       visual.alphaFactor = mesh.alphaFactor;
       visual.alpha = mesh.alpha;
@@ -293,7 +315,7 @@ std::optional<GizmoHandle> handleUnderCursor(App& app, Vec2 mouse) {
 }
 
 std::optional<NodeId> pickNode(App& app, Ray const& ray) {
-  std::vector<std::pair<NodeId, Aabb>> candidates;
+  std::vector<vredit::PickCandidate> candidates;
   for (NodeVisual const& visual : app.visuals) {
     Mat4 world = app.scene.world(visual.id);
     Aabb box{};
@@ -313,9 +335,14 @@ std::optional<NodeId> pickNode(App& app, Ray const& ray) {
                    std::fmax(box.max.z, point.z)};
       }
     }
-    candidates.push_back({visual.id, box});
+    vredit::PickCandidate candidate;
+    candidate.node = visual.id;
+    candidate.worldBounds = box;
+    candidate.world = world;
+    candidate.geometry = visual.pickGeometry;
+    candidates.push_back(std::move(candidate));
   }
-  auto hit = pickClosest(ray, candidates);
+  auto hit = vredit::pickClosestSurface(ray, candidates);
   if (!hit.has_value()) {
     return std::nullopt;
   }
@@ -336,6 +363,9 @@ float snapStepFor(App const& app) {
   }
 }
 
+// Defined below; pointerPress commits any live drag before starting anew.
+bool endDrag(App& app);
+
 // Pointer interaction shared by the mouse and the VR controller ray. The
 // caller resolves the handle under the pointer (screen-space for the mouse,
 // ray-space for VR); a handle press starts a drag, anything else selects.
@@ -343,6 +373,10 @@ void pointerPress(App& app,
                   Ray const& ray,
                   Vec3 const& viewDir,
                   std::optional<GizmoHandle> handle) {
+  // A press while a drag is live means its release was never seen (pointer
+  // left the window); commit that drag as one undo step before starting over,
+  // or its transforms would be silently lost from history.
+  endDrag(app);
   if (handle.has_value()) {
     Vec3 pivot;
     Quat orientation;
@@ -351,9 +385,15 @@ void pointerPress(App& app,
       settings.mode = app.mode;
       settings.space = app.space;
       settings.snapStep = snapStepFor(app);
-      app.dragging =
+      bool started =
           app.drag.begin(app.scene, app.selection, pivot, orientation, *handle, ray, viewDir,
                          settings);
+      if (started) {
+        // Snapshot after begin() (it captures state, never mutates) and before
+        // the first update() — undo restores exactly this pre-drag state.
+        app.undo.begin(app.scene.snapshotTransforms());
+      }
+      app.dragging = started;
     }
     return;
   }
@@ -370,11 +410,19 @@ void pointerMove(App& app, Ray const& ray) {
   }
 }
 
-void pointerRelease(App& app) {
+// Ends an active drag and records it as one undo step (no-op when the drag
+// moved nothing). Shared by release, mode switches and shutdown paths.
+bool endDrag(App& app) { // returns true when an undo step was recorded
   if (app.dragging) {
     app.drag.end();
     app.dragging = false;
+    return app.undo.commit(app.scene.snapshotTransforms());
   }
+  return false;
+}
+
+void pointerRelease(App& app) {
+  endDrag(app);
 }
 
 // Ray-space handle pick for controller pointers (VR).
@@ -508,6 +556,9 @@ void handleEvent(App& app,
     Vec2 mouse{static_cast<float>(press->event_x), static_cast<float>(press->event_y)};
     app.lastMouse = mouse;
     app.snap = (press->state & XCB_MOD_MASK_CONTROL) != 0U;
+    if (app.width == 0U || app.height == 0U) {
+      break; // minimised: pointer maths would divide by zero
+    }
     if (press->detail == 1U) {
       pointerPress(app, appRay(app, mouse), cameraForward(app.camera),
                    handleUnderCursor(app, mouse));
@@ -547,6 +598,13 @@ void handleEvent(App& app,
     Vec2 mouse{static_cast<float>(motion->event_x), static_cast<float>(motion->event_y)};
     Vec2 delta{mouse.x - app.lastMouse.x, mouse.y - app.lastMouse.y};
     app.lastMouse = mouse;
+    if (app.width == 0U || app.height == 0U) {
+      endDrag(app); // minimised mid-drag: commit what was done, stop tracking
+      app.looking = false;
+      app.panning = false;
+      app.panButton = 0U;
+      break; // pointer maths would divide by zero
+    }
     if (app.dragging) {
       pointerMove(app, appRay(app, mouse));
     } else if (app.looking) {
@@ -562,8 +620,8 @@ void handleEvent(App& app,
     auto* key = reinterpret_cast<xcb_key_press_event_t*>(event);
     xcb_keysym_t keysym = keysymFor(window, key->detail);
     // Free-flight movement keys are tracked on press/release and applied per
-    // frame. Both cases are matched because Shift (boost) and Caps Lock change
-    // the keysym but not the physical key.
+    // frame. Both cases are matched because this lookup reads the unshifted
+    // keysym column only, and layouts differ.
     bool movementKey = true;
     switch (keysym) {
     case 'w': case 'W': app.flyForward = pressed; break;
@@ -584,7 +642,25 @@ void handleEvent(App& app,
     // Only keys that change gizmo state cancel an active drag; modifier presses
     // (e.g. Ctrl for snap) must not.
     bool stateChanged = false;
-    if (keysym == 0xFF1BU) {
+    if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
+      // Ctrl-Z during a live grab cancels the grab (restores its pre-drag
+      // state) and leaves older history alone.
+      bool const wasDragging = app.dragging;
+      bool const recorded = endDrag(app);
+      if (wasDragging && !recorded) {
+        break; // unmoved grab: nothing to cancel, history untouched
+      }
+      bool const redo = (key->state & XCB_MOD_MASK_SHIFT) != 0U;
+      if (redo ? app.undo.redo(app.scene) : app.undo.undo(app.scene)) {
+        std::printf("%s\n", redo ? "redo" : "undo");
+      }
+    } else if ((keysym == 'y' || keysym == 'Y') &&
+               (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
+      endDrag(app);
+      if (app.undo.redo(app.scene)) {
+        std::printf("redo\n");
+      }
+    } else if (keysym == 0xFF1BU) {
       app.running = false;
       stateChanged = true;
     } else if (keysym == '1' || keysym == 'g' || keysym == 'G') {
@@ -602,8 +678,7 @@ void handleEvent(App& app,
       stateChanged = true;
     }
     if (stateChanged && app.dragging) {
-      app.drag.end();
-      app.dragging = false;
+      endDrag(app);
     }
     break;
   }
@@ -614,6 +689,15 @@ void handleEvent(App& app,
     if (!renderer.resize(app.width, app.height)) {
       std::printf("[vk] resize failed; exiting\n");
       app.running = false;
+    }
+    break;
+  }
+  case XCB_MAP_NOTIFY: {
+    // Restoring a minimised window: some WMs send no ConfigureNotify at the
+    // previous geometry, which would leave the renderer at zero extent (frozen
+    // window). Re-request the resize when the two disagree.
+    if (app.width > 0U && app.height > 0U && renderer.width() == 0U) {
+      renderer.resize(app.width, app.height);
     }
     break;
   }
@@ -963,10 +1047,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
       app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
                  : app.mode == GizmoMode::Rotate  ? GizmoMode::Scale
                                                   : GizmoMode::Translate;
-      if (app.dragging) {
-        app.drag.end();
-        app.dragging = false;
-      }
+      endDrag(app);
     }
 
     // Head and pointer in world space (rig-transformed).

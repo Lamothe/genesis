@@ -84,4 +84,56 @@ std::optional<PickHit> pickClosest(Ray const& ray,
   return best;
 }
 
+std::optional<PickHit> pickClosestSurface(Ray const& ray,
+                                          std::vector<PickCandidate> const& candidates) {
+  std::optional<PickHit> best;
+  for (auto const& candidate : candidates) {
+    float boundT = 0.0F;
+    if (!rayAabb(ray, candidate.worldBounds, boundT)) {
+      continue;
+    }
+    // Bounds entry is a lower bound for any hit inside them, so nothing in
+    // this candidate can beat a closer hit already found.
+    if (best.has_value() && boundT >= best->t) {
+      continue;
+    }
+    if (!candidate.geometry || candidate.geometry->positions.empty() ||
+        candidate.geometry->indices.size() < 3U) {
+      if (!best.has_value() || boundT < best->t) {
+        best = PickHit{candidate.node, boundT, ray.origin + ray.direction * boundT};
+      }
+      continue;
+    }
+    // Triangle pass in world space: distance must be world-comparable across
+    // candidates, and transforming vertices keeps that exact under any scale.
+    PickGeometry const& geometry = *candidate.geometry;
+    float hitT = 0.0F;
+    bool hit = false;
+    for (std::size_t i = 0; i + 2U < geometry.indices.size(); i += 3U) {
+      std::uint32_t i0 = geometry.indices[i];
+      std::uint32_t i1 = geometry.indices[i + 1U];
+      std::uint32_t i2 = geometry.indices[i + 2U];
+      if (i0 >= geometry.positions.size() || i1 >= geometry.positions.size() ||
+          i2 >= geometry.positions.size()) {
+        continue; // never trust indices blindly
+      }
+      Vec3 a = transformPoint(candidate.world, geometry.positions[i0]);
+      Vec3 b = transformPoint(candidate.world, geometry.positions[i1]);
+      Vec3 c = transformPoint(candidate.world, geometry.positions[i2]);
+      float t = 0.0F;
+      if (!rayTriangle(ray, a, b, c, t)) {
+        continue;
+      }
+      if (!hit || t < hitT) {
+        hitT = t;
+        hit = true;
+      }
+    }
+    if (hit && (!best.has_value() || hitT < best->t)) {
+      best = PickHit{candidate.node, hitT, ray.origin + ray.direction * hitT};
+    }
+  }
+  return best;
+}
+
 } // namespace vredit

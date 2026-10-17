@@ -49,8 +49,9 @@ only: **all project logic is typed C/C++ (project rule — no Python)**.
 
 ## Controls
 
-LMB select / drag gizmo, RMB orbit, MMB or Shift+RMB pan, wheel zoom.
-G translate, R rotate, S scale, L world/local space, Ctrl snap, Esc quit.
+WASD move, Q/E down/up, Shift boost, RMB mouse-look, wheel fly forward/back.
+LMB select / drag gizmo. G translate, R rotate, S scale (or 1/2/3), L
+world/local space, Ctrl snap, Ctrl-Z undo, Ctrl-Y / Ctrl-Shift-Z redo, Esc quit.
 
 ## Design notes
 

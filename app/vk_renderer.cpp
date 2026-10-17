@@ -335,6 +335,25 @@ struct VkRenderer::Impl {
     return true;
   }
 
+  // Recreates the swapchain and the depth image as one consistent set. Order
+  // matters: the swapchain reports the extent it actually got (configure
+  // events lag the real window size during an interactive resize), and the
+  // depth image must follow it — rendering with a depth image sized for a
+  // different extent is invalid and has crashed the driver on resize.
+  bool recreateTargets() {
+    if (!createSwapchain()) {
+      return false;
+    }
+    if (width == 0U || height == 0U) {
+      // Minimised: the swapchain guard kept the old targets alive, so keep the
+      // old depth too — creating a 0x0 image here would be invalid.
+      return true;
+    }
+    destroyImage2D(depthImage, depthMemory, depthView);
+    return createImage2D(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                         VK_IMAGE_ASPECT_DEPTH_BIT, depthImage, depthMemory, depthView);
+  }
+
   bool createSwapchain() {
     VkSurfaceCapabilitiesKHR caps{};
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical, surface, &caps));
@@ -345,6 +364,13 @@ struct VkRenderer::Impl {
     if (extent.width == UINT32_MAX) {
       extent.width = width;
       extent.height = height;
+    }
+    if (extent.width == 0U || extent.height == 0U) {
+      // Minimised / zero-extent surface: nothing can be created. Keep the old
+      // targets; draw() skips rendering while width/height stay zero.
+      width = 0;
+      height = 0;
+      return true;
     }
 
     std::uint32_t imageCount = caps.minImageCount + 1U;
@@ -386,7 +412,13 @@ struct VkRenderer::Impl {
       viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       viewInfo.subresourceRange.levelCount = 1;
       viewInfo.subresourceRange.layerCount = 1;
-      VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &swapchainViews[i]));
+      if (vkCreateImageView(device, &viewInfo, nullptr, &swapchainViews[i]) != VK_SUCCESS) {
+        // A half-filled view array must never reach draw(): retire the whole
+        // swapchain so the next frame fails cleanly instead of crashing.
+        std::printf("[vk] swapchain view creation failed\n");
+        destroySwapchain();
+        return false;
+      }
     }
     // Commit the extent only after full success so renderArea/viewport always
     // match the live attachments.
@@ -867,7 +899,7 @@ bool VkRenderer::init(Config const& config) {
         vkStruct<VkSemaphoreCreateInfo>(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
     VK_CHECK(vkCreateSemaphore(g.device, &semaphoreInfo, nullptr, &g.imageAvailable));
     VK_CHECK(vkCreateSemaphore(g.device, &semaphoreInfo, nullptr, &g.renderFinished));
-    if (!g.createSwapchain()) {
+    if (!g.recreateTargets()) {
       return false;
     }
   } else {
@@ -1532,14 +1564,11 @@ bool VkRenderer::resize(std::uint32_t width, std::uint32_t height) {
     return true;
   }
   vkDeviceWaitIdle(g.device);
+  // Requested size is a fallback for surfaces that report no fixed extent;
+  // createSwapchain() overwrites it with the extent the swapchain really got.
   g.width = width;
   g.height = height;
-  g.destroyImage2D(g.depthImage, g.depthMemory, g.depthView);
-  if (!g.createImage2D(VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                       VK_IMAGE_ASPECT_DEPTH_BIT, g.depthImage, g.depthMemory, g.depthView)) {
-    return false;
-  }
-  return g.createSwapchain();
+  return g.recreateTargets();
 }
 
 bool VkRenderer::draw(Camera const& camera,
@@ -1580,7 +1609,7 @@ bool VkRenderer::draw(Camera const& camera,
                                              VK_NULL_HANDLE, &g.swapchainIndex);
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
       vkDeviceWaitIdle(g.device);
-      return g.createSwapchain();
+      return g.recreateTargets();
     }
     if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
       return checkVk(acquire, "vkAcquireNextImageKHR");
@@ -1607,7 +1636,7 @@ bool VkRenderer::draw(Camera const& camera,
     VkResult presentResult = vkQueuePresentKHR(g.queue, &presentInfo);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
       vkDeviceWaitIdle(g.device);
-      return g.createSwapchain();
+      return g.recreateTargets();
     }
     if (presentResult != VK_SUCCESS) {
       return checkVk(presentResult, "vkQueuePresentKHR");

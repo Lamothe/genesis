@@ -131,6 +131,24 @@ Vec3 Scene::worldPosition(NodeId id) {
   return transformPoint(world(id), Vec3{});
 }
 
+SceneSnapshot Scene::snapshotTransforms() const {
+  SceneSnapshot snapshot;
+  for (NodeId id = 1; id < slots_.size(); ++id) {
+    if (slots_[id].alive) {
+      snapshot.transforms.emplace_back(id, slots_[id].local);
+    }
+  }
+  return snapshot;
+}
+
+void Scene::restoreTransforms(SceneSnapshot const& snapshot) {
+  for (auto const& entry : snapshot.transforms) {
+    if (valid(entry.first)) {
+      setLocal(entry.first, entry.second);
+    }
+  }
+}
+
 void Scene::markSubtreeDirty(NodeId id) {
   std::vector<NodeId> pending{id};
   while (!pending.empty()) {

@@ -8,7 +8,7 @@ mkdir -p .build/shaders
 glslc shaders/mesh.vert -o .build/shaders/mesh.vert.spv
 glslc shaders/mesh.frag -o .build/shaders/mesh.frag.spv
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude -Ithird_party/openxr/include \
-  src/scene.cpp src/picking.cpp src/gizmo.cpp src/camera.cpp src/handles.cpp \
+  src/scene.cpp src/picking.cpp src/gizmo.cpp src/camera.cpp src/handles.cpp src/undo.cpp \
   src/mesh.cpp src/json.cpp src/gltf.cpp src/obj.cpp src/image.cpp \
   app/geometry.cpp app/vk_renderer.cpp app/xr_shell.cpp app/editor_app.cpp \
   -lvulkan -lxcb -lz -l:libopenxr_loader.so.1 -o .build/vr-editor

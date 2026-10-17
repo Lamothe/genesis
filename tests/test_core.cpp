@@ -21,6 +21,7 @@
 #include "obj.h"
 #include "picking.h"
 #include "scene.h"
+#include "undo.h"
 #include "vecmath.h"
 
 using namespace vredit;
@@ -270,6 +271,164 @@ void testPickClosest() {
 
   auto miss = vredit::pickClosest({{0.0F, 9.0F, 1.0F}, {1.0F, 0.0F, 0.0F}}, candidates);
   CHECK(!miss.has_value());
+}
+
+void testPickClosestSurface() {
+  // Regression: box entry distance is not surface distance. A large box whose
+  // entry is closer (t=1) but whose visible surface is far (t=8) must lose to
+  // a small object whose surface is genuinely in front (t=4). The old
+  // bounds-only pick returned the large one; surface picking must not.
+  auto farGeometry = std::make_shared<vredit::PickGeometry>();
+  farGeometry->positions = {{-1.0F, -1.0F, 8.0F},
+                           {1.0F, -1.0F, 8.0F},
+                           {0.0F, 1.0F, 8.0F}};
+  farGeometry->indices = {0, 1, 2};
+
+  auto nearGeometry = std::make_shared<vredit::PickGeometry>();
+  nearGeometry->positions = {{-0.5F, -0.5F, 4.0F},
+                            {0.5F, -0.5F, 4.0F},
+                            {0.0F, 0.5F, 4.0F}};
+  nearGeometry->indices = {0, 1, 2};
+
+  vredit::PickCandidate large;
+  large.node = 1;
+  large.worldBounds = {{-2.0F, -2.0F, 1.0F}, {2.0F, 2.0F, 9.0F}};
+  large.geometry = farGeometry;
+
+  vredit::PickCandidate small;
+  small.node = 2;
+  small.worldBounds = {{-0.5F, -0.5F, 3.9F}, {0.5F, 0.5F, 4.1F}};
+  small.geometry = nearGeometry;
+
+  std::vector<vredit::PickCandidate> both{large, small};
+  vredit::Ray ray{{0.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 1.0F}};
+
+  auto hit = vredit::pickClosestSurface(ray, both);
+  CHECK(hit.has_value());
+  CHECK(hit->node == 2); // the near SURFACE wins, not the near box entry
+  CHECK_NEAR(hit->t, 4.0F, 1e-5F);
+
+  // Order must not matter: same result with the near candidate listed first.
+  std::vector<vredit::PickCandidate> reversed{small, large};
+  auto hit2 = vredit::pickClosestSurface(ray, reversed);
+  CHECK(hit2.has_value());
+  CHECK(hit2->node == 2);
+
+  // A box-shaped candidate (no geometry) still picks at its bounds entry.
+  vredit::PickCandidate boxOnly;
+  boxOnly.node = 3;
+  boxOnly.worldBounds = {{-0.5F, -0.5F, 2.0F}, {0.5F, 0.5F, 3.0F}};
+  std::vector<vredit::PickCandidate> withBox{large, boxOnly};
+  auto hit3 = vredit::pickClosestSurface(ray, withBox);
+  CHECK(hit3.has_value());
+  CHECK(hit3->node == 3); // bounds entry t=2 beats the large surface at t=8
+  CHECK_NEAR(hit3->t, 2.0F, 1e-5F);
+
+  // Ray misses every surface inside the large box: empty volume must not pick.
+  vredit::Ray offSide{{0.0F, 0.0F, 0.0F}, {0.0F, 1.0F, 1.0F}};
+  std::vector<vredit::PickCandidate> onlyLarge{large};
+  auto miss = vredit::pickClosestSurface(offSide, onlyLarge);
+  CHECK(!miss.has_value());
+}
+
+void testSceneSnapshotRestore() {
+  vredit::Scene scene;
+  vredit::NodeId a = scene.create();
+  vredit::NodeId b = scene.create();
+  vredit::Transform ta;
+  ta.translation = {1.0F, 0.0F, 0.0F};
+  scene.setLocal(a, ta);
+  vredit::Transform tb;
+  tb.translation = {0.0F, 2.0F, 0.0F};
+  scene.setLocal(b, tb);
+
+  vredit::SceneSnapshot snapshot = scene.snapshotTransforms();
+  CHECK(snapshot.transforms.size() == 2U);
+
+  vredit::Transform moved = ta;
+  moved.translation = {9.0F, 9.0F, 9.0F};
+  scene.setLocal(a, moved);
+  scene.setLocal(b, moved);
+  CHECK(!vredit::sameSnapshot(snapshot, scene.snapshotTransforms()));
+
+  scene.restoreTransforms(snapshot);
+  CHECK(vredit::sameSnapshot(snapshot, scene.snapshotTransforms()));
+  CHECK_NEAR(scene.local(a).translation.x, 1.0F, 1e-5F);
+  CHECK_NEAR(scene.local(b).translation.y, 2.0F, 1e-5F);
+
+  // Restoring after destroying a node skips it rather than resurrecting it.
+  scene.destroy(b);
+  scene.setLocal(a, moved);
+  scene.restoreTransforms(snapshot);
+  CHECK(!scene.valid(b));
+  CHECK_NEAR(scene.local(a).translation.x, 1.0F, 1e-5F);
+}
+
+void testUndoHistory() {
+  vredit::Scene scene;
+  vredit::NodeId n = scene.create();
+  vredit::Transform t0;
+  t0.translation = {1.0F, 0.0F, 0.0F};
+  scene.setLocal(n, t0);
+
+  vredit::UndoHistory undo;
+  CHECK(!undo.canUndo());
+  CHECK(!undo.canRedo());
+
+  // One drag: begin before the change, commit after; exactly one undo step.
+  undo.begin(scene.snapshotTransforms());
+  vredit::Transform t1 = t0;
+  t1.translation = {5.0F, 0.0F, 0.0F};
+  scene.setLocal(n, t1);
+  undo.commit(scene.snapshotTransforms());
+  CHECK(undo.canUndo());
+  CHECK(!undo.canRedo());
+
+  CHECK(undo.undo(scene));
+  CHECK_NEAR(scene.local(n).translation.x, 1.0F, 1e-5F);
+  CHECK(undo.canRedo());
+  CHECK(!undo.canUndo());
+
+  CHECK(undo.redo(scene));
+  CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F);
+  CHECK(undo.canUndo());
+
+  // A commit that changed nothing records no step.
+  undo.begin(scene.snapshotTransforms());
+  undo.commit(scene.snapshotTransforms());
+  CHECK(undo.undo(scene)); // only the first drag is undone...
+  CHECK_NEAR(scene.local(n).translation.x, 1.0F, 1e-5F);
+  CHECK(!undo.canUndo()); // ...and nothing more
+
+  // A new edit after undo clears the redo branch.
+  undo.redo(scene);
+  CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F);
+  undo.begin(scene.snapshotTransforms());
+  vredit::Transform t2 = t1;
+  t2.translation = {7.0F, 0.0F, 0.0F};
+  scene.setLocal(n, t2);
+  undo.commit(scene.snapshotTransforms());
+  CHECK(!undo.canRedo());
+  CHECK(undo.undo(scene));
+  CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F);
+
+  // Regression: begin() with an edit still open (a drag whose release was
+  // lost) must commit that edit, not overwrite it — otherwise its transforms
+  // are silently lost from history.
+  undo.clear();
+  undo.begin(scene.snapshotTransforms()); // base: x=5
+  vredit::Transform t3 = t1;
+  t3.translation = {8.0F, 0.0F, 0.0F};
+  scene.setLocal(n, t3); // dangling edit, never committed
+  undo.begin(scene.snapshotTransforms()); // new drag starts at x=8
+  vredit::Transform t4 = t1;
+  t4.translation = {9.0F, 0.0F, 0.0F};
+  scene.setLocal(n, t4);
+  undo.commit(scene.snapshotTransforms());
+  CHECK(undo.undo(scene));
+  CHECK_NEAR(scene.local(n).translation.x, 8.0F, 1e-5F); // second drag undone
+  CHECK(undo.undo(scene));
+  CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F); // dangling edit too
 }
 
 void testGizmoTranslateWorld() {
@@ -1470,6 +1629,9 @@ int main() {
   testRayAabb();
   testRayTriangle();
   testPickClosest();
+  testPickClosestSurface();
+  testSceneSnapshotRestore();
+  testUndoHistory();
   testGizmoTranslateWorld();
   testGizmoTranslateRotatedParent();
   testGizmoRotateSnapped();
