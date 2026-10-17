@@ -1249,13 +1249,12 @@ void testUpscaleToPot() {
   CHECK(up.rgba.size() == 4U * 8U * 4U);
   CHECK(up.rgba[0] == 200U && up.rgba.back() == 200U); // solid stays solid
 
-  // A real bilinear check: 0..255 across 2 texels upscales to 4 with the
-  // interpolated middle values.
+  // A 2x1 image is POT in both axes: the no-op passthrough check.
   Image edge;
   edge.width = 2;
   edge.height = 1;
   edge.rgba = {0U, 0U, 0U, 255U, 255U, 255U, 255U, 255U};
-  Image upEdge = upscaleToPot(edge); // 2x1 is POT width/POT height after h->1... 2x1 IS POT
+  Image upEdge = upscaleToPot(edge);
   CHECK(upEdge.width == 2U && upEdge.height == 1U);
   Image ramp;
   ramp.width = 2;
