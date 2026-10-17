@@ -49,7 +49,9 @@ std::optional<PickHit> pickClosestSurface(Ray const& ray,
 // Selection expansion for model groups. A plain pick selects the picked node's
 // whole model group (every node sharing its group id); a secondary pick
 // (partOnly) selects just the node itself. Group 0 means "ungrouped", which
-// always selects individually; an unknown node selects just itself.
+// always selects individually; an unknown node selects just itself. `picked`
+// must be a valid node id (callers only ever pass a live pick); the returned
+// vector is never empty and preserves the order of `groups`.
 std::vector<NodeId> expandSelection(std::vector<std::pair<NodeId, std::uint32_t>> const& groups,
                                     NodeId picked,
                                     bool partOnly);

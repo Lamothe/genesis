@@ -51,6 +51,16 @@ bool UndoHistory::redo(Scene& scene) {
   return true;
 }
 
+bool UndoHistory::cancel(Scene& scene) {
+  if (!pendingOpen_) {
+    return false;
+  }
+  scene.restoreTransforms(pending_);
+  pending_ = SceneSnapshot{};
+  pendingOpen_ = false;
+  return true;
+}
+
 void UndoHistory::clear() {
   undo_.clear();
   redo_.clear();

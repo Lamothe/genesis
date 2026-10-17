@@ -33,7 +33,7 @@ have the neural renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash vr/editor/run-tests.sh        # core tests (319 checks; image fixtures via ImageMagick)
+bash vr/editor/run-tests.sh        # core tests (435 checks; image fixtures via ImageMagick)
 bash vr/editor/run-editor.sh       # build + interactive editor
 bash vr/editor/run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash vr/editor/run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
@@ -49,11 +49,18 @@ only: **all project logic is typed C/C++ (project rule — no Python)**.
 
 ## Controls
 
-WASD move, Q/E down/up, Shift boost, RMB mouse-look, wheel fly forward/back.
-LMB select (whole model) / drag gizmo; Shift+LMB or Ctrl+LMB selects a single
-part. G translate, R rotate, S scale (or 1/2/3), L world/local space, Ctrl
-snap, Ctrl-Z undo, Ctrl-Y / Ctrl-Shift-Z redo, Esc quit. The gizmo sits at the
-centre of the selection's bounds; the selection is tinted and outlined.
+Free-flight, first-person (VR-friendly): **WASD** move, **Q/E** down/up,
+**Shift** boost, **RMB** mouse-look, **MMB** or **Shift+RMB** pan, **wheel** fly
+forward/back.
+
+**LMB** selects and drags the gizmo: a click selects the whole model under the
+cursor, **Shift+LMB** or **Ctrl+LMB** selects a single part. **1**/**G**
+translate, **2**/**R** rotate, **3** scale, **L** world/local space, **Ctrl**
+snap, **Ctrl-Z** undo (cancels a live grab), **Ctrl-Y** / **Ctrl-Shift-Z**
+redo, **Esc** quits. The gizmo sits at the centre of the selection's bounds;
+the selection is tinted and outlined. In VR the trigger selects the whole model
+and grip+trigger selects a single part — grip doubles as the snap/boost
+modifier, mirroring Ctrl's desktop overlap.
 
 ## Design notes
 
@@ -68,13 +75,6 @@ centre of the selection's bounds; the selection is tinted and outlined.
   not bump it.
 - The caller resolves which gizmo handle was grabbed (the renderer knows where
   handles were drawn); this core only does the drag maths and applies it.
-
-## Controls
-
-Free-flight, first-person (VR-friendly): **WASD** move, **Q/E** down/up,
-**Shift** boost, **RMB** mouse-look, **MMB** or **Shift+RMB** pan, **wheel** fly
-forward/back. **LMB** selects and drags the gizmo. **1/2/3** translate/rotate/
-scale, **L** world/local space, **Ctrl** snapping, **Esc** quits.
 
 ## Roadmap
 

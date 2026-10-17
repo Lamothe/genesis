@@ -708,8 +708,17 @@ void handleEvent(App& app,
     // (e.g. Ctrl for snap) must not.
     bool stateChanged = false;
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      // Ctrl-Z during a live grab cancels the grab (restores its pre-drag
-      // state) and leaves older history alone.
+      // Ctrl-Z during a live grab cancels the grab: restore its pre-drag
+      // state and drop the pending edit, leaving both the undo and redo
+      // stacks exactly as they were. Going through commit()+undo() instead
+      // would clear any existing redo branch and leave the cancelled grab
+      // itself redoable.
+      if (app.dragging && (key->state & XCB_MOD_MASK_SHIFT) == 0U) {
+        app.drag.end();
+        app.dragging = false;
+        app.undo.cancel(app.scene);
+        break;
+      }
       bool const wasDragging = app.dragging;
       bool const recorded = endDrag(app);
       if (wasDragging && !recorded) {
@@ -1027,7 +1036,6 @@ int runSmokeWindow(char const* shaderDir, int frames, std::vector<char const*> c
   return 0;
 }
 
-// Applies held movement keys once per frame (free flight).
 constexpr float kXrTurnSpeed = 2.2F; // radians/second at full stick deflection
 
 // Interactive or smoke VR session through the OpenXR shell. Returns 0 when no
@@ -1175,6 +1183,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
   return 0;
 }
 
+// Applies held movement keys once per frame (free flight).
 void updateFlight(App& app, float dt) {
   Vec3 local{};
   if (app.flyForward) {

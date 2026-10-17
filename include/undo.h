@@ -21,6 +21,11 @@ public:
   bool canRedo() const { return !redo_.empty(); }
   bool undo(Scene& scene); // false when nothing to undo
   bool redo(Scene& scene); // false when nothing to redo
+  // Drops a pending (live) edit, restoring its pre-edit state without
+  // recording a step. Both stacks are left exactly as they were, so
+  // cancelling a grab neither eats history nor becomes redoable. False when
+  // no edit is pending.
+  bool cancel(Scene& scene);
   void clear();
 
 private:

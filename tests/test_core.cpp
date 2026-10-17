@@ -431,6 +431,41 @@ void testUndoHistory() {
   CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F); // dangling edit too
 }
 
+void testCancelPendingEdit() {
+  vredit::Scene scene;
+  vredit::NodeId n = scene.create();
+  vredit::Transform t0;
+  t0.translation = {1.0F, 0.0F, 0.0F};
+  scene.setLocal(n, t0);
+
+  vredit::UndoHistory undo;
+  CHECK(!undo.cancel(scene)); // nothing pending
+
+  // Build one step and take it back, so a redo branch exists.
+  undo.begin(scene.snapshotTransforms());
+  vredit::Transform t1 = t0;
+  t1.translation = {5.0F, 0.0F, 0.0F};
+  scene.setLocal(n, t1);
+  undo.commit(scene.snapshotTransforms());
+  CHECK(undo.undo(scene));
+  CHECK(undo.canRedo());
+
+  // A live grab, cancelled: the pre-drag state returns and no step lands on
+  // either stack.
+  undo.begin(scene.snapshotTransforms());
+  vredit::Transform grab = t0;
+  grab.translation = {99.0F, 0.0F, 0.0F};
+  scene.setLocal(n, grab);
+  CHECK(undo.cancel(scene));
+  CHECK_NEAR(scene.local(n).translation.x, 1.0F, 1e-5F);
+  CHECK(!undo.canUndo()); // the cancelled grab is not undoable...
+  CHECK(undo.canRedo());  // ...and it did not eat the existing redo branch
+
+  // Redo replays the ORIGINAL edit, not the cancelled grab.
+  CHECK(undo.redo(scene));
+  CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F);
+}
+
 void testExpandSelection() {
   // One model file = one group: a plain pick selects every node of the group,
   // a secondary pick just the single part.
@@ -1753,6 +1788,7 @@ int main() {
   testPickClosestSurface();
   testSceneSnapshotRestore();
   testUndoHistory();
+  testCancelPendingEdit();
   testExpandSelection();
   testBoundsHelpers();
   testGizmoParentChildSelectionRides();
