@@ -917,6 +917,41 @@ void testFloorGrab() {
   CHECK(!refused.begin(grouped, {}, {0.0F, 0.0F, 0.0F}));
   CHECK(!refused.active());
 
+  // Movement is 1:1 with the controller in WORLD units even under a scaled
+  // parent chain (glTF roots often carry 0.01/100 unit conversions): the delta
+  // is applied in world space and only converted back through the parent.
+  vredit::Scene scaled;
+  vredit::NodeId root = scaled.create();
+  vredit::Transform rootT;
+  rootT.scale = {0.01F, 0.01F, 0.01F};
+  scaled.setLocal(root, rootT);
+  vredit::NodeId scaledChild = scaled.create(root);
+  vredit::Transform childT;
+  childT.translation = {2.0F, 0.0F, -1.0F};
+  scaled.setLocal(scaledChild, childT);
+  vredit::FloorGrab scaledGrab;
+  CHECK(scaledGrab.begin(scaled, {root, scaledChild}, {0.0F, 0.0F, 0.0F}));
+  scaledGrab.update({0.5F, 0.0F, -0.25F});
+  CHECK_NEAR3(scaled.worldPosition(root), {0.5F, 0.0F, -0.25F});
+  CHECK_NEAR3(scaled.worldPosition(scaledChild), {0.52F, 0.0F, -0.26F}); // 1:1, not 100:1
+
+  // Part-select under a scaled parent: here the child IS the grabbed node and
+  // the world->local conversion runs through the scaled parent (invParent) —
+  // the same path a grip+trigger part grab takes on a unit-converted glTF.
+  vredit::Scene partScaled;
+  vredit::NodeId partRoot = partScaled.create();
+  vredit::Transform partRootT;
+  partRootT.scale = {0.01F, 0.01F, 0.01F};
+  partScaled.setLocal(partRoot, partRootT);
+  vredit::NodeId partChild = partScaled.create(partRoot);
+  vredit::Transform partChildT;
+  partChildT.translation = {2.0F, 0.0F, -1.0F};
+  partScaled.setLocal(partChild, partChildT);
+  vredit::FloorGrab partGrab;
+  CHECK(partGrab.begin(partScaled, {partChild}, {0.0F, 0.0F, 0.0F}));
+  partGrab.update({0.5F, 0.0F, -0.25F});
+  CHECK_NEAR3(partScaled.worldPosition(partChild), {0.52F, 0.0F, -0.26F});
+
   // End clears the grab; further updates are no-ops.
   groupGrab.end();
   CHECK(!groupGrab.active());
@@ -1767,10 +1802,10 @@ void testHandlePickingByRay() {
   Ray ontoX{{0.7F, 3.0F, 0.0F}, {0.0F, -1.0F, 0.0F}};
   auto hit = pickHandleByRay(geometry, ontoX, 0.1F);
   CHECK(hit.has_value());
-  CHECK(hit.has_value() && *hit == GizmoHandle::AxisX);
+  CHECK(hit.has_value() && hit->handle == GizmoHandle::AxisX);
   Ray ontoY{{5.0F, 0.5F, 0.0F}, {-1.0F, 0.0F, 0.0F}};
   hit = pickHandleByRay(geometry, ontoY, 0.1F);
-  CHECK(hit.has_value() && *hit == GizmoHandle::AxisY);
+  CHECK(hit.has_value() && hit->handle == GizmoHandle::AxisY);
   Ray away{{0.0F, 5.0F, 5.0F}, {0.0F, 1.0F, 0.0F}};
   CHECK(!pickHandleByRay(geometry, away, 0.1F).has_value());
   Ray awayAlongX{{2.5F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}};
@@ -1782,7 +1817,7 @@ void testHandlePickingByRay() {
   float rim = 0.8F * 0.70710678F;
   Ray throughRim{{0.0F, rim, 3.0F}, {0.0F, 0.0F, -1.0F}};
   hit = pickHandleByRay(rings, throughRim, 0.1F);
-  CHECK(hit.has_value() && *hit == GizmoHandle::AxisX);
+  CHECK(hit.has_value() && hit->handle == GizmoHandle::AxisX);
   // The diagonal misses every ring (each ring stays 0.46 from it).
   float diag = 0.57735027F;
   Ray diagonal{{1.0F, 1.0F, 1.0F}, {-diag, -diag, -diag}};
@@ -1797,7 +1832,7 @@ void testHandlePickingByRay() {
   square.points = {{0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 0.0F}, {0.0F, 1.0F, 0.0F}};
   Ray throughSquare{{0.5F, 0.5F, 3.0F}, {0.0F, 0.0F, -1.0F}};
   hit = pickHandleByRay({square}, throughSquare, 0.1F);
-  CHECK(hit.has_value() && *hit == GizmoHandle::PlaneXY);
+  CHECK(hit.has_value() && hit->handle == GizmoHandle::PlaneXY);
   Ray besideSquare{{1.5F, 0.5F, 3.0F}, {0.0F, 0.0F, -1.0F}};
   CHECK(!pickHandleByRay({square}, besideSquare, 0.1F).has_value());
   Ray behindSquare{{0.5F, 0.5F, 3.0F}, {0.0F, 0.0F, 1.0F}};
@@ -1808,7 +1843,24 @@ void testHandlePickingByRay() {
   axisLine.points = {{0.0F, 0.0F, 0.0F}, {0.0F, 2.0F, 0.0F}};
   Ray throughBoth{{0.05F, 0.5F, 3.0F}, {0.0F, 0.0F, -1.0F}}; // near the line, over the square
   hit = pickHandleByRay({square, axisLine}, throughBoth, 0.1F);
-  CHECK(hit.has_value() && *hit == GizmoHandle::AxisY); // line-like wins
+  CHECK(hit.has_value() && hit->handle == GizmoHandle::AxisY); // line-like wins
+
+  // Depth reporting: the returned distance is the along-ray distance to the
+  // hit, so callers can depth-order handles against a model surface.
+  float hitDepth = hit.has_value() ? hit->distance : -1.0F;
+  CHECK_NEAR(hitDepth, 3.0F, 1e-4F); // the line is at z = 0, ray from z = 3
+  // Same hit approached obliquely from farther away: the depth grows with the
+  // travel distance while the geometry under the ray is unchanged.
+  Vec3 deepDir = normalized(Vec3{0.0F, -3.0F, 2.0F});
+  Ray ontoXDeep{{0.7F, 3.0F, -2.0F}, deepDir};
+  auto deepHit = pickHandleByRay(geometry, ontoXDeep, 0.1F);
+  CHECK(deepHit.has_value() && deepHit->handle == GizmoHandle::AxisX);
+  float deepDepth = deepHit.has_value() ? deepHit->distance : -1.0F;
+  CHECK_NEAR(deepDepth, 3.6055513F, 1e-4F); // |(0, 3, -2)| to (0.7, 0, 0)
+  float lineDepth = -1.0F;
+  CHECK_NEAR(raySegmentDistance(parallel, {5.0F, 0.0F, 0.0F}, {6.0F, 0.0F, 0.0F}, &lineDepth),
+             0.5F, 1e-5F);
+  CHECK_NEAR(lineDepth, 5.0F, 1e-4F); // closest approach sits at the segment start
 }
 
 void testXrMath() {

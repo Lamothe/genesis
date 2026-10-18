@@ -26,6 +26,13 @@ struct HandleGeom {
   std::vector<Vec3> points;
 };
 
+// A handle hit from a ray pick: the handle plus its along-ray distance, so
+// callers can depth-order handles against what else the ray hits.
+struct RayHandleHit {
+  GizmoHandle handle{GizmoHandle::Free};
+  float distance{0.0F};
+};
+
 struct HandleShape {
   GizmoHandle handle{GizmoHandle::Free};
   bool loop{false};
@@ -58,16 +65,18 @@ std::optional<GizmoHandle> pickHandle(std::vector<HandleShape> const& shapes,
 // Ray-space pick for controller pointers (VR): tests the same world-space
 // geometry pickHandle projects, so what is drawn is what is grabbed here too.
 // Line-like shapes win over filled shapes; `threshold` is world-space distance
-// from the ray. Returns nullopt when nothing is within reach.
-std::optional<GizmoHandle> pickHandleByRay(std::vector<HandleGeom> const& geometry,
-                                           Ray const& ray,
-                                           float threshold);
+// from the ray. Returns the hit handle and its along-ray distance (for
+// depth-ordering against bodies), or nullopt when nothing is within reach.
+std::optional<RayHandleHit> pickHandleByRay(std::vector<HandleGeom> const& geometry,
+                                            Ray const& ray,
+                                            float threshold);
 
 float pointSegmentDistance(Vec2 point, Vec2 a, Vec2 b);
 bool pointInPolygon(std::vector<Vec2> const& polygon, Vec2 point);
 
 // Distance from a half-line (origin + t*dir, t >= 0) to a segment [a, b].
-// `dir` should be normalised.
-float raySegmentDistance(Ray const& ray, Vec3 a, Vec3 b);
+// `dir` should be normalised. When `rayDistOut` is given it receives the
+// along-ray distance to the closest approach (0 when it clamps to the origin).
+float raySegmentDistance(Ray const& ray, Vec3 a, Vec3 b, float* rayDistOut = nullptr);
 
 } // namespace vredit

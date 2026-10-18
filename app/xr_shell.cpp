@@ -600,7 +600,12 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   getInfo.action = xr_->triggerAction;
   getInfo.subactionPath = rightPath;
   xrGetActionStateFloat(xr_->session, &getInfo, &triggerState);
-  bool selectNow = triggerState.isActive && triggerState.currentState > 0.55F;
+  // Hysteresis on the analog trigger: hovering at the press threshold would
+  // otherwise drop and re-press every other frame, and each re-press restarts
+  // the grab at the current position — the model creeps and undo fills with
+  // micro-steps instead of tracking the hand 1:1.
+  float const trigger = triggerState.isActive ? triggerState.currentState : 0.0F;
+  bool selectNow = trigger > (xr_->selectPrev ? 0.4F : 0.55F);
   input.selectHeld = selectNow;
   input.selectPressed = selectNow && !xr_->selectPrev;
   input.selectReleased = !selectNow && xr_->selectPrev;

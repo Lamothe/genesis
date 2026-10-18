@@ -73,10 +73,15 @@ Vec3 handleColour(GizmoHandle handle) {
 }
 
 void appendHandleLines(std::vector<RendererVertex>& out,
-                       std::vector<HandleGeom> const& geometry) {
+                       std::vector<HandleGeom> const& geometry,
+                       std::optional<GizmoHandle> hover) {
   Vec3 const up{0.0F, 1.0F, 0.0F};
   for (HandleGeom const& geom : geometry) {
     Vec3 colour = handleColour(geom.handle);
+    if (hover.has_value() && *hover == geom.handle) {
+      // Hovered handle: brightened so it is obvious they are hitting it.
+      colour = colour + (Vec3{1.0F, 1.0F, 1.0F} - colour) * 0.55F;
+    }
     std::size_t count = geom.points.size();
     if (count < 2U) {
       continue;

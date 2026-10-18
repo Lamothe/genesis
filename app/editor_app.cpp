@@ -119,10 +119,16 @@ struct App {
   GizmoDrag drag;
   FloorGrab grab; // VR: hold the trigger on a model and move the controller
   bool dragging{false};
+  // Per-frame pointer hover: what a press would act on (resolvePointerTarget).
+  // The hovered model group lights up cool and the hovered handle brightens,
+  // so what you see highlighted is what a press will grab.
+  std::vector<NodeId> hoverIds;
+  std::optional<GizmoHandle> hoverHandle;
   bool looking{false};
   bool panning{false};
   bool running{true};
   bool snap{false};
+  bool partSelect{false}; // shift/ctrl (desktop) or grip (VR): select one part
   // Free-flight state (WASD/QE held keys + Shift boost).
   bool flyForward{false};
   bool flyBack{false};
@@ -302,23 +308,6 @@ Ray appRay(App const& app, Vec2 pixel) {
   return cameraRay(app.camera, viewport.x / viewport.y, pixel, viewport);
 }
 
-ProjectFn makeProject(App const& app) {
-  Vec2 viewport{static_cast<float>(app.width), static_cast<float>(app.height)};
-  Mat4 viewProj = cameraViewProjection(app.camera, viewport.x / viewport.y);
-  return [viewProj, viewport](Vec3 const& p) {
-    float x = viewProj.m[0] * p.x + viewProj.m[4] * p.y + viewProj.m[8] * p.z + viewProj.m[12];
-    float y = viewProj.m[1] * p.x + viewProj.m[5] * p.y + viewProj.m[9] * p.z + viewProj.m[13];
-    float w = viewProj.m[3] * p.x + viewProj.m[7] * p.y + viewProj.m[11] * p.z + viewProj.m[15];
-    if (w < 1e-6F) {
-      // Behind (or on) the camera plane: not projectable. NaN makes the shape
-      // unpickable; the rasteriser clips such geometry independently.
-      float nan = std::numeric_limits<float>::quiet_NaN();
-      return Vec2{nan, nan};
-    }
-    return Vec2{(x / w + 1.0F) * 0.5F * viewport.x, (y / w + 1.0F) * 0.5F * viewport.y};
-  };
-}
-
 // Combined world bounds of the selection: visuals contribute their exact
 // transformed bounds, hierarchy-only nodes (no mesh) their origin point.
 bool selectionBounds(App& app, Aabb& boundsOut) {
@@ -366,26 +355,30 @@ bool gizmoFrame(App& app, Vec3& pivot, Quat& orientation) {
   return true;
 }
 
-float gizmoSize(App const& app, Vec3 pivot) {
+float gizmoSize(App& app, Vec3 pivot) {
   float distance = length(app.camera.position - pivot);
   float worldPerPixel =
       2.0F * distance * std::tan(app.camera.fovY * 0.5F) / static_cast<float>(app.height);
-  return kGizmoPixels * worldPerPixel;
-}
-
-std::optional<GizmoHandle> handleUnderCursor(App& app, Vec2 mouse) {
-  Vec3 pivot;
-  Quat orientation;
-  if (!gizmoFrame(app, pivot, orientation)) {
-    return std::nullopt;
+  float size = kGizmoPixels * worldPerPixel;
+  // Scale with the selection so the handles stay reachable past the silhouette
+  // of a large model (the gizmo sits at the bounds centre — inside the body),
+  // bounded at 2x so the desktop feel stays familiar.
+  Aabb bounds{};
+  if (selectionBounds(app, bounds)) {
+    float radius = 0.5F * length(bounds.max - bounds.min);
+    size = std::fmax(size, std::fmin(2.0F * size, 0.75F * radius));
   }
-  auto shapes =
-      buildHandleShapes(app.mode, pivot, orientation, gizmoSize(app, pivot), makeProject(app));
-  return pickHandle(shapes, mouse, kPickThresholdPx);
+  return size;
 }
 
-std::optional<NodeId> pickNode(App& app, Ray const& ray) {
+// Body pick for a pointer ray: exact surface first (closest surface still wins
+// through gaps), falling back to the bounding box — thin geometry like hair
+// cards is easy to miss with a bare ray and "the click targets were too
+// small" is exactly that experience. Returns the hit with its along-ray
+// distance so callers can depth-order bodies against gizmo handles.
+std::optional<vredit::PickHit> pickNode(App& app, Ray const& ray) {
   std::vector<vredit::PickCandidate> candidates;
+  std::vector<std::pair<NodeId, Aabb>> boxes;
   for (NodeVisual const& visual : app.visuals) {
     Mat4 world = app.scene.world(visual.id);
     Aabb box{};
@@ -411,12 +404,76 @@ std::optional<NodeId> pickNode(App& app, Ray const& ray) {
     candidate.world = world;
     candidate.geometry = visual.pickGeometry;
     candidates.push_back(std::move(candidate));
+    boxes.emplace_back(visual.id, box);
   }
   auto hit = vredit::pickClosestSurface(ray, candidates);
-  if (!hit.has_value()) {
-    return std::nullopt;
+  if (hit.has_value()) {
+    return hit;
   }
-  return hit->node;
+  return vredit::pickClosest(ray, boxes); // generous fallback: the whole box
+}
+
+// Cheap bounds-only body pick (per-frame hover feedback).
+// What a press on this ray would act on, resolved by depth: a gizmo handle
+// wins only when it is nearer along the ray than the model body. The handles
+// sit at the selection's bounds centre — inside the body — so without depth
+// ordering every press near a model's middle stole a handle drag instead of
+// the body grab (one axis of movement = "very slowly", and AxisY/Free could
+// lift models off the floor). Hover feedback reports this same resolution,
+// so what lights up is what a press will do.
+struct PointerTarget {
+  std::optional<GizmoHandle> handle; // set when a handle wins
+  NodeId node{kInvalidNode};         // set when a body wins
+};
+
+PointerTarget resolvePointerTarget(App& app, Ray const& ray, float thresholdPx) {
+  PointerTarget target;
+  // The body uses the press's own pick (exact surface first, bounds fallback):
+  // hover and press must agree on what is under the pointer, and the exact
+  // pick is what keeps "closest surface through gaps" honest. It costs
+  // milliseconds on a dense model — the price of "what lights up is what a
+  // press grabs".
+  auto body = pickNode(app, ray);
+  Vec3 pivot;
+  Quat orientation;
+  std::optional<vredit::RayHandleHit> handleHit;
+  if (gizmoFrame(app, pivot, orientation)) {
+    float size = gizmoSize(app, pivot);
+    auto geometry = buildHandleGeometry(app.mode, pivot, orientation, size);
+    handleHit = vredit::pickHandleByRay(geometry, ray, size * (thresholdPx / kGizmoPixels));
+  }
+  // Depth order: a handle wins only when it is in front of the body hit. The
+  // handles sit at the bounds centre — inside the body — so pressing a model's
+  // middle grabs the body (the primary action) and handles are used where they
+  // protrude past the silhouette, which the selection-scaled gizmo makes
+  // generous. When only the bounds fallback hit, the body still wins ties:
+  // pointing into an empty box region should grab the model, not a buried
+  // handle.
+  bool const handleWins =
+      handleHit.has_value() && (!body.has_value() || handleHit->distance < body->t);
+  if (handleWins) {
+    target.handle = handleHit->handle;
+  } else if (body.has_value()) {
+    target.node = body->node;
+  }
+  return target;
+}
+
+// Refresh the per-frame hover state (what a press would act on). Suppressed
+// during a live drag so the highlight does not chase the pointer mid-edit.
+void updateHover(App& app, Ray const& ray, float thresholdPx, bool partSelect) {
+  app.hoverIds.clear();
+  app.hoverHandle.reset();
+  if (app.dragging || app.grab.active()) {
+    return;
+  }
+  PointerTarget target = resolvePointerTarget(app, ray, thresholdPx);
+  if (target.handle.has_value()) {
+    app.hoverHandle = target.handle;
+  } else if (target.node != kInvalidNode) {
+    // Light exactly what a press would select with the current modifier.
+    app.hoverIds = vredit::expandSelection(app.modelGroups, target.node, partSelect);
+  }
 }
 
 float snapStepFor(App const& app) {
@@ -447,14 +504,14 @@ bool endDrag(App& app);
 void pointerPress(App& app,
                   Ray const& ray,
                   Vec3 const& viewDir,
-                  std::optional<GizmoHandle> handle,
+                  PointerTarget const& target,
                   bool partSelect,
                   std::optional<Vec3> grabPosition = std::nullopt) {
   // A press while a drag is live means its release was never seen (pointer
   // left the window); commit that drag as one undo step before starting over,
   // or its transforms would be silently lost from history.
   endDrag(app);
-  if (handle.has_value()) {
+  if (target.handle.has_value()) {
     Vec3 pivot;
     Quat orientation;
     if (gizmoFrame(app, pivot, orientation)) {
@@ -463,7 +520,7 @@ void pointerPress(App& app,
       settings.space = app.space;
       settings.snapStep = snapStepFor(app);
       bool started =
-          app.drag.begin(app.scene, app.selection, pivot, orientation, *handle, ray, viewDir,
+          app.drag.begin(app.scene, app.selection, pivot, orientation, *target.handle, ray, viewDir,
                          settings);
       if (started) {
         // Snapshot after begin() (it captures state, never mutates) and before
@@ -474,10 +531,9 @@ void pointerPress(App& app,
     }
     return;
   }
-  auto hit = pickNode(app, ray);
   app.selection.clear();
-  if (hit.has_value()) {
-    app.selection = vredit::expandSelection(app.modelGroups, *hit, partSelect);
+  if (target.node != kInvalidNode) {
+    app.selection = vredit::expandSelection(app.modelGroups, target.node, partSelect);
     // VR floor grab: the body IS the move target. Snapshot after begin() (it
     // captures state, never mutates) so undo restores the pre-grab position.
     if (grabPosition.has_value() &&
@@ -526,21 +582,6 @@ void pointerRelease(App& app) {
   endDrag(app);
 }
 
-// Ray-space handle pick for controller pointers (VR). The threshold is more
-// generous than the mouse's 8 px: an aim ray jitters at distance and the
-// gizmo is small on screen, so a tight tube around each handle is what made
-// the click targets feel unusable in VR.
-std::optional<GizmoHandle> handleUnderRay(App& app, Ray const& ray) {
-  Vec3 pivot;
-  Quat orientation;
-  if (!gizmoFrame(app, pivot, orientation)) {
-    return std::nullopt;
-  }
-  float size = gizmoSize(app, pivot);
-  auto geometry = buildHandleGeometry(app.mode, pivot, orientation, size);
-  return pickHandleByRay(geometry, ray, size * (kVrPickThresholdPx / kGizmoPixels));
-}
-
 void assembleFrame(App& app,
                     std::vector<DrawItem>& items,
                     std::vector<RendererVertex>& depthLines,
@@ -549,7 +590,10 @@ void assembleFrame(App& app,
   auto isSelected = [&app](NodeId id) {
     return std::find(app.selection.begin(), app.selection.end(), id) != app.selection.end();
   };
-  auto appendItem = [&app, &items, &isSelected](NodeVisual const& visual) {
+  auto isHovered = [&app](NodeId id) {
+    return std::find(app.hoverIds.begin(), app.hoverIds.end(), id) != app.hoverIds.end();
+  };
+  auto appendItem = [&app, &items, &isSelected, &isHovered](NodeVisual const& visual) {
     DrawItem item;
     item.mesh = visual.mesh;
     item.texture = visual.texture;
@@ -562,7 +606,9 @@ void assembleFrame(App& app,
     item.alphaCutoff = visual.alphaCutoff;
     item.alpha = visual.alpha;
     item.lit = true;
-    item.highlight = isSelected(visual.id) ? 1.0F : 0.0F;
+    // 1 = selected (warm), 2 = hovered (cool) — the hover state is what makes
+    // "you knew that you were hitting them" true before the press.
+    item.highlight = isSelected(visual.id) ? 1.0F : (isHovered(visual.id) ? 2.0F : 0.0F);
     items.push_back(item);
   };
   // Opaque and mask-cutout items first, blended items last (painter's order).
@@ -580,7 +626,7 @@ void assembleFrame(App& app,
   Quat orientation;
   if (gizmoFrame(app, pivot, orientation)) {
     auto geometry = buildHandleGeometry(app.mode, pivot, orientation, gizmoSize(app, pivot));
-    appendHandleLines(overlayLines, geometry);
+    appendHandleLines(overlayLines, geometry, app.hoverHandle);
   }
   Aabb selectedBounds{};
   if (selectionBounds(app, selectedBounds)) {
@@ -670,13 +716,15 @@ void handleEvent(App& app,
     Vec2 mouse{static_cast<float>(press->event_x), static_cast<float>(press->event_y)};
     app.lastMouse = mouse;
     app.snap = (press->state & XCB_MOD_MASK_CONTROL) != 0U;
+    app.partSelect = (press->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
     if (app.width == 0U || app.height == 0U) {
       break; // minimised: pointer maths would divide by zero
     }
     if (press->detail == 1U) {
       bool const partSelect = (press->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
-      pointerPress(app, appRay(app, mouse), cameraForward(app.camera),
-                   handleUnderCursor(app, mouse), partSelect);
+      Ray mouseRay = appRay(app, mouse);
+      PointerTarget target = resolvePointerTarget(app, mouseRay, kPickThresholdPx);
+      pointerPress(app, mouseRay, cameraForward(app.camera), target, partSelect);
     } else if (press->detail == 3U) {
       if ((press->state & XCB_MOD_MASK_SHIFT) != 0U) {
         app.panning = true;
@@ -713,6 +761,8 @@ void handleEvent(App& app,
     Vec2 mouse{static_cast<float>(motion->event_x), static_cast<float>(motion->event_y)};
     Vec2 delta{mouse.x - app.lastMouse.x, mouse.y - app.lastMouse.y};
     app.lastMouse = mouse;
+    app.snap = (motion->state & XCB_MOD_MASK_CONTROL) != 0U;
+    app.partSelect = (motion->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
     if (app.width == 0U || app.height == 0U) {
       endDrag(app); // minimised mid-drag: commit what was done, stop tracking
       app.looking = false;
@@ -1205,8 +1255,13 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
   }
 
   // The headset drives the eye views; locomotion is a rig transform composed
-  // with the head pose (per-eye viewProj = proj*viewHead * rigView).
+  // with the head pose (per-eye viewProj = proj*viewHead * rigView). The rig
+  // must be a gravity-aligned frame — yaw + position only. An inherited pitch
+  // (the desktop framing camera looks down at the model) tilts the entire
+  // world off the headset's gravity: the ground stops being level and the
+  // tilt direction sweeps as the head turns.
   Camera rig = app.camera;
+  rig.pitch = 0.0F;
 
   bool running = true;
   int framesRendered = 0;
@@ -1243,17 +1298,18 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     last = now;
     dt = dt > 0.1F ? 0.1F : dt;
 
-    // Left stick moves/strafes, right stick turns; grip boosts and snaps
-    // (mirroring the desktop Shift-boost / Ctrl-snap modifiers). Turning
+    // Left stick moves/strafes, right stick turns (yaw only); grip boosts and
+    // snaps (mirroring the desktop Shift-boost / Ctrl-snap modifiers). Turning
     // pivots on the tracked head, not on the rig position — pivoting on the
     // origin swung the viewer in an arc ("rotating around a point above my
-    // head") whenever the head sat away from it.
+    // head") whenever the head sat away from it. Stick pitch is deliberately
+    // unbound: pitching the rig tilts the world off gravity and moved the
+    // viewer mid-turn — in VR you look up/down with your head.
     app.snap = input.gripHeld > 0.5F;
     float speed = kFlySpeed * (app.snap ? kFlyBoost : 1.0F) * dt;
     cameraFly(rig, {input.moveStick.x * speed, 0.0F, input.moveStick.y * speed});
     clampHeadAboveGround(rig, input.headPosition);
-    cameraLookPivot(rig, input.headPosition, input.turnStick.x * kXrTurnSpeed * dt,
-                    input.turnStick.y * kXrTurnSpeed * dt);
+    cameraLookPivot(rig, input.headPosition, input.turnStick.x * kXrTurnSpeed * dt, 0.0F);
 
     if (input.menuPressed) {
       app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
@@ -1283,14 +1339,15 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     if (input.selectPressed) {
       // Grip + trigger selects a single part; trigger alone the whole model.
       bool const partSelect = input.gripHeld > 0.5F;
-      pointerPress(app, worldRay, headForward, handleUnderRay(app, worldRay), partSelect,
-                   worldRay.origin);
+      PointerTarget target = resolvePointerTarget(app, worldRay, kVrPickThresholdPx);
+      pointerPress(app, worldRay, headForward, target, partSelect, worldRay.origin);
     } else if (input.selectHeld) {
       pointerMove(app, worldRay, worldRay.origin);
     }
     if (input.selectReleased) {
       pointerRelease(app);
     }
+    updateHover(app, worldRay, kVrPickThresholdPx, input.gripHeld > 0.5F);
 
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
@@ -1443,6 +1500,7 @@ int runInteractive(char const* shaderDir, std::vector<char const*> const& modelP
       std::this_thread::sleep_for(std::chrono::milliseconds(8)); // minimised: no busy spin
       continue;
     }
+    updateHover(app, appRay(app, app.lastMouse), kPickThresholdPx, app.partSelect);
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;

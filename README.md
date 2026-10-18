@@ -65,9 +65,13 @@ part — grip doubles as the snap/boost modifier, mirroring Ctrl's desktop
 overlap. Pressing the trigger on the model body *grabs* it: hold and move the
 controller to slide the model on the ground plane (1:1 with the hand, never
 lifting off the floor), release to drop it. Aim at a gizmo handle instead for
-precise axis/rotate/scale work. Left stick flies, right stick turns — turning
-pivots on your head, so you spin in place rather than orbiting the tracking
-origin.
+precise axis/rotate/scale work — a handle wins only where it is nearer than
+the model surface, so grabbing the body is what happens when you press the
+model itself. Whatever is under the pointer lights up first (cool tint on the
+model, brightened handle), and what lights up is what a press will grab. Left
+stick flies, right stick turns (yaw only — look up/down with your head, so
+the ground stays level); turning pivots on your head, so you spin in place
+rather than orbiting the tracking origin.
 
 ## Design notes
 

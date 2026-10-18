@@ -51,8 +51,15 @@ void main() {
   if (mode > 0.5 && mode < 1.5 && base.a < push.params.z) {
     discard; // AlphaMode::Mask
   }
-  // Selection highlight: warm orange lift that survives textures and lighting.
-  base.rgb = mix(base.rgb, vec3(1.0, 0.62, 0.22), 0.35 * push.normalParams.w) +
-             vec3(0.18, 0.10, 0.0) * push.normalParams.w;
+  // State highlight: 1 = selected (warm orange lift that survives textures and
+  // lighting), 2 = hovered (cool blue lift, so the target under the pointer is
+  // unmistakable before the press).
+  float highlight = push.normalParams.w;
+  if (highlight > 1.5) {
+    base.rgb = mix(base.rgb, vec3(0.45, 0.80, 1.0), 0.35) + vec3(0.02, 0.08, 0.16);
+  } else {
+    base.rgb = mix(base.rgb, vec3(1.0, 0.62, 0.22), 0.35 * highlight) +
+               vec3(0.18, 0.10, 0.0) * highlight;
+  }
   outColour = base;
 }

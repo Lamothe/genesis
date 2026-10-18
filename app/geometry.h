@@ -26,7 +26,7 @@ struct DrawItem {
   float alphaCutoff{0.5F};
   AlphaMode alpha{AlphaMode::Opaque};
   bool lit{true};
-  float highlight{0.0F};      // 1 = selected: warm tint in the shader
+  float highlight{0.0F};      // 1 = selected (warm), 2 = hovered (cool)
 };
 
 void appendCube(std::vector<RendererVertex>& out);
@@ -34,7 +34,8 @@ void appendGrid(std::vector<RendererVertex>& out, float extent, float step);
 
 // Adds handle lines as line-list vertices using standard gizmo colours.
 void appendHandleLines(std::vector<RendererVertex>& out,
-                       std::vector<HandleGeom> const& geometry);
+                       std::vector<HandleGeom> const& geometry,
+                       std::optional<GizmoHandle> hover = std::nullopt);
 
 // 12 edges of an axis-aligned box (line list), e.g. a selection outline.
 void appendBoundsLines(std::vector<RendererVertex>& out, Aabb const& bounds, Vec3 colour);

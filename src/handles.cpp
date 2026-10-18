@@ -204,7 +204,7 @@ float clamp01(float value) {
 
 // Ray vs coplanar filled polygon: plane hit, then 2D point-in-polygon in the
 // plane's own basis.
-bool rayHitsPolygon(Ray const& ray, std::vector<Vec3> const& points) {
+bool rayHitsPolygon(Ray const& ray, std::vector<Vec3> const& points, float* rayDistOut) {
   if (points.size() < 3U) {
     return false;
   }
@@ -239,12 +239,18 @@ bool rayHitsPolygon(Ray const& ray, std::vector<Vec3> const& points) {
     flat.push_back({dot(d, basisU), dot(d, basisV)});
   }
   Vec2 q{dot(hit - points[0], basisU), dot(hit - points[0], basisV)};
-  return pointInPolygon(flat, q);
+  if (!pointInPolygon(flat, q)) {
+    return false;
+  }
+  if (rayDistOut != nullptr) {
+    *rayDistOut = t;
+  }
+  return true;
 }
 
 } // namespace
 
-float raySegmentDistance(Ray const& ray, Vec3 a, Vec3 b) {
+float raySegmentDistance(Ray const& ray, Vec3 a, Vec3 b, float* rayDistOut) {
   // Closest points between the half-line (s >= 0) and the segment (t in [0,1])
   // solved directly in double precision: aiming ALONG a handle is the common
   // case and the float normal equations cancel catastrophically there.
@@ -304,20 +310,24 @@ float raySegmentDistance(Ray const& ray, Vec3 a, Vec3 b) {
   double dx = wx + s * ux - t * vx;
   double dy = wy + s * uy - t * vy;
   double dz = wz + s * uz - t * vz;
+  if (rayDistOut != nullptr) {
+    *rayDistOut = static_cast<float>(s);
+  }
   return static_cast<float>(std::sqrt(dx * dx + dy * dy + dz * dz));
 }
 
-std::optional<GizmoHandle> pickHandleByRay(std::vector<HandleGeom> const& geometry,
-                                           Ray const& ray, float threshold) {
-  std::optional<GizmoHandle> lineHit;
+std::optional<RayHandleHit> pickHandleByRay(std::vector<HandleGeom> const& geometry,
+                                            Ray const& ray, float threshold) {
+  std::optional<RayHandleHit> lineHit;
   float lineHitDistance = threshold;
-  std::optional<GizmoHandle> filledHit;
+  std::optional<RayHandleHit> filledHit;
 
   for (HandleGeom const& shape : geometry) {
     std::size_t count = shape.points.size();
     if (shape.filled) {
-      if (!filledHit.has_value() && rayHitsPolygon(ray, shape.points)) {
-        filledHit = shape.handle;
+      float depth = 0.0F;
+      if (!filledHit.has_value() && rayHitsPolygon(ray, shape.points, &depth)) {
+        filledHit = RayHandleHit{shape.handle, depth};
       }
       continue;
     }
@@ -325,17 +335,19 @@ std::optional<GizmoHandle> pickHandleByRay(std::vector<HandleGeom> const& geomet
       continue;
     }
     for (std::size_t i = 1; i < count; ++i) {
-      float d = raySegmentDistance(ray, shape.points[i - 1U], shape.points[i]);
+      float depth = 0.0F;
+      float d = raySegmentDistance(ray, shape.points[i - 1U], shape.points[i], &depth);
       if (d < lineHitDistance) {
         lineHitDistance = d;
-        lineHit = shape.handle;
+        lineHit = RayHandleHit{shape.handle, depth};
       }
     }
     if (shape.loop && count >= 3U) {
-      float d = raySegmentDistance(ray, shape.points[count - 1U], shape.points[0]);
+      float depth = 0.0F;
+      float d = raySegmentDistance(ray, shape.points[count - 1U], shape.points[0], &depth);
       if (d < lineHitDistance) {
         lineHitDistance = d;
-        lineHit = shape.handle;
+        lineHit = RayHandleHit{shape.handle, depth};
       }
     }
   }
