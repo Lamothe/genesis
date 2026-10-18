@@ -1167,6 +1167,25 @@ void testSegmentAndPolygonPicking() {
   CHECK(!pointInPolygon(square, {0.5F, 1.5F}));
 }
 
+void testPressGrabs() {
+  using vredit::NodeId;
+  using vredit::pressGrabs;
+  std::vector<NodeId> const model{1, 2, 3};
+  std::vector<NodeId> const part{2};
+  std::vector<NodeId> const none{};
+
+  // A first press (nothing selected) only ever selects.
+  CHECK(!pressGrabs(none, model, 10.0, 0.1));
+  // A press resolving to a different target only selects.
+  CHECK(!pressGrabs(model, part, 10.0, 0.1));
+  CHECK(!pressGrabs(part, model, 10.0, 0.1));
+  // The second press on the already-selected target grabs — unless it lands
+  // within the bounce window of the previous release.
+  CHECK(pressGrabs(model, model, 10.0, 0.1));
+  CHECK(pressGrabs(part, part, 0.5, 0.1));
+  CHECK(!pressGrabs(model, model, 0.02, 0.1));
+}
+
 void testHandlePicking() {
   ProjectFn project = [](Vec3 const& p) { return Vec2{p.x, p.y}; };
 
@@ -2025,6 +2044,7 @@ int main() {
   testUpscaleToPot();
   testMipChain();
   testSegmentAndPolygonPicking();
+  testPressGrabs();
   testHandlePicking();
   testHandlePickingBehindCamera();
   testHandlePickingByRay();

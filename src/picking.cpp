@@ -165,4 +165,15 @@ std::vector<NodeId> expandSelection(std::vector<std::pair<NodeId, std::uint32_t>
   return out;
 }
 
+
+bool pressGrabs(std::vector<NodeId> const& selection,
+                std::vector<NodeId> const& picked,
+                double secondsSinceLastRelease,
+                double debounceSeconds) {
+  if (selection.empty() || selection != picked) {
+    return false; // a new target: this press only selects
+  }
+  return secondsSinceLastRelease >= debounceSeconds;
+}
+
 } // namespace vredit

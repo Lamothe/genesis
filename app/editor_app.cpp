@@ -43,6 +43,9 @@ constexpr float kWheelMetres = 1.0F;     // metres per wheel notch
 constexpr float kGizmoPixels = 120.0F;
 constexpr float kPickThresholdPx = 8.0F;
 constexpr float kVrPickThresholdPx = 24.0F; // aim rays jitter: 3x the mouse
+// A re-press closer than this to the previous release is a controller bounce
+// (Quest triggers are wobbly), not a deliberate second click.
+constexpr double kGrabDebounceSeconds = 0.1;
 constexpr float kSnapTranslate = 0.25F;
 constexpr float kSnapRotate = 0.2617994F; // 15 degrees
 constexpr float kSnapScale = 0.25F;
@@ -129,6 +132,9 @@ struct App {
   bool running{true};
   bool snap{false};
   bool partSelect{false}; // shift/ctrl (desktop) or grip (VR): select one part
+  // For the two-step move rule: a re-press too soon after a release is a
+  // controller bounce (Quest triggers are wobbly), not a second click.
+  std::chrono::steady_clock::time_point lastReleaseTime{};
   // Free-flight state (WASD/QE held keys + Shift boost).
   bool flyForward{false};
   bool flyBack{false};
@@ -498,10 +504,11 @@ bool endDrag(App& app);
 // ray-space for VR); a handle press starts a drag, anything else selects.
 // partSelect (shift/ctrl click, grip+trigger in VR) limits the selection to
 // the single picked part instead of the whole model. When grabPosition is
-// given (VR controller world position), a body press also starts a floor
-// grab: holding the trigger and pointing moves the model on the ground plane
-// with the aim point, so the whole model is the click target rather than a
-// handle.
+// given (VR controller world position), a SECOND press on the already-
+// selected target starts the floor grab: holding the trigger and pointing
+// moves the model on the ground plane with the aim point. A first press only
+// selects (the two-step move rule — see pressGrabs), so an accidental
+// trigger press can never move anything.
 void pointerPress(App& app,
                   Ray const& ray,
                   Vec3 const& viewDir,
@@ -532,16 +539,28 @@ void pointerPress(App& app,
     }
     return;
   }
-  app.selection.clear();
-  if (target.node != kInvalidNode) {
-    app.selection = vredit::expandSelection(app.modelGroups, target.node, partSelect);
-    // VR floor grab: the body IS the move target. Snapshot after begin() (it
-    // captures state, never mutates) so undo restores the pre-grab position.
-    if (grabPosition.has_value() &&
-        app.grab.begin(app.scene, app.selection, *grabPosition, ray.direction)) {
+  if (target.node == kInvalidNode) {
+    app.selection.clear();
+    return;
+  }
+  auto const picked = vredit::expandSelection(app.modelGroups, target.node, partSelect);
+  // Two-step move (user request): a press only SELECTS. A press on the
+  // already-selected target GRABS and moves it — so a wobbly trigger press
+  // can change the selection but can never move anything. (Desktop body
+  // presses never grab at all; the gizmo does the moving there.)
+  double const quietSeconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - app.lastReleaseTime)
+          .count();
+  if (grabPosition.has_value() &&
+      vredit::pressGrabs(app.selection, picked, quietSeconds, kGrabDebounceSeconds)) {
+    // Snapshot after begin() (it captures state, never mutates) so undo
+    // restores the pre-grab position.
+    if (app.grab.begin(app.scene, app.selection, *grabPosition, ray.direction)) {
       app.undo.begin(app.scene.snapshotTransforms());
     }
+    return;
   }
+  app.selection = picked;
 }
 
 void pointerMove(App& app, Ray const& ray, std::optional<Vec3> grabPosition = std::nullopt) {
@@ -581,6 +600,7 @@ void cancelLiveEdit(App& app) {
 
 void pointerRelease(App& app) {
   endDrag(app);
+  app.lastReleaseTime = std::chrono::steady_clock::now();
 }
 
 void assembleFrame(App& app,

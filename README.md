@@ -62,19 +62,23 @@ the selection is tinted and outlined.
 
 In VR the trigger selects the whole model and grip+trigger selects a single
 part — grip doubles as the snap/boost modifier, mirroring Ctrl's desktop
-overlap. Pressing the trigger on the model body *grabs* it: hold and point
-where it should go — the model slides on the ground plane following the point
-where your aim beam meets the floor, so pointing at a spot places it there
-fast and aiming close gives precise nudges. It never lifts off the floor.
-Release to drop it as one undo step. Aim at a gizmo handle instead for precise
-axis/rotate/scale work — a handle wins only where it is nearer than the model
-surface, so grabbing the body is what happens when you press the model itself.
-Handles brighten when hovered; the selection is shown by the warm tint and the
-gizmo sitting at the selection's centre. Left stick flies where you look —
-point down and fly to descend, which is how you adjust your own height;
-strafing stays level. Right stick turns (yaw only — the ground stays level
-with gravity); turning pivots on your head, so you spin in place rather than
-orbiting the tracking origin.
+overlap. Moving is a deliberate two-step: the first press only *selects*, and
+a second press on the already-selected target *grabs* it — hold and point
+where it should go, and the model slides on the ground plane following the
+point where your aim beam meets the floor (pointing at a spot places it there
+fast, aiming close gives precise nudges). It never lifts off the floor;
+release drops it as one undo step. This way a wobbly trigger press can only
+change the selection — it can never move anything — and a re-press within
+100 ms of a release is treated as a controller bounce, not a second click.
+Aim at a gizmo handle instead for precise axis/rotate/scale work — a handle
+wins only where it is nearer than the model surface, so grabbing the body is
+what happens when you press the model itself. Handles brighten when hovered;
+the selection is shown by the warm tint and the gizmo sitting at the
+selection's centre. Left stick flies where you look — point down and fly to
+descend, which is how you adjust your own height; strafing stays level.
+Right stick turns (X) and looks up/down (Y); turning pivots on your head, so
+you spin in place rather than orbiting the tracking origin, and the ground
+stays level with gravity.
 
 ## Design notes
 
