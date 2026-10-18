@@ -607,9 +607,9 @@ void assembleFrame(App& app,
     item.alphaCutoff = visual.alphaCutoff;
     item.alpha = visual.alpha;
     item.lit = true;
-    // 1 = selected (warm), 2 = hovered (cool) — the hover state is what makes
-    // "you knew that you were hitting them" true before the press.
-    item.highlight = isSelected(visual.id) ? 1.0F : (isHovered(visual.id) ? 2.0F : 0.0F);
+    // 1 = selected (warm) — the only tint the user wants: the selection is
+    // also visible from the gizmo sitting at the selection's centre.
+    item.highlight = isSelected(visual.id) ? 1.0F : 0.0F;
     items.push_back(item);
   };
   // Opaque and mask-cutout items first, blended items last (painter's order).
@@ -628,12 +628,6 @@ void assembleFrame(App& app,
   if (gizmoFrame(app, pivot, orientation)) {
     auto geometry = buildHandleGeometry(app.mode, pivot, orientation, gizmoSize(app, pivot));
     appendHandleLines(overlayLines, geometry, app.hoverHandle);
-  }
-  Aabb selectedBounds{};
-  if (selectionBounds(app, selectedBounds)) {
-    // Selection outline sits on top of everything, so the selected model is
-    // identifiable even when its tint alone is not obvious.
-    appendBoundsLines(overlayLines, selectedBounds, {1.0F, 0.62F, 0.22F});
   }
 }
 

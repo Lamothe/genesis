@@ -94,30 +94,6 @@ void appendHandleLines(std::vector<RendererVertex>& out,
       out.push_back({geom.points[count - 1U], up, colour, {0.0F, 0.0F}});
       out.push_back({geom.points[0], up, colour, {0.0F, 0.0F}});
     }
-    if (geom.filled && count == 4U) {
-      // The square click targets (planar handles, scale tips) are filled pick
-      // regions: hatch the fill so the target is visible at all (an outline
-      // alone is nearly invisible in VR) and hatch it densely when hovered so
-      // "you knew that you were hitting them" is unmistakable.
-      bool const hot = hover.has_value() && *hover == geom.handle;
-      int const steps = hot ? 6 : 2;
-      Vec3 const& p0 = geom.points[0];
-      Vec3 const& p1 = geom.points[1];
-      Vec3 const& p2 = geom.points[2];
-      Vec3 const& p3 = geom.points[3];
-      auto bilinear = [&](float u, float v) {
-        Vec3 a = p0 + (p1 - p0) * u;
-        Vec3 b = p3 + (p2 - p3) * u;
-        return a + (b - a) * v;
-      };
-      for (int i = 1; i < steps; ++i) {
-        float t = static_cast<float>(i) / static_cast<float>(steps);
-        out.push_back({bilinear(t, 0.0F), up, colour, {0.0F, 0.0F}});
-        out.push_back({bilinear(t, 1.0F), up, colour, {0.0F, 0.0F}});
-        out.push_back({bilinear(0.0F, t), up, colour, {0.0F, 0.0F}});
-        out.push_back({bilinear(1.0F, t), up, colour, {0.0F, 0.0F}});
-      }
-    }
   }
 }
 

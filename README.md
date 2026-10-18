@@ -69,13 +69,12 @@ fast and aiming close gives precise nudges. It never lifts off the floor.
 Release to drop it as one undo step. Aim at a gizmo handle instead for precise
 axis/rotate/scale work — a handle wins only where it is nearer than the model
 surface, so grabbing the body is what happens when you press the model itself.
-Whatever is under the pointer lights up first (cool tint on the model,
-brightened handle, and the move gizmo's square planar targets fill in with a
-dense hatch when hovered), and what lights up is what a press will grab. Left
-stick flies where you look — point down and fly to descend, which is how you
-adjust your own height; strafing stays level. Right stick turns (yaw only —
-the ground stays level with gravity); turning pivots on your head, so you
-spin in place rather than orbiting the tracking origin.
+Handles brighten when hovered; the selection is shown by the warm tint and the
+gizmo sitting at the selection's centre. Left stick flies where you look —
+point down and fly to descend, which is how you adjust your own height;
+strafing stays level. Right stick turns (yaw only — the ground stays level
+with gravity); turning pivots on your head, so you spin in place rather than
+orbiting the tracking origin.
 
 ## Design notes
 

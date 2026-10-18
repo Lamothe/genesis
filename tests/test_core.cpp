@@ -1163,8 +1163,9 @@ void testHandlePicking() {
                                   project);
   CHECK(pickHandle(shapes, {0.5F, 0.05F}, 0.1F) == GizmoHandle::AxisX);
   CHECK(pickHandle(shapes, {0.05F, 0.5F}, 0.1F) == GizmoHandle::AxisY);
-  // Plane quad band lives between 0.25 and 0.45 along each axis.
-  CHECK(pickHandle(shapes, {0.35F, 0.35F}, 0.1F) == GizmoHandle::PlaneXY);
+  // The planar squares are gone (user request): the band between the axes
+  // picks nothing.
+  CHECK(!pickHandle(shapes, {0.35F, 0.35F}, 0.1F).has_value());
   CHECK(!pickHandle(shapes, {2.0F, 2.0F}, 0.1F).has_value());
 
   // Rotate: the Z ring lies in the XY plane; pick a point on the ring away

@@ -61,8 +61,6 @@ std::vector<HandleGeom> buildHandleGeometry(GizmoMode mode,
                   rotate(orientation, {0.0F, 0.0F, 1.0F})};
   GizmoHandle const axisHandles[3] = {GizmoHandle::AxisX, GizmoHandle::AxisY,
                                       GizmoHandle::AxisZ};
-  GizmoHandle const planeHandles[3] = {GizmoHandle::PlaneXY, GizmoHandle::PlaneYZ,
-                                       GizmoHandle::PlaneZX};
 
   if (mode == GizmoMode::Rotate) {
     int const ringSteps = 32;
@@ -107,21 +105,6 @@ std::vector<HandleGeom> buildHandleGeometry(GizmoMode mode,
     }
   }
 
-  float const inner = size * 0.25F;
-  float const outer = size * 0.45F;
-  for (int p = 0; p < 3; ++p) {
-    Vec3 u = axes[p];
-    Vec3 v = axes[(p + 1) % 3];
-    HandleGeom quad;
-    quad.handle = planeHandles[p];
-    quad.loop = true;
-    quad.filled = true;
-    quad.points.push_back(pivot + u * inner + v * inner);
-    quad.points.push_back(pivot + u * outer + v * inner);
-    quad.points.push_back(pivot + u * outer + v * outer);
-    quad.points.push_back(pivot + u * inner + v * outer);
-    geoms.push_back(std::move(quad));
-  }
   return geoms;
 }
 
