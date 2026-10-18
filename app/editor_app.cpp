@@ -1310,7 +1310,12 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
                                                 {input.moveStick.x * speed, 0.0F,
                                                  input.moveStick.y * speed});
     clampHeadAboveGround(rig, input.headPosition);
-    cameraLookPivot(rig, input.headPosition, input.turnStick.x * kXrTurnSpeed * dt, 0.0F);
+    // Right stick: X turns (yaw), Y looks up/down (pitch) — the classic
+    // first-person right stick. Both pivot on the tracked head, and the FPS
+    // basis keeps the horizon level (cameraRight is horizontal by
+    // construction), so pitch can never roll the world off level.
+    cameraLookPivot(rig, input.headPosition, input.turnStick.x * kXrTurnSpeed * dt,
+                    input.turnStick.y * kXrTurnSpeed * dt);
 
     if (input.menuPressed) {
       app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate

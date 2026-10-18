@@ -1143,6 +1143,17 @@ void testCameraLookPivot() {
   Mat4 pitchedWorld{};
   CHECK(vredit::invertAffine(cameraView(camera), pitchedWorld));
   CHECK_NEAR3(vredit::transformPoint(pitchedWorld, pivotLocal), midPivot);
+
+  // Combined turns never roll the horizon: the camera's right vector stays
+  // horizontal at any yaw and pitch ("not level with the ground as they
+  // turn" cannot come back), while the stick pitch does accumulate.
+  Camera roll;
+  roll.pitch = 0.0F;
+  for (int i = 0; i < 7; ++i) {
+    cameraLookPivot(roll, {0.4F, 0.3F, -0.2F}, 0.37F, -0.21F);
+    CHECK_NEAR(vredit::cameraRight(roll).y, 0.0F, 1e-5F);
+  }
+  CHECK(roll.pitch < 0.0F);
 }
 
 void testSegmentAndPolygonPicking() {
