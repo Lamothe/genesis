@@ -878,25 +878,70 @@ void testGizmoPlaneHandle() {
 void testFloorGrab() {
   vredit::Scene scene;
   vredit::NodeId node = scene.create();
+  vredit::Vec3 const down{0.0F, -1.0F, 0.0F};
 
-  // Horizontal controller motion moves the model 1:1 on the floor...
+  // The model follows the AIM POINT where the beam meets the floor ("move
+  // around the X/Y axis based on the controllers movements"). With the beam
+  // straight down the controller's horizontal motion sweeps the aim point 1:1
+  // across the floor...
   vredit::FloorGrab grab;
-  CHECK(grab.begin(scene, {node}, {10.0F, 1.6F, -4.0F}));
+  CHECK(grab.begin(scene, {node}, {10.0F, 1.6F, -4.0F}, down));
   CHECK(grab.active());
-  grab.update({10.5F, 1.6F, -3.0F});
+  grab.update({10.5F, 1.6F, -3.0F}, down);
   CHECK_NEAR3(scene.worldPosition(node), {0.5F, 0.0F, 1.0F});
   CHECK_NEAR3(grab.offset(), {0.5F, 0.0F, 1.0F});
 
-  // ...while vertical motion never lifts it off the floor (y stays 0).
-  grab.update({12.0F, 3.9F, -3.0F});
+  // ...while raising the controller never lifts the model off the floor.
+  grab.update({12.0F, 3.9F, -3.0F}, down);
   CHECK_NEAR3(scene.worldPosition(node), {2.0F, 0.0F, 1.0F});
+
+  // A first update with no motion is an exact no-op.
+  vredit::FloorGrab still;
+  vredit::Scene stillScene;
+  vredit::NodeId stillNode = stillScene.create();
+  CHECK(still.begin(stillScene, {stillNode}, {1.0F, 2.0F, 1.0F}, down));
+  still.update({1.0F, 2.0F, 1.0F}, down);
+  CHECK(still.offset().x == 0.0F && still.offset().y == 0.0F && still.offset().z == 0.0F);
+  CHECK(stillScene.worldPosition(stillNode).x == 0.0F);
+
+  // A hand at floor level: the carry point is the hand's own floor position
+  // (no divide-by-zero jump to the clamp).
+  vredit::FloorGrab low;
+  vredit::Scene lowScene;
+  vredit::NodeId lowNode = lowScene.create();
+  CHECK(low.begin(lowScene, {lowNode}, {2.0F, 0.0F, 3.0F}, down));
+  low.update({2.5F, 0.0F, 3.0F}, down);
+  CHECK_NEAR3(lowScene.worldPosition(lowNode), {0.5F, 0.0F, 0.0F});
+
+  // Pointing at a different spot moves the model there with the controller
+  // itself barely moving — that is what makes layout fast.
+  vredit::Scene aimScene;
+  vredit::NodeId aimNode = aimScene.create();
+  vredit::FloorGrab aimGrab;
+  vredit::Vec3 diagonal = vredit::normalized(vredit::Vec3{0.0F, -1.0F, -1.0F});
+  CHECK(aimGrab.begin(aimScene, {aimNode}, {0.0F, 1.0F, 0.0F}, diagonal));
+  aimGrab.update({0.0F, 1.0F, 0.0F},
+                 vredit::normalized(vredit::Vec3{0.5F, -1.0F, -1.0F}));
+  CHECK_NEAR3(aimScene.worldPosition(aimNode), {0.5F, 0.0F, 0.0F}); // aim only
+
+  // A grazing aim is clamped (no flinging across the room) and never lifts.
+  vredit::Vec3 before = aimScene.worldPosition(aimNode);
+  aimGrab.update({0.0F, 1.0F, 0.0F}, vredit::normalized(vredit::Vec3{1.0F, -0.01F, 0.0F}));
+  CHECK(vredit::length(aimScene.worldPosition(aimNode) - before) < 12.5F);
+  CHECK_NEAR(aimScene.worldPosition(aimNode).y, 0.0F, 1e-5F);
+
+  // An upward aim also stays clamped and floor-locked.
+  before = aimScene.worldPosition(aimNode);
+  aimGrab.update({0.0F, 1.0F, 0.0F}, vredit::normalized(vredit::Vec3{0.0F, 1.0F, 0.0F}));
+  CHECK(vredit::length(aimScene.worldPosition(aimNode) - before) < 12.5F);
+  CHECK(aimScene.worldPosition(aimNode).y == 0.0F);
 
   // Drift-free: the transform is recomputed from the start state every
   // update, so repeated updates cannot accumulate rounding error.
   for (int i = 0; i < 1000; ++i) {
-    grab.update({12.0F + 0.001F * static_cast<float>(i % 7), 1.6F, -3.0F});
+    grab.update({12.0F + 0.001F * static_cast<float>(i % 7), 1.6F, -3.0F}, down);
   }
-  grab.update({12.0F, 1.6F, -3.0F});
+  grab.update({12.0F, 1.6F, -3.0F}, down);
   CHECK_NEAR3(scene.worldPosition(node), {2.0F, 0.0F, 1.0F});
 
   // Rigid-group semantics: a child of a selected node rides along instead of
@@ -908,13 +953,13 @@ void testFloorGrab() {
   ct.translation = {1.0F, 0.0F, 0.0F};
   grouped.setLocal(child, ct);
   vredit::FloorGrab groupGrab;
-  CHECK(groupGrab.begin(grouped, {parent, child}, {0.0F, 0.0F, 0.0F}));
-  groupGrab.update({3.0F, 0.0F, -2.0F});
+  CHECK(groupGrab.begin(grouped, {parent, child}, {0.0F, 2.0F, 0.0F}, down));
+  groupGrab.update({3.0F, 2.0F, -2.0F}, down);
   CHECK_NEAR3(grouped.worldPosition(child), {4.0F, 0.0F, -2.0F}); // once, not twice
 
   // A body press with no movable node is refused and stays inactive.
   vredit::FloorGrab refused;
-  CHECK(!refused.begin(grouped, {}, {0.0F, 0.0F, 0.0F}));
+  CHECK(!refused.begin(grouped, {}, {0.0F, 2.0F, 0.0F}, down));
   CHECK(!refused.active());
 
   // Movement is 1:1 with the controller in WORLD units even under a scaled
@@ -930,8 +975,8 @@ void testFloorGrab() {
   childT.translation = {2.0F, 0.0F, -1.0F};
   scaled.setLocal(scaledChild, childT);
   vredit::FloorGrab scaledGrab;
-  CHECK(scaledGrab.begin(scaled, {root, scaledChild}, {0.0F, 0.0F, 0.0F}));
-  scaledGrab.update({0.5F, 0.0F, -0.25F});
+  CHECK(scaledGrab.begin(scaled, {root, scaledChild}, {0.0F, 2.0F, 0.0F}, down));
+  scaledGrab.update({0.5F, 2.0F, -0.25F}, down);
   CHECK_NEAR3(scaled.worldPosition(root), {0.5F, 0.0F, -0.25F});
   CHECK_NEAR3(scaled.worldPosition(scaledChild), {0.52F, 0.0F, -0.26F}); // 1:1, not 100:1
 
@@ -948,14 +993,14 @@ void testFloorGrab() {
   partChildT.translation = {2.0F, 0.0F, -1.0F};
   partScaled.setLocal(partChild, partChildT);
   vredit::FloorGrab partGrab;
-  CHECK(partGrab.begin(partScaled, {partChild}, {0.0F, 0.0F, 0.0F}));
-  partGrab.update({0.5F, 0.0F, -0.25F});
+  CHECK(partGrab.begin(partScaled, {partChild}, {0.0F, 2.0F, 0.0F}, down));
+  partGrab.update({0.5F, 2.0F, -0.25F}, down);
   CHECK_NEAR3(partScaled.worldPosition(partChild), {0.52F, 0.0F, -0.26F});
 
   // End clears the grab; further updates are no-ops.
   groupGrab.end();
   CHECK(!groupGrab.active());
-  groupGrab.update({99.0F, 0.0F, 99.0F});
+  groupGrab.update({99.0F, 2.0F, 99.0F}, down);
   CHECK_NEAR3(grouped.worldPosition(child), {4.0F, 0.0F, -2.0F});
 }
 
@@ -1038,6 +1083,18 @@ void testCameraManipulation() {
   CHECK_NEAR3(camera.position, {3.0F, 3.5F, 3.0F});
   cameraFly(camera, {0.0F, 0.0F, -4.0F});
   CHECK_NEAR3(camera.position, {3.0F, 3.5F, 7.0F}); // backward is +Z at yaw 0
+
+  // Fly-where-you-look (VR): forward follows the head's PITCH — looking down
+  // and pushing the stick forward descends (that is the height control) — and
+  // the signs match cameraFly's forward-positive convention.
+  Camera lookCam;
+  lookCam.pitch = 0.0F; // the expectations below assume a level rig
+  Vec3 level = cameraFlyLook(lookCam, {0.0F, 0.0F, -1.0F}, {0.0F, 0.0F, 2.0F});
+  CHECK_NEAR3(level, {0.0F, 0.0F, -2.0F}); // stick forward = world forward
+  Vec3 pitched = cameraFlyLook(lookCam, {0.0F, -0.5F, -0.8660254F}, {0.0F, 0.0F, 2.0F});
+  CHECK_NEAR3(pitched, {0.0F, -1.0F, -1.7320508F}); // forward 1.732, down 1
+  Vec3 strafe = cameraFlyLook(lookCam, {0.0F, -0.5F, -0.8660254F}, {1.0F, 0.0F, 0.0F});
+  CHECK_NEAR3(strafe, {1.0F, 0.0F, 0.0F}); // strafe stays level
 
   // Wheel dolly moves along the view direction.
   cameraDolly(camera, 1.0F);

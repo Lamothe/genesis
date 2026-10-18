@@ -54,6 +54,13 @@ void cameraLookPivot(Camera& camera, Vec3 localPoint, float dYaw, float dPitch);
 // current view direction (true fly movement, pitch included).
 void cameraFly(Camera& camera, Vec3 localMetres);
 
+// Free-flight movement for a head-tracked rig (VR): forward/back follows the
+// head's LOOK direction with its pitch — looking down + forward descends,
+// which is what adjusts your own height — while strafe stays level. The
+// delta is in world metres; localMetres uses cameraFly's convention (x =
+// right, y = up, z = forward-positive metres).
+Vec3 cameraFlyLook(Camera const& camera, Vec3 headForwardLocal, Vec3 localMetres);
+
 // Wheel dolly: > 0 flies forward along the view direction.
 void cameraDolly(Camera& camera, float amount);
 

@@ -317,26 +317,53 @@ void GizmoDrag::applyDelta(Mat4 const& delta) {
   applyDragStarts(*scene_, starts_, delta);
 }
 
+namespace {
+
+// Where along the aim beam a grabbed model is carried: the point where the
+// beam touches the floor — pointing at a spot places the model there, so the
+// movement is the aim point's ("based on the controllers movements"), not
+// the arm's travel. Clamped so grazing/horizontal aims cannot fling the model
+// or jitter it.
+float beamCarryDistance(Vec3 origin, Vec3 direction) {
+  float constexpr kMaxCarryM = 12.0F;
+  // Floor intersection t = -origin.y / direction.y, clamped continuously into
+  // [0, kMaxCarryM]: no slope gate (that jumped the carry point when the hand
+  // was low), no divide-by-zero (direction.y = 0 falls through to the clamp).
+  if (direction.y < 0.0F) {
+    float const tFloor = -origin.y / direction.y;
+    if (tFloor >= 0.0F) {
+      return tFloor < kMaxCarryM ? tFloor : kMaxCarryM;
+    }
+  }
+  return kMaxCarryM;
+}
+
+} // namespace
+
 bool FloorGrab::begin(Scene& scene,
                       std::vector<NodeId> const& selection,
-                      Vec3 controllerWorld) {
+                      Vec3 controllerWorld,
+                      Vec3 aimDirection) {
   end();
   captureDragStarts(scene, selection, starts_);
   if (starts_.empty()) {
     return false;
   }
   scene_ = &scene;
-  start_ = controllerWorld;
+  Vec3 const aim = normalized(aimDirection);
+  anchor_ = controllerWorld + aim * beamCarryDistance(controllerWorld, aim);
   offset_ = {};
   active_ = true;
   return true;
 }
 
-void FloorGrab::update(Vec3 controllerWorld) {
+void FloorGrab::update(Vec3 controllerWorld, Vec3 aimDirection) {
   if (!active_) {
     return;
   }
-  Vec3 raw = controllerWorld - start_;
+  Vec3 const aim = normalized(aimDirection);
+  Vec3 const target = controllerWorld + aim * beamCarryDistance(controllerWorld, aim);
+  Vec3 raw = target - anchor_;
   raw.y = 0.0F; // models stay stuck to the floor: horizontal motion only
   offset_ = raw;
   applyDragStarts(*scene_, starts_, translationMatrix(offset_));

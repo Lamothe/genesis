@@ -101,18 +101,21 @@ private:
   bool active_{false};
 };
 
-// Grab-and-move on the floor plane (VR: hold the trigger on a model and move
-// the controller). The selection follows the controller's world-space motion
-// projected on the ground plane — x/z only; y is untouched, so models stay
-// stuck to the floor. As with GizmoDrag, every update recomputes the
-// cumulative offset from the grab start and applies it to the captured start
-// transforms, so repeated updates cannot accumulate drift.
+// Grab-and-move on the floor plane (VR: hold the trigger on a model and point
+// where it should go). The selection follows the AIM POINT — the point where
+// the controller's aim beam meets the floor, clamped to 12 m — so pointing at
+// a spot places the model there ("based on the controllers movements")
+// instead of dragging it with arm travel. The offset is horizontal only, so
+// models stay stuck to the floor. As with GizmoDrag, every update recomputes
+// the cumulative offset from the grab start and applies it to the captured
+// start transforms, so repeated updates cannot accumulate drift.
 class FloorGrab {
 public:
   bool begin(Scene& scene,
              std::vector<NodeId> const& selection,
-             Vec3 controllerWorld);
-  void update(Vec3 controllerWorld);
+             Vec3 controllerWorld,
+             Vec3 aimDirection);
+  void update(Vec3 controllerWorld, Vec3 aimDirection);
   void end();
 
   bool active() const { return active_; }
@@ -121,7 +124,7 @@ public:
 private:
   Scene* scene_{nullptr};
   std::vector<DragStart> starts_;
-  Vec3 start_{};
+  Vec3 anchor_{}; // aim point at grab: the model follows the aim point's motion
   Vec3 offset_{};
   bool active_{false};
 };

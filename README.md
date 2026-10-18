@@ -62,16 +62,20 @@ the selection is tinted and outlined.
 
 In VR the trigger selects the whole model and grip+trigger selects a single
 part — grip doubles as the snap/boost modifier, mirroring Ctrl's desktop
-overlap. Pressing the trigger on the model body *grabs* it: hold and move the
-controller to slide the model on the ground plane (1:1 with the hand, never
-lifting off the floor), release to drop it. Aim at a gizmo handle instead for
-precise axis/rotate/scale work — a handle wins only where it is nearer than
-the model surface, so grabbing the body is what happens when you press the
-model itself. Whatever is under the pointer lights up first (cool tint on the
-model, brightened handle), and what lights up is what a press will grab. Left
-stick flies, right stick turns (yaw only — look up/down with your head, so
-the ground stays level); turning pivots on your head, so you spin in place
-rather than orbiting the tracking origin.
+overlap. Pressing the trigger on the model body *grabs* it: hold and point
+where it should go — the model slides on the ground plane following the point
+where your aim beam meets the floor, so pointing at a spot places it there
+fast and aiming close gives precise nudges. It never lifts off the floor.
+Release to drop it as one undo step. Aim at a gizmo handle instead for precise
+axis/rotate/scale work — a handle wins only where it is nearer than the model
+surface, so grabbing the body is what happens when you press the model itself.
+Whatever is under the pointer lights up first (cool tint on the model,
+brightened handle, and the move gizmo's square planar targets fill in with a
+dense hatch when hovered), and what lights up is what a press will grab. Left
+stick flies where you look — point down and fly to descend, which is how you
+adjust your own height; strafing stays level. Right stick turns (yaw only —
+the ground stays level with gravity); turning pivots on your head, so you
+spin in place rather than orbiting the tracking origin.
 
 ## Design notes
 

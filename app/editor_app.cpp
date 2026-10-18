@@ -499,8 +499,9 @@ bool endDrag(App& app);
 // partSelect (shift/ctrl click, grip+trigger in VR) limits the selection to
 // the single picked part instead of the whole model. When grabPosition is
 // given (VR controller world position), a body press also starts a floor
-// grab: holding the pointer drags the model on the ground plane 1:1 with the
-// controller, so the whole model is the click target rather than a handle.
+// grab: holding the trigger and pointing moves the model on the ground plane
+// with the aim point, so the whole model is the click target rather than a
+// handle.
 void pointerPress(App& app,
                   Ray const& ray,
                   Vec3 const& viewDir,
@@ -537,7 +538,7 @@ void pointerPress(App& app,
     // VR floor grab: the body IS the move target. Snapshot after begin() (it
     // captures state, never mutates) so undo restores the pre-grab position.
     if (grabPosition.has_value() &&
-        app.grab.begin(app.scene, app.selection, *grabPosition)) {
+        app.grab.begin(app.scene, app.selection, *grabPosition, ray.direction)) {
       app.undo.begin(app.scene.snapshotTransforms());
     }
   }
@@ -545,7 +546,7 @@ void pointerPress(App& app,
 
 void pointerMove(App& app, Ray const& ray, std::optional<Vec3> grabPosition = std::nullopt) {
   if (app.grab.active() && grabPosition.has_value()) {
-    app.grab.update(*grabPosition);
+    app.grab.update(*grabPosition, ray.direction);
     return;
   }
   if (app.dragging) {
@@ -1307,7 +1308,13 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     // viewer mid-turn — in VR you look up/down with your head.
     app.snap = input.gripHeld > 0.5F;
     float speed = kFlySpeed * (app.snap ? kFlyBoost : 1.0F) * dt;
-    cameraFly(rig, {input.moveStick.x * speed, 0.0F, input.moveStick.y * speed});
+    // Fly where you LOOK: stick forward follows the head's view direction with
+    // its pitch, so looking down + forward descends — the head's look is what
+    // adjusts your own height, exactly as pitch + W does on desktop. Strafe
+    // stays level. (The rig itself stays gravity-aligned: see runXr.)
+    rig.position = rig.position + cameraFlyLook(rig, input.headForward,
+                                                {input.moveStick.x * speed, 0.0F,
+                                                 input.moveStick.y * speed});
     clampHeadAboveGround(rig, input.headPosition);
     cameraLookPivot(rig, input.headPosition, input.turnStick.x * kXrTurnSpeed * dt, 0.0F);
 
@@ -1334,7 +1341,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     // The right controller's aim ray drives the same state machine as the
     // mouse; the head pose sizes the gizmo. Passing the controller position
     // enables the floor grab: pressing the model body (not a handle) selects
-    // it and holding drags it on the ground plane 1:1 with the hand.
+    // it, and holding moves it on the ground plane with the aim point.
     app.camera.position = headWorld;
     if (input.selectPressed) {
       // Grip + trigger selects a single part; trigger alone the whole model.

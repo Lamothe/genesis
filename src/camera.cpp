@@ -186,6 +186,15 @@ void cameraFly(Camera& camera, Vec3 localMetres) {
                     cameraForward(camera) * localMetres.z;
 }
 
+Vec3 cameraFlyLook(Camera const& camera, Vec3 headForwardLocal, Vec3 localMetres) {
+  // headForwardLocal is the head's forward in the camera's local frame (the
+  // rig-local view direction); right*x + up*y - forward*z maps it to world.
+  Vec3 look = normalized(cameraRight(camera) * headForwardLocal.x +
+                         cameraUp(camera) * headForwardLocal.y -
+                         cameraForward(camera) * headForwardLocal.z);
+  return cameraRight(camera) * localMetres.x + look * localMetres.z;
+}
+
 void cameraDolly(Camera& camera, float amount) {
   camera.position = camera.position + cameraForward(camera) * amount;
 }
