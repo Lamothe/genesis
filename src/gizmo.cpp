@@ -67,6 +67,54 @@ bool GizmoDrag::planeIntersect(Ray const& ray, Vec3& pointOut) const {
   return true;
 }
 
+void captureDragStarts(Scene& scene,
+                       std::vector<NodeId> const& selection,
+                       std::vector<DragStart>& out) {
+  out.clear();
+  for (NodeId id : selection) {
+    if (!scene.valid(id)) {
+      continue;
+    }
+    // Rigid-group semantics: a node whose ancestor is also selected rides
+    // along with that ancestor's transform instead of receiving the delta
+    // itself, which would apply it twice through the hierarchy.
+    bool ancestorSelected = false;
+    for (NodeId p = scene.parent(id); p != kInvalidNode && scene.valid(p); p = scene.parent(p)) {
+      if (std::find(selection.begin(), selection.end(), p) != selection.end()) {
+        ancestorSelected = true;
+        break;
+      }
+    }
+    if (ancestorSelected) {
+      continue;
+    }
+    DragStart start;
+    start.id = id;
+    NodeId parentId = scene.parent(id);
+    Mat4 parentWorld;
+    if (parentId != kInvalidNode && scene.valid(parentId)) {
+      parentWorld = scene.world(parentId);
+    }
+    if (!invertAffine(parentWorld, start.invParent)) {
+      // Singular parent world (a zero-scale ancestor): drop the node. Its
+      // skipped descendants inherit the same singular chain and would fail
+      // identically as their own entries, so nothing moves — no silent
+      // half-transform.
+      continue;
+    }
+    start.startWorld = mul(parentWorld, toMatrix(scene.local(id)));
+    out.push_back(start);
+  }
+}
+
+void applyDragStarts(Scene& scene, std::vector<DragStart> const& starts, Mat4 const& delta) {
+  for (DragStart const& start : starts) {
+    Mat4 newWorld = mul(delta, start.startWorld);
+    Mat4 newLocal = mul(start.invParent, newWorld);
+    scene.setLocal(start.id, toTransform(newLocal));
+  }
+}
+
 bool GizmoDrag::begin(Scene& scene,
                       std::vector<NodeId> const& selection,
                       Vec3 pivot,
@@ -173,40 +221,7 @@ bool GizmoDrag::begin(Scene& scene,
   }
 
   starts_.clear();
-  for (NodeId id : selection) {
-    if (!scene.valid(id)) {
-      continue;
-    }
-    // Rigid-group semantics: a node whose ancestor is also selected rides
-    // along with that ancestor's transform instead of receiving the delta
-    // itself, which would apply it twice through the hierarchy.
-    bool ancestorSelected = false;
-    for (NodeId p = scene.parent(id); p != kInvalidNode && scene.valid(p); p = scene.parent(p)) {
-      if (std::find(selection.begin(), selection.end(), p) != selection.end()) {
-        ancestorSelected = true;
-        break;
-      }
-    }
-    if (ancestorSelected) {
-      continue;
-    }
-    StartNode start;
-    start.id = id;
-    NodeId parentId = scene.parent(id);
-    Mat4 parentWorld;
-    if (parentId != kInvalidNode && scene.valid(parentId)) {
-      parentWorld = scene.world(parentId);
-    }
-    if (!invertAffine(parentWorld, start.invParent)) {
-      // Singular parent world (a zero-scale ancestor): drop the node. Its
-      // skipped descendants inherit the same singular chain and would fail
-      // identically as their own entries, so nothing moves — no silent
-      // half-transform.
-      continue;
-    }
-    start.startWorld = mul(parentWorld, toMatrix(scene.local(id)));
-    starts_.push_back(start);
-  }
+  captureDragStarts(scene, selection, starts_);
 
   active_ = true;
   return true;
@@ -299,11 +314,39 @@ void GizmoDrag::end() {
 }
 
 void GizmoDrag::applyDelta(Mat4 const& delta) {
-  for (StartNode const& start : starts_) {
-    Mat4 newWorld = mul(delta, start.startWorld);
-    Mat4 newLocal = mul(start.invParent, newWorld);
-    scene_->setLocal(start.id, toTransform(newLocal));
+  applyDragStarts(*scene_, starts_, delta);
+}
+
+bool FloorGrab::begin(Scene& scene,
+                      std::vector<NodeId> const& selection,
+                      Vec3 controllerWorld) {
+  end();
+  captureDragStarts(scene, selection, starts_);
+  if (starts_.empty()) {
+    return false;
   }
+  scene_ = &scene;
+  start_ = controllerWorld;
+  offset_ = {};
+  active_ = true;
+  return true;
+}
+
+void FloorGrab::update(Vec3 controllerWorld) {
+  if (!active_) {
+    return;
+  }
+  Vec3 raw = controllerWorld - start_;
+  raw.y = 0.0F; // models stay stuck to the floor: horizontal motion only
+  offset_ = raw;
+  applyDragStarts(*scene_, starts_, translationMatrix(offset_));
+}
+
+void FloorGrab::end() {
+  active_ = false;
+  scene_ = nullptr;
+  starts_.clear();
+  offset_ = {};
 }
 
 } // namespace vredit

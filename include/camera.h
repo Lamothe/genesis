@@ -44,6 +44,12 @@ Ray cameraRay(Camera const& camera, float aspect, Vec2 pixel, Vec2 viewportSize)
 // Mouse look: changes orientation only (pitch clamped short of gimbal flip).
 void cameraLook(Camera& camera, float dYaw, float dPitch);
 
+// Turn around a pivot in the camera's local frame instead of around the
+// camera position: the given local point keeps its world position fixed while
+// the orientation changes. VR smooth turn passes the tracked head here —
+// pivoting on the tracking origin instead would swing the viewer in an arc
+// around the origin. localPoint = {0, 0, 0} degenerates to cameraLook.
+void cameraLookPivot(Camera& camera, Vec3 localPoint, float dYaw, float dPitch);
 // Flies by a local offset in metres: x = right, y = up, z = forward along the
 // current view direction (true fly movement, pitch included).
 void cameraFly(Camera& camera, Vec3 localMetres);

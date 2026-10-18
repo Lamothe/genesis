@@ -30,6 +30,27 @@ struct GizmoSettings {
   float snapStep{0.0F}; // Translate: metres; Rotate: radians; Scale: factor increments. 0 = off.
 };
 
+// Per-node start state for drift-free drags: the cumulative delta is applied
+// to startWorld and pushed back to local through the (constant) parent.
+struct DragStart {
+  NodeId id{kInvalidNode};
+  Mat4 startWorld{};
+  Mat4 invParent{};
+};
+
+// Captures the start transforms of a selection's rigid groups: a node whose
+// ancestor is also selected rides along with that ancestor instead of
+// receiving the delta twice through the hierarchy. Nodes whose parent chain
+// is singular (a zero-scale ancestor) are skipped — their descendants inherit
+// the same singular chain, so nothing moves instead of half-transforming.
+// Shared by GizmoDrag and FloorGrab.
+void captureDragStarts(Scene& scene,
+                       std::vector<NodeId> const& selection,
+                       std::vector<DragStart>& out);
+
+// Applies a world-space delta to the captured starts.
+void applyDragStarts(Scene& scene, std::vector<DragStart> const& starts, Mat4 const& delta);
+
 // Drift-free gizmo drag over a selection: every update recomputes the cumulative
 // delta from the drag start and applies it to the captured start transforms, so
 // repeated updates cannot accumulate rounding drift.
@@ -57,17 +78,11 @@ public:
   float cumulative() const { return value_; }
 
 private:
-  struct StartNode {
-    NodeId id{kInvalidNode};
-    Mat4 startWorld{};
-    Mat4 invParent{};
-  };
-
   bool planeIntersect(Ray const& ray, Vec3& pointOut) const;
   void applyDelta(Mat4 const& delta);
 
   Scene* scene_{nullptr};
-  std::vector<StartNode> starts_;
+  std::vector<DragStart> starts_;
   GizmoSettings settings_{};
   GizmoHandle handle_{GizmoHandle::Free};
   Quat orientation_{};
@@ -83,6 +98,31 @@ private:
   float value_{0.0F};
   float prevRawAngle_{0.0F};
   float angleOffset_{0.0F};
+  bool active_{false};
+};
+
+// Grab-and-move on the floor plane (VR: hold the trigger on a model and move
+// the controller). The selection follows the controller's world-space motion
+// projected on the ground plane — x/z only; y is untouched, so models stay
+// stuck to the floor. As with GizmoDrag, every update recomputes the
+// cumulative offset from the grab start and applies it to the captured start
+// transforms, so repeated updates cannot accumulate drift.
+class FloorGrab {
+public:
+  bool begin(Scene& scene,
+             std::vector<NodeId> const& selection,
+             Vec3 controllerWorld);
+  void update(Vec3 controllerWorld);
+  void end();
+
+  bool active() const { return active_; }
+  Vec3 offset() const { return offset_; } // cumulative x/z metres (y always 0)
+
+private:
+  Scene* scene_{nullptr};
+  std::vector<DragStart> starts_;
+  Vec3 start_{};
+  Vec3 offset_{};
   bool active_{false};
 };
 

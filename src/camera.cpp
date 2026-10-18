@@ -164,6 +164,22 @@ void cameraLook(Camera& camera, float dYaw, float dPitch) {
   }
 }
 
+void cameraLookPivot(Camera& camera, Vec3 localPoint, float dYaw, float dPitch) {
+  // The turn pivots on `localPoint` (the tracked head for VR), not on the
+  // camera position (the tracking origin): pivoting on the origin swings the
+  // viewer through an arc whenever the head is offset from it. The world
+  // position of a local point is position + basis*local, straight from the
+  // camera basis (the inverse of cameraView) — no matrix inversion needed.
+  auto toWorld = [&camera](Vec3 local) {
+    return camera.position + cameraRight(camera) * local.x + cameraUp(camera) * local.y -
+           cameraForward(camera) * local.z;
+  };
+  Vec3 const worldPivot = toWorld(localPoint);
+  cameraLook(camera, dYaw, dPitch);
+  // Shift the camera so the pivot kept its world position through the turn.
+  camera.position = camera.position + (worldPivot - toWorld(localPoint));
+}
+
 void cameraFly(Camera& camera, Vec3 localMetres) {
   camera.position = camera.position + cameraRight(camera) * localMetres.x +
                     Vec3{0.0F, 1.0F, 0.0F} * localMetres.y +

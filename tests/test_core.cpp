@@ -875,6 +875,55 @@ void testGizmoPlaneHandle() {
   CHECK_NEAR3(scene.worldPosition(node), {0.3F, 0.4F, 0.0F});
 }
 
+void testFloorGrab() {
+  vredit::Scene scene;
+  vredit::NodeId node = scene.create();
+
+  // Horizontal controller motion moves the model 1:1 on the floor...
+  vredit::FloorGrab grab;
+  CHECK(grab.begin(scene, {node}, {10.0F, 1.6F, -4.0F}));
+  CHECK(grab.active());
+  grab.update({10.5F, 1.6F, -3.0F});
+  CHECK_NEAR3(scene.worldPosition(node), {0.5F, 0.0F, 1.0F});
+  CHECK_NEAR3(grab.offset(), {0.5F, 0.0F, 1.0F});
+
+  // ...while vertical motion never lifts it off the floor (y stays 0).
+  grab.update({12.0F, 3.9F, -3.0F});
+  CHECK_NEAR3(scene.worldPosition(node), {2.0F, 0.0F, 1.0F});
+
+  // Drift-free: the transform is recomputed from the start state every
+  // update, so repeated updates cannot accumulate rounding error.
+  for (int i = 0; i < 1000; ++i) {
+    grab.update({12.0F + 0.001F * static_cast<float>(i % 7), 1.6F, -3.0F});
+  }
+  grab.update({12.0F, 1.6F, -3.0F});
+  CHECK_NEAR3(scene.worldPosition(node), {2.0F, 0.0F, 1.0F});
+
+  // Rigid-group semantics: a child of a selected node rides along instead of
+  // receiving the offset twice through the hierarchy.
+  vredit::Scene grouped;
+  vredit::NodeId parent = grouped.create();
+  vredit::NodeId child = grouped.create(parent);
+  vredit::Transform ct;
+  ct.translation = {1.0F, 0.0F, 0.0F};
+  grouped.setLocal(child, ct);
+  vredit::FloorGrab groupGrab;
+  CHECK(groupGrab.begin(grouped, {parent, child}, {0.0F, 0.0F, 0.0F}));
+  groupGrab.update({3.0F, 0.0F, -2.0F});
+  CHECK_NEAR3(grouped.worldPosition(child), {4.0F, 0.0F, -2.0F}); // once, not twice
+
+  // A body press with no movable node is refused and stays inactive.
+  vredit::FloorGrab refused;
+  CHECK(!refused.begin(grouped, {}, {0.0F, 0.0F, 0.0F}));
+  CHECK(!refused.active());
+
+  // End clears the grab; further updates are no-ops.
+  groupGrab.end();
+  CHECK(!groupGrab.active());
+  groupGrab.update({99.0F, 0.0F, 99.0F});
+  CHECK_NEAR3(grouped.worldPosition(child), {4.0F, 0.0F, -2.0F});
+}
+
 void testEpochStructuralChanges() {
   vredit::Scene scene;
   vredit::NodeId p = scene.create();
@@ -962,6 +1011,46 @@ void testCameraManipulation() {
   // Pan: dragging right moves the camera left relative to the world.
   cameraPan(camera, 10.0F, 0.0F, 600.0F);
   CHECK(camera.position.x < 3.0F);
+}
+
+void testCameraLookPivot() {
+  Camera camera;
+  camera.position = {1.0F, 2.0F, 3.0F};
+  camera.yaw = 0.0F;
+  camera.pitch = 0.0F;
+
+  // A turn around a local pivot keeps that pivot's world position fixed —
+  // this is what makes VR smooth-turn spin in place instead of orbiting the
+  // tracking origin (the head is offset from it).
+  Vec3 const pivotLocal{0.4F, -0.2F, -1.5F};
+  Mat4 beforeWorld{};
+  CHECK(vredit::invertAffine(cameraView(camera), beforeWorld));
+  Vec3 const pivotWorld = vredit::transformPoint(beforeWorld, pivotLocal);
+
+  cameraLookPivot(camera, pivotLocal, kHalfPi, 0.0F);
+
+  Mat4 afterWorld{};
+  CHECK(vredit::invertAffine(cameraView(camera), afterWorld));
+  CHECK_NEAR3(vredit::transformPoint(afterWorld, pivotLocal), pivotWorld);
+  // The orientation still turned; only the position compensated.
+  CHECK_NEAR3(cameraForward(camera), {1.0F, 0.0F, 0.0F});
+
+  // With the pivot at the camera origin the compensation is zero: plain look.
+  Camera plain;
+  plain.position = {1.0F, 2.0F, 3.0F};
+  plain.pitch = 0.0F;
+  cameraLookPivot(plain, {0.0F, 0.0F, 0.0F}, kHalfPi, 0.0F);
+  CHECK_NEAR3(plain.position, {1.0F, 2.0F, 3.0F});
+  CHECK_NEAR3(cameraForward(plain), {1.0F, 0.0F, 0.0F});
+
+  // Pitching around the pivot keeps it fixed too.
+  Mat4 midWorld{};
+  CHECK(vredit::invertAffine(cameraView(camera), midWorld));
+  Vec3 const midPivot = vredit::transformPoint(midWorld, pivotLocal);
+  cameraLookPivot(camera, pivotLocal, 0.0F, 0.7F);
+  Mat4 pitchedWorld{};
+  CHECK(vredit::invertAffine(cameraView(camera), pitchedWorld));
+  CHECK_NEAR3(vredit::transformPoint(pitchedWorld, pivotLocal), midPivot);
 }
 
 void testSegmentAndPolygonPicking() {
@@ -1806,9 +1895,11 @@ int main() {
   testGizmoScaleClamp();
   testGizmoBeginFailureClean();
   testGizmoPlaneHandle();
+  testFloorGrab();
   testEpochStructuralChanges();
   testCameraFraming();
   testCameraManipulation();
+  testCameraLookPivot();
   testXrMath();
   testUpscaleToPot();
   testMipChain();

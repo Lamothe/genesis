@@ -58,9 +58,16 @@ cursor, **Shift+LMB** or **Ctrl+LMB** selects a single part. **1**/**G**
 translate, **2**/**R** rotate, **3** scale, **L** world/local space, **Ctrl**
 snap, **Ctrl-Z** undo (cancels a live grab), **Ctrl-Y** / **Ctrl-Shift-Z**
 redo, **Esc** quits. The gizmo sits at the centre of the selection's bounds;
-the selection is tinted and outlined. In VR the trigger selects the whole model
-and grip+trigger selects a single part — grip doubles as the snap/boost
-modifier, mirroring Ctrl's desktop overlap.
+the selection is tinted and outlined.
+
+In VR the trigger selects the whole model and grip+trigger selects a single
+part — grip doubles as the snap/boost modifier, mirroring Ctrl's desktop
+overlap. Pressing the trigger on the model body *grabs* it: hold and move the
+controller to slide the model on the ground plane (1:1 with the hand, never
+lifting off the floor), release to drop it. Aim at a gizmo handle instead for
+precise axis/rotate/scale work. Left stick flies, right stick turns — turning
+pivots on your head, so you spin in place rather than orbiting the tracking
+origin.
 
 ## Design notes
 

@@ -42,6 +42,7 @@ constexpr float kMinEyeHeight = 0.15F;   // the camera never passes below the gr
 constexpr float kWheelMetres = 1.0F;     // metres per wheel notch
 constexpr float kGizmoPixels = 120.0F;
 constexpr float kPickThresholdPx = 8.0F;
+constexpr float kVrPickThresholdPx = 24.0F; // aim rays jitter: 3x the mouse
 constexpr float kSnapTranslate = 0.25F;
 constexpr float kSnapRotate = 0.2617994F; // 15 degrees
 constexpr float kSnapScale = 0.25F;
@@ -55,6 +56,23 @@ void clampAboveGround(Camera& camera) {
 void flyCamera(Camera& camera, Vec3 const& localDelta) {
   cameraFly(camera, localDelta);
   clampAboveGround(camera);
+}
+
+// VR floor clamp: the viewer is the tracked head, not the rig origin (the two
+// differ by the head's offset in tracking space — an origin created while
+// standing can sit above a seated head). Clamp the head to the grid after rig
+// motion; physical head motion is never touched (clamping that would drag the
+// world up under a crouching viewer).
+void clampHeadAboveGround(Camera& rig, Vec3 const& headLocal) {
+  Mat4 rigView = cameraView(rig);
+  Mat4 rigWorld{};
+  if (!invertAffine(rigView, rigWorld)) {
+    return;
+  }
+  Vec3 headWorld = transformPoint(rigWorld, headLocal);
+  if (headWorld.y < kMinEyeHeight) {
+    rig.position.y = rig.position.y + (kMinEyeHeight - headWorld.y);
+  }
 }
 
 void dollyCamera(Camera& camera, float metres) {
@@ -99,6 +117,7 @@ struct App {
   GizmoMode mode{GizmoMode::Translate};
   GizmoSpace space{GizmoSpace::World};
   GizmoDrag drag;
+  FloorGrab grab; // VR: hold the trigger on a model and move the controller
   bool dragging{false};
   bool looking{false};
   bool panning{false};
@@ -421,12 +440,16 @@ bool endDrag(App& app);
 // caller resolves the handle under the pointer (screen-space for the mouse,
 // ray-space for VR); a handle press starts a drag, anything else selects.
 // partSelect (shift/ctrl click, grip+trigger in VR) limits the selection to
-// the single picked part instead of the whole model.
+// the single picked part instead of the whole model. When grabPosition is
+// given (VR controller world position), a body press also starts a floor
+// grab: holding the pointer drags the model on the ground plane 1:1 with the
+// controller, so the whole model is the click target rather than a handle.
 void pointerPress(App& app,
                   Ray const& ray,
                   Vec3 const& viewDir,
                   std::optional<GizmoHandle> handle,
-                  bool partSelect) {
+                  bool partSelect,
+                  std::optional<Vec3> grabPosition = std::nullopt) {
   // A press while a drag is live means its release was never seen (pointer
   // left the window); commit that drag as one undo step before starting over,
   // or its transforms would be silently lost from history.
@@ -455,31 +478,58 @@ void pointerPress(App& app,
   app.selection.clear();
   if (hit.has_value()) {
     app.selection = vredit::expandSelection(app.modelGroups, *hit, partSelect);
+    // VR floor grab: the body IS the move target. Snapshot after begin() (it
+    // captures state, never mutates) so undo restores the pre-grab position.
+    if (grabPosition.has_value() &&
+        app.grab.begin(app.scene, app.selection, *grabPosition)) {
+      app.undo.begin(app.scene.snapshotTransforms());
+    }
   }
 }
 
-void pointerMove(App& app, Ray const& ray) {
+void pointerMove(App& app, Ray const& ray, std::optional<Vec3> grabPosition = std::nullopt) {
+  if (app.grab.active() && grabPosition.has_value()) {
+    app.grab.update(*grabPosition);
+    return;
+  }
   if (app.dragging) {
     app.drag.update(ray);
   }
 }
 
-// Ends an active drag and records it as one undo step (no-op when the drag
-// moved nothing). Shared by release, mode switches and shutdown paths.
+// Ends an active drag (handle or grab) and records it as one undo step (no-op
+// when it moved nothing). Shared by release, mode switches and shutdown paths.
 bool endDrag(App& app) { // returns true when an undo step was recorded
+  bool wasActive = app.grab.active() || app.dragging;
+  app.grab.end();
   if (app.dragging) {
     app.drag.end();
     app.dragging = false;
-    return app.undo.commit(app.scene.snapshotTransforms());
   }
-  return false;
+  return wasActive ? app.undo.commit(app.scene.snapshotTransforms()) : false;
+}
+
+// Cancels an active edit (handle drag or grab) without touching the history:
+// restores its pre-edit transforms and drops the pending undo entry, so both
+// the undo and redo stacks stay exactly as they were. Any undo/redo keypress
+// during a live edit does this and nothing else — going through commit()
+// instead would clear an existing redo branch and make the cancelled edit
+// itself redoable.
+void cancelLiveEdit(App& app) {
+  app.grab.end();
+  app.drag.end();
+  app.dragging = false;
+  app.undo.cancel(app.scene);
 }
 
 void pointerRelease(App& app) {
   endDrag(app);
 }
 
-// Ray-space handle pick for controller pointers (VR).
+// Ray-space handle pick for controller pointers (VR). The threshold is more
+// generous than the mouse's 8 px: an aim ray jitters at distance and the
+// gizmo is small on screen, so a tight tube around each handle is what made
+// the click targets feel unusable in VR.
 std::optional<GizmoHandle> handleUnderRay(App& app, Ray const& ray) {
   Vec3 pivot;
   Quat orientation;
@@ -488,7 +538,7 @@ std::optional<GizmoHandle> handleUnderRay(App& app, Ray const& ray) {
   }
   float size = gizmoSize(app, pivot);
   auto geometry = buildHandleGeometry(app.mode, pivot, orientation, size);
-  return pickHandleByRay(geometry, ray, size * (kPickThresholdPx / kGizmoPixels));
+  return pickHandleByRay(geometry, ray, size * (kVrPickThresholdPx / kGizmoPixels));
 }
 
 void assembleFrame(App& app,
@@ -708,21 +758,11 @@ void handleEvent(App& app,
     // (e.g. Ctrl for snap) must not.
     bool stateChanged = false;
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      // Ctrl-Z during a live grab cancels the grab: restore its pre-drag
-      // state and drop the pending edit, leaving both the undo and redo
-      // stacks exactly as they were. Going through commit()+undo() instead
-      // would clear any existing redo branch and leave the cancelled grab
-      // itself redoable.
-      if (app.dragging && (key->state & XCB_MOD_MASK_SHIFT) == 0U) {
-        app.drag.end();
-        app.dragging = false;
-        app.undo.cancel(app.scene);
+      // Undo/redo during a live edit cancels that edit first and stops there,
+      // leaving both stacks untouched (see cancelLiveEdit).
+      if (app.dragging || app.grab.active()) {
+        cancelLiveEdit(app);
         break;
-      }
-      bool const wasDragging = app.dragging;
-      bool const recorded = endDrag(app);
-      if (wasDragging && !recorded) {
-        break; // unmoved grab: nothing to cancel, history untouched
       }
       bool const redo = (key->state & XCB_MOD_MASK_SHIFT) != 0U;
       if (redo) {
@@ -732,7 +772,10 @@ void handleEvent(App& app,
       }
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      endDrag(app);
+      if (app.dragging || app.grab.active()) {
+        cancelLiveEdit(app);
+        break;
+      }
       app.undo.redo(app.scene);
     } else if (keysym == 0xFF1BU) {
       app.running = false;
@@ -751,7 +794,7 @@ void handleEvent(App& app,
       std::printf("gizmo space: %s\n", app.space == GizmoSpace::World ? "world" : "local");
       stateChanged = true;
     }
-    if (stateChanged && app.dragging) {
+    if (stateChanged && (app.dragging || app.grab.active())) {
       endDrag(app);
     }
     break;
@@ -1201,11 +1244,16 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     dt = dt > 0.1F ? 0.1F : dt;
 
     // Left stick moves/strafes, right stick turns; grip boosts and snaps
-    // (mirroring the desktop Shift-boost / Ctrl-snap modifiers).
+    // (mirroring the desktop Shift-boost / Ctrl-snap modifiers). Turning
+    // pivots on the tracked head, not on the rig position — pivoting on the
+    // origin swung the viewer in an arc ("rotating around a point above my
+    // head") whenever the head sat away from it.
     app.snap = input.gripHeld > 0.5F;
     float speed = kFlySpeed * (app.snap ? kFlyBoost : 1.0F) * dt;
-    flyCamera(rig, {input.moveStick.x * speed, 0.0F, input.moveStick.y * speed});
-    cameraLook(rig, input.turnStick.x * kXrTurnSpeed * dt, input.turnStick.y * kXrTurnSpeed * dt);
+    cameraFly(rig, {input.moveStick.x * speed, 0.0F, input.moveStick.y * speed});
+    clampHeadAboveGround(rig, input.headPosition);
+    cameraLookPivot(rig, input.headPosition, input.turnStick.x * kXrTurnSpeed * dt,
+                    input.turnStick.y * kXrTurnSpeed * dt);
 
     if (input.menuPressed) {
       app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
@@ -1228,14 +1276,17 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
                  normalized(transformVector(rigWorld, input.pointerRay.direction))};
 
     // The right controller's aim ray drives the same state machine as the
-    // mouse; the head pose sizes the gizmo.
+    // mouse; the head pose sizes the gizmo. Passing the controller position
+    // enables the floor grab: pressing the model body (not a handle) selects
+    // it and holding drags it on the ground plane 1:1 with the hand.
     app.camera.position = headWorld;
     if (input.selectPressed) {
       // Grip + trigger selects a single part; trigger alone the whole model.
       bool const partSelect = input.gripHeld > 0.5F;
-      pointerPress(app, worldRay, headForward, handleUnderRay(app, worldRay), partSelect);
+      pointerPress(app, worldRay, headForward, handleUnderRay(app, worldRay), partSelect,
+                   worldRay.origin);
     } else if (input.selectHeld) {
-      pointerMove(app, worldRay);
+      pointerMove(app, worldRay, worldRay.origin);
     }
     if (input.selectReleased) {
       pointerRelease(app);
