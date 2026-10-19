@@ -1105,6 +1105,67 @@ void testCameraManipulation() {
   CHECK(camera.position.x < 3.0F);
 }
 
+void testGravityAlign() {
+  using vredit::gravityAlign;
+  using vredit::Quat;
+  using vredit::quatFromAxisAngle;
+  using vredit::rotate;
+  using vredit::Vec3;
+
+  // A pure roll about the forward axis is removed entirely.
+  Quat const rolled = quatFromAxisAngle({0.0F, 0.0F, -1.0F}, 0.5F);
+  Vec3 const flatUp = rotate(gravityAlign(rolled), {0.0F, 1.0F, 0.0F});
+  CHECK_NEAR(flatUp.x, 0.0F, 1e-5F);
+  CHECK_NEAR(flatUp.y, 1.0F, 1e-5F);
+  CHECK_NEAR(flatUp.z, 0.0F, 1e-5F);
+
+  // A full head orientation (yaw + pitch + roll): the look direction is
+  // preserved EXACTLY (the correction rotates about it) and the result has
+  // no roll — its right axis is horizontal.
+  Quat const head = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 0.7F) *
+                    quatFromAxisAngle({1.0F, 0.0F, 0.0F}, -0.4F) *
+                    quatFromAxisAngle({0.0F, 0.0F, -1.0F}, 0.3F);
+  Quat const aligned = gravityAlign(head);
+  CHECK_NEAR(rotate(aligned, {0.0F, 0.0F, -1.0F}).x, rotate(head, {0.0F, 0.0F, -1.0F}).x, 1e-6F);
+  CHECK_NEAR(rotate(aligned, {0.0F, 0.0F, -1.0F}).y, rotate(head, {0.0F, 0.0F, -1.0F}).y, 1e-6F);
+  CHECK_NEAR(rotate(aligned, {0.0F, 0.0F, -1.0F}).z, rotate(head, {0.0F, 0.0F, -1.0F}).z, 1e-6F);
+  CHECK_NEAR(rotate(aligned, {1.0F, 0.0F, 0.0F}).y, 0.0F, 1e-5F);
+
+  // A zero-roll head is returned unchanged.
+  Quat const level = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 0.7F) *
+                     quatFromAxisAngle({1.0F, 0.0F, 0.0F}, -0.4F);
+  CHECK_NEAR(rotate(gravityAlign(level), {0.0F, 1.0F, 0.0F}).x, rotate(level, {0.0F, 1.0F, 0.0F}).x,
+             1e-6F);
+  CHECK_NEAR(rotate(gravityAlign(level), {0.0F, 1.0F, 0.0F}).y, rotate(level, {0.0F, 1.0F, 0.0F}).y,
+             1e-6F);
+
+  // The shell's composition: the correction preserves the forward exactly and
+  // rigidly rotates eye offsets (length preserved) about the head centre.
+  Quat const correction = aligned * conjugate(normalized(head));
+  Vec3 const offset{0.032F, 0.0F, 0.0F};
+  Vec3 const rotatedOffset = rotate(correction, offset);
+  CHECK_NEAR(dot(rotatedOffset, rotatedOffset), dot(offset, offset), 1e-6F);
+
+  // Idempotent, and a degenerate look direction stays finite.
+  CHECK_NEAR3(rotate(gravityAlign(aligned), {0.0F, 1.0F, 0.0F}),
+              rotate(aligned, {0.0F, 1.0F, 0.0F}));
+  Quat const lookingUp = quatFromAxisAngle({1.0F, 0.0F, 0.0F}, -1.5707964F);
+  Vec3 const v = rotate(gravityAlign(lookingUp), {0.0F, 0.0F, -1.0F});
+  CHECK(std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z));
+
+  // Near vertical the correction fades out (it would act as a yaw and let
+  // tracking noise spin the world): a rolled head 0.5 degrees off vertical
+  // comes back essentially unchanged.
+  Quat const nearVertical =
+      quatFromAxisAngle({1.0F, 0.0F, 0.0F}, -1.5707964F + 0.0087F) *
+      quatFromAxisAngle({0.0F, 0.0F, -1.0F}, 0.3F);
+  Quat const faded = gravityAlign(nearVertical);
+  CHECK_NEAR(rotate(faded, {0.0F, 1.0F, 0.0F}).x, rotate(nearVertical, {0.0F, 1.0F, 0.0F}).x,
+             1e-3F);
+  CHECK_NEAR(rotate(faded, {0.0F, 1.0F, 0.0F}).y, rotate(nearVertical, {0.0F, 1.0F, 0.0F}).y,
+             1e-3F);
+}
+
 void testCameraLookPivot() {
   Camera camera;
   camera.position = {1.0F, 2.0F, 3.0F};
@@ -2040,6 +2101,7 @@ int main() {
   testCameraFraming();
   testCameraManipulation();
   testCameraLookPivot();
+  testGravityAlign();
   testXrMath();
   testUpscaleToPot();
   testMipChain();

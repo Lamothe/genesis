@@ -208,4 +208,32 @@ void cameraPan(Camera& camera, float dPixelX, float dPixelY, float viewportHeigh
                     cameraUp(camera) * (dPixelY * worldPerPixel);
 }
 
+
+Quat gravityAlign(Quat orientation) {
+  Quat const q = normalized(orientation);
+  Vec3 const forward = rotate(q, {0.0F, 0.0F, -1.0F});
+  Vec3 const up = rotate(q, {0.0F, 1.0F, 0.0F});
+  // The gravity-aligned frame: the right axis is horizontal by construction,
+  // so its up is exactly the head's up with the roll removed.
+  Vec3 right = cross(forward, Vec3{0.0F, 1.0F, 0.0F});
+  float const lenSq = dot(right, right);
+  if (lenSq < 1e-12F) {
+    return q; // degenerate (looking straight up/down): no roll to define
+  }
+  right = right * (1.0F / std::sqrt(lenSq));
+  Vec3 const gravityUp = cross(right, forward);
+  // Signed roll of the head: the angle from the gravity-aligned up to the
+  // head's up, about the forward axis. Remove exactly that.
+  float const roll =
+      std::atan2(dot(cross(gravityUp, up), forward), dot(gravityUp, up));
+  // Near straight up/down the roll estimate is amplified by tracking noise and
+  // the correction acts as a world yaw — fade it out over the last degrees.
+  float const vertical = std::abs(forward.y);
+  float fade = 1.0F;
+  if (vertical > 0.985F) { // within ~10 degrees of vertical
+    fade = vertical >= 0.9998F ? 0.0F : (0.9998F - vertical) / (0.9998F - 0.985F);
+  }
+  return quatFromAxisAngle(forward, -roll * fade) * q;
+}
+
 } // namespace vredit

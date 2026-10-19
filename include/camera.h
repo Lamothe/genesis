@@ -38,6 +38,14 @@ Mat4 cameraProjectionFromTangents(float tanLeft, float tanRight, float tanUp, fl
 // (view forward is -Z).
 Mat4 cameraViewFromPose(Vec3 const& position, Quat const& orientation);
 
+// Horizon lock: strip the roll from a tracked head orientation, keeping the
+// look direction exactly where the user points it. Everyone carries a few
+// degrees of physical head roll; composed with turning or a stick pitch it
+// makes the horizon swing ("the viewer is tilted... not level with the ground
+// as they turn"). The correction is a pure rotation about the head's forward
+// axis: forward is preserved exactly and only the roll goes.
+Quat gravityAlign(Quat orientation);
+
 // Ray through a pixel; direction is normalised and points into the scene.
 Ray cameraRay(Camera const& camera, float aspect, Vec2 pixel, Vec2 viewportSize);
 

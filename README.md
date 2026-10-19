@@ -77,8 +77,10 @@ the selection is shown by the warm tint and the gizmo sitting at the
 selection's centre. Left stick flies where you look — point down and fly to
 descend, which is how you adjust your own height; strafing stays level.
 Right stick turns (X) and looks up/down (Y); turning pivots on your head, so
-you spin in place rather than orbiting the tracking origin, and the ground
-stays level with gravity.
+you spin in place rather than orbiting the tracking origin. The view is
+horizon-locked: the head's physical roll is stripped (the look direction is
+kept exactly), so the ground stays level with gravity however you turn, look
+or stick-pitch.
 
 ## Design notes
 

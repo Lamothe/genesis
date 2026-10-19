@@ -67,6 +67,7 @@ struct XrShell::ImplData {
   std::vector<VkImageView> imageViews[2];
   std::uint32_t acquiredIndex[2] = {0, 0};
   XrView views[2];
+  XrView correctedViews[2]; // horizon-locked poses the images are rendered from
   bool haveGoodViews{false}; // views[] holds the last successfully located pair
   XrViewConfigurationView viewConfig[2];
   XrSessionState sessionState{XR_SESSION_STATE_UNKNOWN};
@@ -661,7 +662,9 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   if (input.aimValid[1]) {
     input.pointerRay = input.aimRays[1];
   } else {
-    input.pointerRay = rayFromPose(xr_->views[0].pose); // head gaze fallback
+    // Head gaze fallback: the same horizon-locked eye pose the view is
+    // rendered from, so the drag anchor matches what the user sees.
+    input.pointerRay = rayFromPose(xr_->correctedViews[0].pose);
   }
   return true;
 }
@@ -731,29 +734,48 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     return failFrame(); // no poses ever; nothing to show yet
   }
 
+  // Horizon lock: strip the head's physical roll from both eye poses — one
+  // correction for the pair, applied to the orientations and to the eye
+  // positions around the eye midpoint so the stereo pair stays physically
+  // consistent. The look direction is preserved exactly (the correction
+  // rotates about it), so the horizon stays level while turning or
+  // stick-pitching instead of swinging with the user's head roll.
+  Vec3 const leftEye{xr_->views[0].pose.position.x, xr_->views[0].pose.position.y,
+                     xr_->views[0].pose.position.z};
+  Vec3 const rightEye{xr_->views[1].pose.position.x, xr_->views[1].pose.position.y,
+                      xr_->views[1].pose.position.z};
+  Vec3 const headMid = (leftEye + rightEye) * 0.5F;
+  Quat const rawHead{xr_->views[0].pose.orientation.x, xr_->views[0].pose.orientation.y,
+                     xr_->views[0].pose.orientation.z, xr_->views[0].pose.orientation.w};
+  Quat const correction = gravityAlign(rawHead) * conjugate(normalized(rawHead));
+
   for (int eye = 0; eye < 2; ++eye) {
     XrFovf const& fov = xr_->views[eye].fov;
     Mat4 proj = cameraProjectionFromTangents(std::tan(fov.angleLeft), std::tan(fov.angleRight),
                                              std::tan(fov.angleUp), std::tan(fov.angleDown),
                                              0.05F, 200.0F); // match the desktop camera
     XrPosef const& pose = xr_->views[eye].pose;
-    Mat4 view = cameraViewFromPose(
-        {pose.position.x, pose.position.y, pose.position.z},
-        {pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w});
+    Vec3 const rawPos{pose.position.x, pose.position.y, pose.position.z};
+    Quat const rawOrient{pose.orientation.x, pose.orientation.y, pose.orientation.z,
+                         pose.orientation.w};
+    Vec3 const correctedPos = headMid + rotate(correction, rawPos - headMid);
+    Quat const correctedOrient = correction * rawOrient;
+    // The corrected pair is what the images are rendered from AND what the
+    // compositor must be told in endFrame — the runtime reprojects against
+    // the submitted pose, and a raw/corrected mismatch makes the image swim
+    // exactly while a rolled head moves.
+    xr_->correctedViews[eye].fov = fov;
+    xr_->correctedViews[eye].pose.position = {correctedPos.x, correctedPos.y, correctedPos.z};
+    xr_->correctedViews[eye].pose.orientation = {correctedOrient.x, correctedOrient.y,
+                                                 correctedOrient.z, correctedOrient.w};
+    Mat4 view = cameraViewFromPose(correctedPos, correctedOrient);
     inputOut.eyeViewProj[eye] = mul(proj, view);
   }
 
-  // Head pose: eye midpoint for gizmo sizing, eye-0 orientation for direction.
-  Vec3 leftEye{xr_->views[0].pose.position.x, xr_->views[0].pose.position.y,
-               xr_->views[0].pose.position.z};
-  Vec3 rightEye{xr_->views[1].pose.position.x, xr_->views[1].pose.position.y,
-                xr_->views[1].pose.position.z};
-  inputOut.headPosition = (leftEye + rightEye) * 0.5F;
-  XrPosef const& headPose = xr_->views[0].pose;
-  inputOut.headForward = rotate(
-      Quat{headPose.orientation.x, headPose.orientation.y, headPose.orientation.z,
-           headPose.orientation.w},
-      {0.0F, 0.0F, -1.0F});
+  // Head pose: eye midpoint for gizmo sizing, aligned orientation for the
+  // flight and ray directions (forward is unchanged by the horizon lock).
+  inputOut.headPosition = headMid;
+  inputOut.headForward = rotate(gravityAlign(rawHead), {0.0F, 0.0F, -1.0F});
 
   if (!syncActions(inputOut, static_cast<std::uint64_t>(xr_->frameState.predictedDisplayTime))) {
     ++stats_.actionFail;
@@ -795,7 +817,7 @@ bool XrShell::endFrame() {
   for (int eye = 0; eye < 2; ++eye) {
     projectionViews[eye] =
         xrStruct<XrCompositionLayerProjectionView>(XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW);
-    projectionViews[eye].pose = xr_->views[eye].pose;
+    projectionViews[eye].pose = xr_->correctedViews[eye].pose;
     projectionViews[eye].fov = xr_->views[eye].fov;
     projectionViews[eye].subImage.swapchain = xr_->swapchains[eye];
     projectionViews[eye].subImage.imageRect.offset = {0, 0};
