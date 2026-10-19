@@ -76,17 +76,16 @@ what happens when you press the model itself. The bounding box is not a
 click target: pressing empty space next to a model selects nothing. Handles
 brighten when hovered; the selection is shown by the warm tint and the
 gizmo sitting at the selection's centre. Undo/redo on the controllers: B
-(right) and Y (left) on Touch, trackpad click on Vive; grip + menu toggles
-the backdrop and desktop B does the same — in VR that void is the real world
-(camera passthrough shows through with the models drawn over it), on desktop
-it is a plain black void. There are no flight controls in VR by design:
-passthrough means you walk around the real world with the models placed in
-it, so locomotion is physical — you walk, turn and crouch, and the sticks are
-unused (their output is still logged at session end as controller
-diagnostics). The view is horizon-locked: the head's physical roll is
-stripped (the look direction is kept exactly), so the ground stays level with
-gravity however you move or turn. Desktop keeps its keyboard flight (WASD,
-Q/E, Shift boost) and mouse look for desk debugging.
+(right) and Y (left) on Touch, trackpad click on Vive. Passthrough is the
+DEFAULT view: the real world with the models drawn over it (grip + menu, or
+desktop B, toggles the grid backdrop back). There are no flight controls in
+VR by design: passthrough means you walk around the real world with the
+models placed in it, so locomotion is physical — you walk, turn and crouch,
+and the sticks are unused (their output is still logged at session end as
+controller diagnostics). The view is horizon-locked: the head's physical
+roll is stripped (the look direction is kept exactly), so the ground stays
+level with gravity however you move or turn. Desktop keeps its keyboard
+flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
 
 ## Design notes
 

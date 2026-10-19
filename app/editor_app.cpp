@@ -102,7 +102,7 @@ struct App {
   Camera camera;
   // Backdrop = the ground grid + the tinted clear colour. Toggled off
   // ("show the model without the background"), the scene is a plain void.
-  bool showBackdrop{true};
+  bool showBackdrop{false}; // passthrough/void is the default; B or grip+menu adds the grid
   GizmoMode mode{GizmoMode::Translate};
   GizmoSpace space{GizmoSpace::World};
   GizmoDrag drag;
@@ -585,9 +585,9 @@ void pointerRelease(App& app) {
 
 // "Show the model without the background": the grid goes and the clear
 // becomes a plain void — in VR that void is the real world (alpha 0 lets the
-// passthrough cameras show through), on desktop it is just black.
-void toggleBackdrop(App& app, VkRenderer& renderer, XrShell* shell) {
-  app.showBackdrop = !app.showBackdrop;
+// passthrough cameras show through), on desktop it is just black. This is the
+// DEFAULT state (passthrough first): toggleBackdrop brings the grid back.
+void applyBackdrop(App& app, VkRenderer& renderer, XrShell* shell) {
   if (app.showBackdrop) {
     renderer.setClearColour(0.08F, 0.09F, 0.11F, 1.0F);
     if (shell != nullptr) {
@@ -602,6 +602,11 @@ void toggleBackdrop(App& app, VkRenderer& renderer, XrShell* shell) {
       shell->setPassthrough(transparent);
     }
   }
+}
+
+void toggleBackdrop(App& app, VkRenderer& renderer, XrShell* shell) {
+  app.showBackdrop = !app.showBackdrop;
+  applyBackdrop(app, renderer, shell);
 }
 
 void assembleFrame(App& app,
@@ -1256,6 +1261,8 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     shell.shutdown();
     return 2;
   }
+  // Passthrough is the default view: the real world with models drawn over it.
+  applyBackdrop(app, renderer, &shell);
   if (!modelPaths.empty()) {
     if (!loadModels(app, renderer, modelPaths)) {
       std::printf(smoke ? "SMOKE FAIL: model loading\n" : "model loading failed\n");
@@ -1507,6 +1514,9 @@ int runInteractive(char const* shaderDir, std::vector<char const*> const& modelP
     closeWindow(window);
     return 1;
   }
+  // Passthrough is the default view in VR; on desktop that same state is a
+  // plain void (grip + menu / B toggles the grid backdrop back).
+  applyBackdrop(app, renderer, nullptr);
   if (!modelPaths.empty()) {
     if (!loadModels(app, renderer, modelPaths)) {
       renderer.shutdown();
