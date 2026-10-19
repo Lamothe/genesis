@@ -51,6 +51,13 @@ void main() {
   if (mode > 0.5 && mode < 1.5 && base.a < push.params.z) {
     discard; // AlphaMode::Mask
   }
+  // glTF: OPAQUE ignores texture alpha and kept MASK fragments are opaque;
+  // only BLEND keeps alpha. Without this the layer's passthrough composite
+  // would show the real world through the model wherever the texture has
+  // an alpha channel (and MASK cutouts would render half transparent).
+  if (mode < 1.5) {
+    base.a = 1.0;
+  }
   // State highlight: 1 = selected (warm orange lift that survives textures and
   // lighting), 2 = hovered (cool blue lift, so the target under the pointer is
   // unmistakable before the press).

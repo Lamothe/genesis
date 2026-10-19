@@ -77,7 +77,9 @@ click target: pressing empty space next to a model selects nothing. Handles
 brighten when hovered; the selection is shown by the warm tint and the
 gizmo sitting at the selection's centre. Undo/redo on the controllers: B
 (right) and Y (left) on Touch, trackpad click on Vive; grip + menu toggles
-the backdrop (grid + sky) and desktop B does the same. Left stick flies where you look — point down and fly to
+the backdrop and desktop B does the same — in VR that void is the real world
+(camera passthrough shows through with the models drawn over it), on desktop
+it is a plain black void. Left stick flies where you look — point down and fly to
 descend, which is how you adjust your own height; strafing stays level.
 Right stick turns (X) and looks up/down (Y); turning pivots on your head, so
 you spin in place rather than orbiting the tracking origin. The view is

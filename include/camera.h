@@ -38,6 +38,10 @@ Mat4 cameraProjectionFromTangents(float tanLeft, float tanRight, float tanUp, fl
 // (view forward is -Z).
 Mat4 cameraViewFromPose(Vec3 const& position, Quat const& orientation);
 
+// The camera's orientation as a quaternion, matching cameraForward's basis
+// convention exactly (positive yaw turns toward +X).
+Quat cameraOrientation(Camera const& camera);
+
 // Horizon lock: strip the roll from a tracked head orientation, keeping the
 // look direction exactly where the user points it. Everyone carries a few
 // degrees of physical head roll; composed with turning or a stick pitch it

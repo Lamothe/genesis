@@ -76,6 +76,7 @@ struct VkRenderer::Impl {
 
   // Backdrop void colour (setClearColour).
   float clearR{0.08F};
+  float clearA{1.0F};
   float clearG{0.09F};
   float clearB{0.11F};
 
@@ -607,7 +608,7 @@ struct VkRenderer::Impl {
     colourAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colourAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colourAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colourAttachment.clearValue.color = {{clearR, clearG, clearB, 1.0F}};
+    colourAttachment.clearValue.color = {{clearR, clearG, clearB, clearA}};
 
     VkRenderingAttachmentInfo depthAttachment =
         vkStruct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
@@ -1581,10 +1582,11 @@ bool VkRenderer::resize(std::uint32_t width, std::uint32_t height) {
   g.height = height;
   return g.recreateTargets();
 }
-void VkRenderer::setClearColour(float r, float g, float b) {
+void VkRenderer::setClearColour(float r, float g, float b, float a) {
   impl_->clearR = r;
   impl_->clearG = g;
   impl_->clearB = b;
+  impl_->clearA = a;
 }
 
 

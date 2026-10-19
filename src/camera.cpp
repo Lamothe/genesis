@@ -19,6 +19,16 @@ Vec3 cameraForward(Camera const& camera) {
   return {sy * cp, sp, -cy * cp};
 }
 
+Quat cameraOrientation(Camera const& camera) {
+  // The same basis as cameraForward/cameraView as a quaternion: positive yaw
+  // turns toward +X, so the yaw half-angle is negated. rotate(q, {0,0,-1})
+  // must equal cameraForward — pinned by tests.
+  float const halfYaw = -camera.yaw * 0.5F;
+  float const halfPitch = camera.pitch * 0.5F;
+  return Quat{0.0F, std::sin(halfYaw), 0.0F, std::cos(halfYaw)} *
+         Quat{std::sin(halfPitch), 0.0F, 0.0F, std::cos(halfPitch)};
+}
+
 Vec3 cameraRight(Camera const& camera) {
   return normalized(cross(cameraForward(camera), Vec3{0.0F, 1.0F, 0.0F}));
 }

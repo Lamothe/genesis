@@ -601,13 +601,23 @@ void pointerRelease(App& app) {
 }
 
 // "Show the model without the background": the grid goes and the clear
-// becomes a plain void. Desktop key B; in VR, grip + menu.
-void toggleBackdrop(App& app, VkRenderer& renderer) {
+// becomes a plain void — in VR that void is the real world (alpha 0 lets the
+// passthrough cameras show through), on desktop it is just black.
+void toggleBackdrop(App& app, VkRenderer& renderer, XrShell* shell) {
   app.showBackdrop = !app.showBackdrop;
   if (app.showBackdrop) {
-    renderer.setClearColour(0.08F, 0.09F, 0.11F);
+    renderer.setClearColour(0.08F, 0.09F, 0.11F, 1.0F);
+    if (shell != nullptr) {
+      shell->setPassthrough(false);
+    }
   } else {
-    renderer.setClearColour(0.0F, 0.0F, 0.0F);
+    // Alpha 0 lets the passthrough cameras show through; without runtime
+    // support (or an alpha channel) keep an opaque void instead of black.
+    bool const transparent = shell == nullptr || shell->passthroughSupported();
+    renderer.setClearColour(0.0F, 0.0F, 0.0F, transparent ? 0.0F : 1.0F);
+    if (shell != nullptr) {
+      shell->setPassthrough(transparent);
+    }
   }
 }
 
@@ -866,7 +876,7 @@ void handleEvent(App& app,
       std::printf("gizmo space: %s\n", app.space == GizmoSpace::World ? "world" : "local");
       stateChanged = true;
     } else if (keysym == 'b' || keysym == 'B') {
-      toggleBackdrop(app, renderer);
+      toggleBackdrop(app, renderer, nullptr);
     }
     if (stateChanged && (app.dragging || app.grab.active())) {
       endDrag(app);
@@ -1322,20 +1332,20 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     last = now;
     dt = dt > 0.1F ? 0.1F : dt;
 
-    // Left stick moves/strafes, right stick turns (yaw only); grip boosts and
-    // snaps (mirroring the desktop Shift-boost / Ctrl-snap modifiers). Turning
-    // pivots on the tracked head, not on the rig position — pivoting on the
-    // origin swung the viewer in an arc ("rotating around a point above my
-    // head") whenever the head sat away from it. Stick pitch is deliberately
-    // unbound: pitching the rig tilts the world off gravity and moved the
-    // viewer mid-turn — in VR you look up/down with your head.
+    // Left stick moves/strafes; right stick turns (X = yaw) and looks up/down
+    // (Y = pitch, the classic first-person right stick); grip boosts and
+    // snaps (mirroring the desktop Shift-boost / Ctrl-snap modifiers). Both
+    // turns pivot on the tracked head, not on the rig position — pivoting on
+    // the origin swung the viewer in an arc ("rotating around a point above my
+    // head") whenever the head sat away from it. The rig's pitch is real but
+    // can never roll the world: the composed basis is horizon-locked (runXr).
     app.snap = input.gripHeld > 0.5F;
     float speed = kFlySpeed * (app.snap ? kFlyBoost : 1.0F) * dt;
     // Fly where you LOOK: stick forward follows the head's view direction with
     // its pitch, so looking down + forward descends — the head's look is what
     // adjusts your own height, exactly as pitch + W does on desktop. Strafe
     // stays level. (The rig itself stays gravity-aligned: see runXr.)
-    rig.position = rig.position + cameraFlyLook(rig, input.headForward,
+    rig.position = rig.position + cameraFlyLook(rig, rotate(input.headOrient, {0.0F, 0.0F, -1.0F}),
                                                 {input.moveStick.x * speed, 0.0F,
                                                  input.moveStick.y * speed});
     clampHeadAboveGround(rig, input.headPosition);
@@ -1348,7 +1358,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
 
     if (input.menuPressed) {
       if (input.gripHeld > 0.5F) {
-        toggleBackdrop(app, renderer);
+        toggleBackdrop(app, renderer, &shell);
       } else {
         app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
                    : app.mode == GizmoMode::Rotate  ? GizmoMode::Scale
@@ -1384,7 +1394,8 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
       break;
     }
     Vec3 headWorld = transformPoint(rigWorld, input.headPosition);
-    Vec3 headForward = normalized(transformVector(rigWorld, input.headForward));
+    Vec3 headForward =
+        normalized(transformVector(rigWorld, rotate(input.headOrient, {0.0F, 0.0F, -1.0F})));
     Ray worldRay{transformPoint(rigWorld, input.pointerRay.origin),
                  normalized(transformVector(rigWorld, input.pointerRay.direction))};
 
@@ -1424,8 +1435,18 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     }
 
     bool drew = true;
+    // Compose the rig with the head as ONE basis and horizon-lock the whole:
+    // a pitched rig multiplied by a yawed head view produces phantom roll
+    // (the world tilts as you turn), and the roll has to be stripped from the
+    // composition, not from the parts. One correction serves both eyes so the
+    // stereo pair stays rigid relative to each other.
+    Quat const headTotal = cameraOrientation(rig) * input.headOrient;
+    Quat const horizonLock = gravityAlign(headTotal) * conjugate(normalized(headTotal));
     for (int eye = 0; eye < 2; ++eye) {
-      Mat4 viewProj = mul(input.eyeViewProj[eye], rigView);
+      Vec3 const eyeWorld = transformPoint(rigWorld, input.eyePos[eye]);
+      Quat const totalOrient = horizonLock * (cameraOrientation(rig) * input.eyeOrient[eye]);
+      Mat4 const view = cameraViewFromPose(eyeWorld, totalOrient);
+      Mat4 viewProj = mul(input.eyeProj[eye], view);
       if (!renderer.drawToView(shell.eyeView(eye), shell.eyeImage(eye), viewProj, items,
                                depthLines, overlayLines)) {
         std::printf("[xr] eye draw failed\n");
@@ -1463,6 +1484,9 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
                 "renderFalse %llu (runtime hint ignored)\n",
                 static_cast<unsigned long long>(stats.stalePose),
                 static_cast<unsigned long long>(stats.renderFalse));
+    std::printf("[xr] stick peaks: move X %.2f Y %.2f (strafe/forward), "
+                "turn X %.2f Y %.2f (yaw/pitch) — a 0.00 axis never moved\n",
+                stats.moveXMax, stats.moveYMax, stats.turnXMax, stats.turnYMax);
   }
 
   renderer.shutdown();

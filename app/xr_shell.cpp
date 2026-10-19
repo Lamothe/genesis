@@ -5,6 +5,7 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr_platform.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -130,6 +131,24 @@ XrShell::InitResult XrShell::init() {
   }
   if (!xrOk(result, "xrGetSystem")) {
     return InitResult::Failed;
+  }
+  // Does the runtime composite ALPHA_BLEND frames (passthrough under models)?
+  std::uint32_t blendCount = 0;
+  xrEnumerateEnvironmentBlendModes(xr_->instance, xr_->system,
+                                   XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &blendCount,
+                                   nullptr);
+  if (blendCount > 0U) {
+    std::vector<XrEnvironmentBlendMode> blendModes(blendCount);
+    xrEnumerateEnvironmentBlendModes(xr_->instance, xr_->system,
+                                     XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, blendCount,
+                                     &blendCount, blendModes.data());
+    for (XrEnvironmentBlendMode mode : blendModes) {
+      if (mode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND) {
+        alphaBlendSupported_ = true;
+      }
+    }
+    std::printf("[xr] blend modes: %u (%s)\n", blendCount,
+                alphaBlendSupported_ ? "alpha-blend supported" : "opaque only");
   }
 
   // Enable2 entry points.
@@ -499,9 +518,26 @@ bool XrShell::createSwapchains() {
     }
   }
   if (!found && !formats.empty()) {
-    swapchainFormat_ = static_cast<VkFormat>(formats[0]);
-    std::printf("[xr] using runtime-preferred format %d\n",
-                static_cast<int>(swapchainFormat_));
+    // Passthrough composites through the alpha channel, so prefer a format
+    // that has one; if none does, say so (the alpha-0 clear would be a lie).
+    auto hasAlpha = [](VkFormat f) {
+      return f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB ||
+             f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB ||
+             f == VK_FORMAT_R8G8B8A8_USCALED || f == VK_FORMAT_B8G8R8A8_USCALED;
+    };
+    for (int64_t format : formats) {
+      if (hasAlpha(static_cast<VkFormat>(format))) {
+        swapchainFormat_ = static_cast<VkFormat>(format);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      swapchainFormat_ = static_cast<VkFormat>(formats[0]);
+      std::printf("[xr] runtime-preferred format %d has no alpha channel; "
+                  "passthrough will show black\n",
+                  static_cast<int>(swapchainFormat_));
+    }
   } else if (!found) {
     std::printf("[xr] no swapchain formats reported\n");
     return false;
@@ -631,6 +667,8 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   xrGetActionStateVector2f(xr_->session, &getInfo, &moveState);
   if (moveState.isActive) {
     input.moveStick = {moveState.currentState.x, moveState.currentState.y};
+    stats_.moveXMax = std::max(stats_.moveXMax, std::abs(input.moveStick.x));
+    stats_.moveYMax = std::max(stats_.moveYMax, std::abs(input.moveStick.y));
   }
 
   XrActionStateVector2f turnState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
@@ -639,6 +677,8 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   xrGetActionStateVector2f(xr_->session, &getInfo, &turnState);
   if (turnState.isActive) {
     input.turnStick = {turnState.currentState.x, turnState.currentState.y};
+    stats_.turnXMax = std::max(stats_.turnXMax, std::abs(input.turnStick.x));
+    stats_.turnYMax = std::max(stats_.turnYMax, std::abs(input.turnStick.y));
   }
 
   XrActionStateBoolean menuLeft = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
@@ -802,14 +842,18 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     xr_->correctedViews[eye].pose.position = {correctedPos.x, correctedPos.y, correctedPos.z};
     xr_->correctedViews[eye].pose.orientation = {correctedOrient.x, correctedOrient.y,
                                                  correctedOrient.z, correctedOrient.w};
-    Mat4 view = cameraViewFromPose(correctedPos, correctedOrient);
-    inputOut.eyeViewProj[eye] = mul(proj, view);
+    // Hand the app the composable pieces, not a baked view: the rig (its own
+    // yaw/pitch) must be composed and horizon-locked as a whole, since a
+    // pitched rig multiplied by a yawed head view produces phantom roll.
+    inputOut.eyeProj[eye] = proj;
+    inputOut.eyePos[eye] = correctedPos;
+    inputOut.eyeOrient[eye] = correctedOrient;
   }
 
   // Head pose: eye midpoint for gizmo sizing, aligned orientation for the
   // flight and ray directions (forward is unchanged by the horizon lock).
   inputOut.headPosition = headMid;
-  inputOut.headForward = rotate(gravityAlign(rawHead), {0.0F, 0.0F, -1.0F});
+  inputOut.headOrient = gravityAlign(rawHead);
 
   if (!syncActions(inputOut, static_cast<std::uint64_t>(xr_->frameState.predictedDisplayTime))) {
     ++stats_.actionFail;
@@ -874,9 +918,20 @@ bool XrShell::endFrame() {
   layer.space = xr_->space;
   layer.viewCount = 2;
   layer.views = projectionViews;
+  // Passthrough: alpha-blend the layer over the real world. The clear colour
+  // alpha is 0 in this mode, so empty pixels show the passthrough cameras.
+  bool const alphaBlend = passthrough_ && alphaBlendSupported_;
+  if (passthrough_ && !alphaBlendSupported_ && !passthroughWarned_) {
+    passthroughWarned_ = true;
+    std::printf("[xr] runtime does not support ALPHA_BLEND; passthrough stays off\n");
+  }
+  if (alphaBlend) {
+    layer.layerFlags |= XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+  }
   XrFrameEndInfo endInfo = xrStruct<XrFrameEndInfo>(XR_TYPE_FRAME_END_INFO);
   endInfo.displayTime = xr_->frameState.predictedDisplayTime;
-  endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+  endInfo.environmentBlendMode =
+      alphaBlend ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
   // Layers must outlive the xrEndFrame call below — the runtime reads through
   // endInfo.layers during the call, so the array cannot be scoped to the branch.
   XrCompositionLayerBaseHeader const* layers[] = {

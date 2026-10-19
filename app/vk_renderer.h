@@ -46,7 +46,7 @@ public:
   TextureHandle addTexture(Image const& image, bool repeatU, bool repeatV);
 
   // Clear colour for the next frames (the backdrop void colour).
-  void setClearColour(float r, float g, float b);
+  void setClearColour(float r, float g, float b, float a = 1.0F);
 
   // Renders one frame. Windowed: presents to the swapchain. Offscreen:
   // renders into an internal image available through readback().

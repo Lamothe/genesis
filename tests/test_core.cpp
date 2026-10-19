@@ -1172,6 +1172,32 @@ void testGravityAlign() {
              1e-3F);
   CHECK_NEAR(rotate(faded, {0.0F, 1.0F, 0.0F}).y, rotate(nearVertical, {0.0F, 1.0F, 0.0F}).y,
              1e-3F);
+
+  // Phantom roll: a PITCHED rig composed with a YAWED head produces roll in
+  // the total view even though each part is individually roll-free — that is
+  // what tilted the world as the user turned. The app's fix strips the roll
+  // from the composition (gravityAlign(cameraOrientation(rig) * eyeOrient));
+  // this test pins that the result is level and that the test detects roll.
+  Camera rigCam;
+  rigCam.yaw = 0.8F;
+  rigCam.pitch = 0.5F;
+  Quat const rigQuat = cameraOrientation(rigCam);
+  // cameraOrientation must match cameraForward's convention exactly (a
+  // positive yaw turns toward +X): this is the sign bug the review caught.
+  CHECK_NEAR3(rotate(rigQuat, {0.0F, 0.0F, -1.0F}), cameraForward(rigCam));
+  Quat const headPose = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 1.0F) *
+                        quatFromAxisAngle({1.0F, 0.0F, 0.0F}, 0.2F);
+  Quat const total = rigQuat * headPose;
+  // World up in eye space = the view rotation's first row (column-major
+  // m[0], m[4], m[8]... no: the eye-right row is m[0]/m[4]/m[8]; the
+  // world-up x in eye space is m[4]); roll shows up as a non-zero x there.
+  Mat4 const rolledView = cameraViewFromPose({0.0F, 0.0F, 0.0F}, total);
+  CHECK(std::abs(rolledView.m[4]) > 0.05F); // the un-fixed composition IS rolled
+  Mat4 const levelView = cameraViewFromPose({0.0F, 0.0F, 0.0F}, gravityAlign(total));
+  CHECK_NEAR(levelView.m[4], 0.0F, 1e-4F);  // the fix leaves the horizon level
+  // The look direction is preserved through the lock.
+  CHECK_NEAR3(rotate(gravityAlign(total), {0.0F, 0.0F, -1.0F}),
+              rotate(total, {0.0F, 0.0F, -1.0F}));
 }
 
 void testCameraLookPivot() {
