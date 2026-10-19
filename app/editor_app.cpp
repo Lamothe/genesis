@@ -61,23 +61,6 @@ void flyCamera(Camera& camera, Vec3 const& localDelta) {
   clampAboveGround(camera);
 }
 
-// VR floor clamp: the viewer is the tracked head, not the rig origin (the two
-// differ by the head's offset in tracking space — an origin created while
-// standing can sit above a seated head). Clamp the head to the grid after rig
-// motion; physical head motion is never touched (clamping that would drag the
-// world up under a crouching viewer).
-void clampHeadAboveGround(Camera& rig, Vec3 const& headLocal) {
-  Mat4 rigView = cameraView(rig);
-  Mat4 rigWorld{};
-  if (!invertAffine(rigView, rigWorld)) {
-    return;
-  }
-  Vec3 headWorld = transformPoint(rigWorld, headLocal);
-  if (headWorld.y < kMinEyeHeight) {
-    rig.position.y = rig.position.y + (kMinEyeHeight - headWorld.y);
-  }
-}
-
 void dollyCamera(Camera& camera, float metres) {
   cameraDolly(camera, metres);
   clampAboveGround(camera);
@@ -1302,8 +1285,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
   int skipsInARow = 0;
   double frameMsTotal = 0.0;
   double frameMsMax = 0.0;
-  std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
-  std::chrono::steady_clock::time_point frameStart = last;
+  std::chrono::steady_clock::time_point frameStart = std::chrono::steady_clock::now();
   while (running) {
     XrFrameInput input;
     frameStart = std::chrono::steady_clock::now();
@@ -1327,34 +1309,11 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     }
     skipsInARow = 0;
 
-    auto now = std::chrono::steady_clock::now();
-    float dt = std::chrono::duration<float>(now - last).count();
-    last = now;
-    dt = dt > 0.1F ? 0.1F : dt;
-
-    // Left stick moves/strafes; right stick turns (X = yaw) and looks up/down
-    // (Y = pitch, the classic first-person right stick); grip boosts and
-    // snaps (mirroring the desktop Shift-boost / Ctrl-snap modifiers). Both
-    // turns pivot on the tracked head, not on the rig position — pivoting on
-    // the origin swung the viewer in an arc ("rotating around a point above my
-    // head") whenever the head sat away from it. The rig's pitch is real but
-    // can never roll the world: the composed basis is horizon-locked (runXr).
+    // No flight controls: passthrough means you walk in the real world with
+    // the models placed in it — the sticks' flight/turn bindings were removed
+    // at the user's request ("I can now move in the real world"). Grip is the
+    // gizmo snap modifier.
     app.snap = input.gripHeld > 0.5F;
-    float speed = kFlySpeed * (app.snap ? kFlyBoost : 1.0F) * dt;
-    // Fly where you LOOK: stick forward follows the head's view direction with
-    // its pitch, so looking down + forward descends — the head's look is what
-    // adjusts your own height, exactly as pitch + W does on desktop. Strafe
-    // stays level. (The rig itself stays gravity-aligned: see runXr.)
-    rig.position = rig.position + cameraFlyLook(rig, rotate(input.headOrient, {0.0F, 0.0F, -1.0F}),
-                                                {input.moveStick.x * speed, 0.0F,
-                                                 input.moveStick.y * speed});
-    clampHeadAboveGround(rig, input.headPosition);
-    // Right stick: X turns (yaw), Y looks up/down (pitch) — the classic
-    // first-person right stick. Both pivot on the tracked head, and the FPS
-    // basis keeps the horizon level (cameraRight is horizontal by
-    // construction), so pitch can never roll the world off level.
-    cameraLookPivot(rig, input.headPosition, input.turnStick.x * kXrTurnSpeed * dt,
-                    input.turnStick.y * kXrTurnSpeed * dt);
 
     if (input.menuPressed) {
       if (input.gripHeld > 0.5F) {
@@ -1484,8 +1443,8 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
                 "renderFalse %llu (runtime hint ignored)\n",
                 static_cast<unsigned long long>(stats.stalePose),
                 static_cast<unsigned long long>(stats.renderFalse));
-    std::printf("[xr] stick peaks: move X %.2f Y %.2f (strafe/forward), "
-                "turn X %.2f Y %.2f (yaw/pitch) — a 0.00 axis never moved\n",
+    std::printf("[xr] controller sticks (unused — you walk in passthrough): "
+                "move X %.2f Y %.2f, turn X %.2f Y %.2f\n",
                 stats.moveXMax, stats.moveYMax, stats.turnXMax, stats.turnYMax);
   }
 
