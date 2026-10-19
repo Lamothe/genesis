@@ -23,6 +23,8 @@ struct XrFrameInput {
   bool selectPressed{false};
   bool selectReleased{false};
   bool menuPressed{false};
+  bool undoPressed{false}; // right stick click: undo
+  bool redoPressed{false}; // left stick click: redo
   float gripHeld{0.0F};
 };
 

@@ -41,8 +41,10 @@ struct PickCandidate {
 // object visible in front of a larger one behind it wins even when the larger
 // one's bounding box is entered first (box entry distance is not surface
 // distance — that mismatch is what made selection feel wrong). Candidates
-// without geometry fall back to their bounds entry, which is exact for
-// box-shaped meshes such as the built-in cube.
+// without geometry are box-shaped ("the bounds are the shape"): they pick at
+// their bounds entry, exact for the built-in cube. A candidate WITH geometry
+// that the ray misses is no hit at all — the bounding box is not part of the
+// click target, so empty space next to a model selects nothing.
 std::optional<PickHit> pickClosestSurface(Ray const& ray,
                                           std::vector<PickCandidate> const& candidates);
 

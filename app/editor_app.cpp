@@ -117,15 +117,16 @@ struct App {
   std::uint32_t nextModelGroup{1};
   UndoHistory undo;
   Camera camera;
+  // Backdrop = the ground grid + the tinted clear colour. Toggled off
+  // ("show the model without the background"), the scene is a plain void.
+  bool showBackdrop{true};
   GizmoMode mode{GizmoMode::Translate};
   GizmoSpace space{GizmoSpace::World};
   GizmoDrag drag;
   FloorGrab grab; // VR: hold the trigger on a model and move the controller
   bool dragging{false};
-  // Per-frame pointer hover: what a press would act on (resolvePointerTarget).
-  // The hovered model group lights up cool and the hovered handle brightens,
-  // so what you see highlighted is what a press will grab.
-  std::vector<NodeId> hoverIds;
+  // Per-frame pointer hover: the hovered gizmo HANDLE brightens (model hover
+  // tints were explicitly rejected: the only model tint is on the selection).
   std::optional<GizmoHandle> hoverHandle;
   bool looking{false};
   bool panning{false};
@@ -377,14 +378,13 @@ float gizmoSize(App& app, Vec3 pivot) {
   return size;
 }
 
-// Body pick for a pointer ray: exact surface first (closest surface still wins
-// through gaps), falling back to the bounding box — thin geometry like hair
-// cards is easy to miss with a bare ray and "the click targets were too
-// small" is exactly that experience. Returns the hit with its along-ray
-// distance so callers can depth-order bodies against gizmo handles.
+// Body pick for a pointer ray: exact surface only (closest surface still wins
+// through gaps). The bounding box is not a click target — a ray that misses
+// the triangles hits nothing, so empty space never selects a model. Returns
+// the hit with its along-ray distance so callers can depth-order bodies
+// against gizmo handles.
 std::optional<vredit::PickHit> pickNode(App& app, Ray const& ray) {
   std::vector<vredit::PickCandidate> candidates;
-  std::vector<std::pair<NodeId, Aabb>> boxes;
   for (NodeVisual const& visual : app.visuals) {
     Mat4 world = app.scene.world(visual.id);
     Aabb box{};
@@ -410,13 +410,11 @@ std::optional<vredit::PickHit> pickNode(App& app, Ray const& ray) {
     candidate.world = world;
     candidate.geometry = visual.pickGeometry;
     candidates.push_back(std::move(candidate));
-    boxes.emplace_back(visual.id, box);
   }
-  auto hit = vredit::pickClosestSurface(ray, candidates);
-  if (hit.has_value()) {
-    return hit;
-  }
-  return vredit::pickClosest(ray, boxes); // generous fallback: the whole box
+  // The bounding box is NOT a click target: a press on empty space must
+  // select nothing, even inside a model's bounds (a generous box fallback
+  // made "click the air next to her" select the model).
+  return vredit::pickClosestSurface(ray, candidates);
 }
 
 // Cheap bounds-only body pick (per-frame hover feedback).
@@ -465,10 +463,10 @@ PointerTarget resolvePointerTarget(App& app, Ray const& ray, float thresholdPx) 
   return target;
 }
 
-// Refresh the per-frame hover state (what a press would act on). Suppressed
-// during a live drag so the highlight does not chase the pointer mid-edit.
+// Refresh the per-frame hover state (the hovered gizmo handle brightens).
+// Suppressed during a live drag so the highlight does not chase the pointer
+// mid-edit. Model hover tints were explicitly rejected.
 void updateHover(App& app, Ray const& ray, float thresholdPx, bool partSelect) {
-  app.hoverIds.clear();
   app.hoverHandle.reset();
   if (app.dragging || app.grab.active()) {
     return;
@@ -476,9 +474,8 @@ void updateHover(App& app, Ray const& ray, float thresholdPx, bool partSelect) {
   PointerTarget target = resolvePointerTarget(app, ray, thresholdPx);
   if (target.handle.has_value()) {
     app.hoverHandle = target.handle;
-  } else if (target.node != kInvalidNode) {
-    // Light exactly what a press would select with the current modifier.
-    app.hoverIds = vredit::expandSelection(app.modelGroups, target.node, partSelect);
+  } else {
+    (void)partSelect; // models are not highlighted on hover
   }
 }
 
@@ -603,18 +600,28 @@ void pointerRelease(App& app) {
   app.lastReleaseTime = std::chrono::steady_clock::now();
 }
 
+// "Show the model without the background": the grid goes and the clear
+// becomes a plain void. Desktop key B; in VR, grip + menu.
+void toggleBackdrop(App& app, VkRenderer& renderer) {
+  app.showBackdrop = !app.showBackdrop;
+  if (app.showBackdrop) {
+    renderer.setClearColour(0.08F, 0.09F, 0.11F);
+  } else {
+    renderer.setClearColour(0.0F, 0.0F, 0.0F);
+  }
+}
+
 void assembleFrame(App& app,
                     std::vector<DrawItem>& items,
                     std::vector<RendererVertex>& depthLines,
                     std::vector<RendererVertex>& overlayLines) {
-  appendGrid(depthLines, 8.0F, 1.0F);
+  if (app.showBackdrop) {
+    appendGrid(depthLines, 8.0F, 1.0F);
+  }
   auto isSelected = [&app](NodeId id) {
     return std::find(app.selection.begin(), app.selection.end(), id) != app.selection.end();
   };
-  auto isHovered = [&app](NodeId id) {
-    return std::find(app.hoverIds.begin(), app.hoverIds.end(), id) != app.hoverIds.end();
-  };
-  auto appendItem = [&app, &items, &isSelected, &isHovered](NodeVisual const& visual) {
+  auto appendItem = [&app, &items, &isSelected](NodeVisual const& visual) {
     DrawItem item;
     item.mesh = visual.mesh;
     item.texture = visual.texture;
@@ -858,6 +865,8 @@ void handleEvent(App& app,
       app.space = (app.space == GizmoSpace::World) ? GizmoSpace::Local : GizmoSpace::World;
       std::printf("gizmo space: %s\n", app.space == GizmoSpace::World ? "world" : "local");
       stateChanged = true;
+    } else if (keysym == 'b' || keysym == 'B') {
+      toggleBackdrop(app, renderer);
     }
     if (stateChanged && (app.dragging || app.grab.active())) {
       endDrag(app);
@@ -1338,10 +1347,32 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
                     input.turnStick.y * kXrTurnSpeed * dt);
 
     if (input.menuPressed) {
-      app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
-                 : app.mode == GizmoMode::Rotate  ? GizmoMode::Scale
-                                                  : GizmoMode::Translate;
-      endDrag(app);
+      if (input.gripHeld > 0.5F) {
+        toggleBackdrop(app, renderer);
+      } else {
+        app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
+                   : app.mode == GizmoMode::Rotate  ? GizmoMode::Scale
+                                                    : GizmoMode::Translate;
+        endDrag(app);
+      }
+    }
+    bool cancelledLiveEdit = false;
+    if (input.undoPressed) {
+      if (app.dragging || app.grab.active()) {
+        cancelLiveEdit(app);
+        cancelledLiveEdit = true;
+      } else {
+        app.undo.undo(app.scene);
+      }
+    }
+    // Same guard as the desktop keys: one cancel per frame leaves both stacks
+    // untouched even if both arrive together.
+    if (input.redoPressed && !cancelledLiveEdit) {
+      if (app.dragging || app.grab.active()) {
+        cancelLiveEdit(app);
+      } else {
+        app.undo.redo(app.scene);
+      }
     }
 
     // Head and pointer in world space (rig-transformed).
@@ -1597,7 +1628,11 @@ int main(int argc, char** argv) {
       std::printf(
           "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR]\n"
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
-          "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n");
+          "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n"
+          "keys: WASD/QE fly (RMB look), 1/2/3 move/rotate/scale, L space,\n"
+          "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
+          "vr:   trigger select then move, grip+trigger part, B/Y undo/redo,\n"
+          "      grip+menu backdrop, menu gizmo mode, sticks fly/turn/look\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);

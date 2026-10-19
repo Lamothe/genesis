@@ -45,6 +45,9 @@ public:
   // fallback). Up to 32 textures; safe to call at any time.
   TextureHandle addTexture(Image const& image, bool repeatU, bool repeatV);
 
+  // Clear colour for the next frames (the backdrop void colour).
+  void setClearColour(float r, float g, float b);
+
   // Renders one frame. Windowed: presents to the swapchain. Offscreen:
   // renders into an internal image available through readback().
   bool draw(Camera const& camera,

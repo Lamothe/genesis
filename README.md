@@ -72,9 +72,12 @@ change the selection — it can never move anything — and a re-press within
 100 ms of a release is treated as a controller bounce, not a second click.
 Aim at a gizmo handle instead for precise axis/rotate/scale work — a handle
 wins only where it is nearer than the model surface, so grabbing the body is
-what happens when you press the model itself. Handles brighten when hovered;
-the selection is shown by the warm tint and the gizmo sitting at the
-selection's centre. Left stick flies where you look — point down and fly to
+what happens when you press the model itself. The bounding box is not a
+click target: pressing empty space next to a model selects nothing. Handles
+brighten when hovered; the selection is shown by the warm tint and the
+gizmo sitting at the selection's centre. Undo/redo on the controllers: B
+(right) and Y (left) on Touch, trackpad click on Vive; grip + menu toggles
+the backdrop (grid + sky) and desktop B does the same. Left stick flies where you look — point down and fly to
 descend, which is how you adjust your own height; strafing stays level.
 Right stick turns (X) and looks up/down (Y); turning pivots on your head, so
 you spin in place rather than orbiting the tracking origin. The view is

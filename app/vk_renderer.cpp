@@ -74,6 +74,11 @@ struct VkRenderer::Impl {
     std::uint32_t indexCount{0};
   };
 
+  // Backdrop void colour (setClearColour).
+  float clearR{0.08F};
+  float clearG{0.09F};
+  float clearB{0.11F};
+
   bool windowed{false};
   bool external{false}; // caller-owned instance/device (XR path)
   std::uint32_t width{0};
@@ -602,7 +607,7 @@ struct VkRenderer::Impl {
     colourAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colourAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colourAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colourAttachment.clearValue.color = {{0.08F, 0.09F, 0.11F, 1.0F}};
+    colourAttachment.clearValue.color = {{clearR, clearG, clearB, 1.0F}};
 
     VkRenderingAttachmentInfo depthAttachment =
         vkStruct<VkRenderingAttachmentInfo>(VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO);
@@ -1576,6 +1581,12 @@ bool VkRenderer::resize(std::uint32_t width, std::uint32_t height) {
   g.height = height;
   return g.recreateTargets();
 }
+void VkRenderer::setClearColour(float r, float g, float b) {
+  impl_->clearR = r;
+  impl_->clearG = g;
+  impl_->clearB = b;
+}
+
 
 bool VkRenderer::draw(Camera const& camera,
                       std::vector<DrawItem> const& items,

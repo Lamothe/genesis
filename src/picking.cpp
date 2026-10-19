@@ -99,6 +99,9 @@ std::optional<PickHit> pickClosestSurface(Ray const& ray,
     }
     if (!candidate.geometry || candidate.geometry->positions.empty() ||
         candidate.geometry->indices.size() < 3U) {
+      // Box-shaped contract: null geometry means "the bounds ARE the shape"
+      // (demo cubes), and clicking a visible cube face must select it. The
+      // empty-space fix is at the call site: no surface-miss bounds fallback.
       if (!best.has_value() || boundT < best->t) {
         best = PickHit{candidate.node, boundT, ray.origin + ray.direction * boundT};
       }

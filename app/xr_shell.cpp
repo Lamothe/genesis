@@ -59,6 +59,8 @@ struct XrShell::ImplData {
   XrAction moveAction{XR_NULL_HANDLE};
   XrAction turnAction{XR_NULL_HANDLE};
   XrAction menuAction{XR_NULL_HANDLE};
+  XrAction undoAction{XR_NULL_HANDLE}; // right stick click
+  XrAction redoAction{XR_NULL_HANDLE}; // left stick click
   XrAction gripAction{XR_NULL_HANDLE};
   XrAction aimAction{XR_NULL_HANDLE};
   XrSpace aimSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE}; // left, right
@@ -79,6 +81,10 @@ struct XrShell::ImplData {
   XrFrameState frameState{};
   bool selectPrev{false};
   bool menuPrev{false};
+  bool undoPrev{false};
+  bool redoPrev{false};
+  bool undoPending{false}; // latched until a frame renders and consumes it
+  bool redoPending{false};
 
   // XR_KHR_vulkan_enable2 entry points.
   PFN_xrCreateVulkanInstanceKHR pfnCreateVulkanInstance{nullptr};
@@ -373,6 +379,7 @@ bool XrShell::createActions() {
 
   if (!makeFloat("trigger", &xr_->triggerAction) || !makeVec2("move", &xr_->moveAction) ||
       !makeVec2("turn", &xr_->turnAction) || !makeBool("menu", &xr_->menuAction) ||
+      !makeBool("undo", &xr_->undoAction) || !makeBool("redo", &xr_->redoAction) ||
       !makeFloat("grip", &xr_->gripAction) || !makePose("aim", &xr_->aimAction)) {
     return false;
   }
@@ -390,7 +397,7 @@ bool XrShell::createActions() {
         {"/user/hand/right/input/menu/click", xr_->menuAction},
         {"/user/hand/left/input/menu/click", xr_->menuAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
-        {"/user/hand/left/input/aim/pose", xr_->aimAction}}},
+        {"/user/hand/left/input/aim/pose", xr_->aimAction}}}, // no thumbstick on this profile
       {"/interaction_profiles/oculus/touch_controller",
        {{"/user/hand/right/input/trigger/value", xr_->triggerAction},
         {"/user/hand/left/input/trigger/value", xr_->triggerAction},
@@ -400,7 +407,11 @@ bool XrShell::createActions() {
         {"/user/hand/right/input/squeeze/value", xr_->gripAction},
         {"/user/hand/left/input/squeeze/value", xr_->gripAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
-        {"/user/hand/left/input/aim/pose", xr_->aimAction}}},
+        {"/user/hand/left/input/aim/pose", xr_->aimAction},
+        // Undo/redo on the face buttons, NOT the stick clicks: clicking the
+        // locomotion stick mid-stride is a natural accident.
+        {"/user/hand/right/input/b/click", xr_->undoAction},
+        {"/user/hand/left/input/y/click", xr_->redoAction}}},
       {"/interaction_profiles/htc/vive_controller",
        {{"/user/hand/right/input/trigger/click", xr_->triggerAction},
         {"/user/hand/left/input/trigger/click", xr_->triggerAction},
@@ -411,7 +422,9 @@ bool XrShell::createActions() {
         {"/user/hand/right/input/squeeze/click", xr_->gripAction},
         {"/user/hand/left/input/squeeze/click", xr_->gripAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
-        {"/user/hand/left/input/aim/pose", xr_->aimAction}}},
+        {"/user/hand/left/input/aim/pose", xr_->aimAction},
+        {"/user/hand/right/input/trackpad/click", xr_->undoAction},
+        {"/user/hand/left/input/trackpad/click", xr_->redoAction}}},
   };
 
   for (Binding const& binding : bindings) {
@@ -640,6 +653,27 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   input.menuPressed = menuNow && !xr_->menuPrev;
   xr_->menuPrev = menuNow;
 
+  // Undo/redo: face buttons on Touch (B = undo, Y = redo), trackpad click on
+  // Vive. The press is latched until a frame actually renders, so a
+  // skipped/acquire-failed frame cannot swallow it, and an inactive action
+  // keeps its previous state rather than manufacturing a new edge.
+  XrActionStateBoolean undoState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
+  getInfo.action = xr_->undoAction;
+  getInfo.subactionPath = rightPath;
+  xrGetActionStateBoolean(xr_->session, &getInfo, &undoState);
+  bool undoNow = undoState.isActive ? undoState.currentState : xr_->undoPrev;
+  xr_->undoPending = xr_->undoPending || (undoNow && !xr_->undoPrev);
+  xr_->undoPrev = undoNow;
+  XrActionStateBoolean redoState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
+  getInfo.action = xr_->redoAction;
+  getInfo.subactionPath = leftPath;
+  xrGetActionStateBoolean(xr_->session, &getInfo, &redoState);
+  bool redoNow = redoState.isActive ? redoState.currentState : xr_->redoPrev;
+  xr_->redoPending = xr_->redoPending || (redoNow && !xr_->redoPrev);
+  xr_->redoPrev = redoNow;
+  input.undoPressed = xr_->undoPending;
+  input.redoPressed = xr_->redoPending;
+
   XrActionStateFloat gripState = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
   getInfo.action = xr_->gripAction;
   getInfo.subactionPath = rightPath;
@@ -805,6 +839,10 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     }
   }
   xr_->frameReady = true;
+  // The app consumes this frame's undo/redo presses now; a later skip must
+  // not swallow a fresh press or replay this one.
+  xr_->undoPending = false;
+  xr_->redoPending = false;
   return FrameStatus::Render;
 }
 

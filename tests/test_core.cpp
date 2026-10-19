@@ -314,7 +314,8 @@ void testPickClosestSurface() {
   CHECK(hit2.has_value());
   CHECK(hit2->node == 2);
 
-  // A box-shaped candidate (no geometry) still picks at its bounds entry.
+  // A box-shaped candidate (null geometry = "the bounds are the shape") still
+  // picks at its bounds entry: clicking a visible cube face must select it.
   vredit::PickCandidate boxOnly;
   boxOnly.node = 3;
   boxOnly.worldBounds = {{-0.5F, -0.5F, 2.0F}, {0.5F, 0.5F, 3.0F}};
@@ -323,6 +324,13 @@ void testPickClosestSurface() {
   CHECK(hit3.has_value());
   CHECK(hit3->node == 3); // bounds entry t=2 beats the large surface at t=8
   CHECK_NEAR(hit3->t, 2.0F, 1e-5F);
+
+  // But a mesh candidate whose triangles the ray misses is NOT a hit even
+  // though the ray passes through its bounds: the bounding box is not part
+  // of the click target, so empty space next to a model selects nothing.
+  std::vector<vredit::PickCandidate> meshOnly{large};
+  vredit::Ray missRay{{3.0F, 3.0F, 0.0F}, {0.0F, 0.0F, 1.0F}}; // inside the bounds, off-triangle
+  CHECK(!vredit::pickClosestSurface(missRay, meshOnly).has_value());
 
   // Ray misses every surface inside the large box: empty volume must not pick.
   vredit::Ray offSide{{0.0F, 0.0F, 0.0F}, {0.0F, 1.0F, 1.0F}};
