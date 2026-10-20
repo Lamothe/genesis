@@ -60,9 +60,13 @@ void main() {
   }
   // State highlight: 1 = selected (warm orange lift that survives textures and
   // lighting), 2 = hovered (cool blue lift, so the target under the pointer is
-  // unmistakable before the press).
+  // unmistakable before the press), 3..4 = delete charge (red ramp: 3.0 means
+  // charge 0, 4.0 means "about to delete").
   float highlight = push.normalParams.w;
-  if (highlight > 1.5) {
+  if (highlight > 2.5) {
+    float charge = clamp(highlight - 3.0, 0.0, 1.0);
+    base.rgb = mix(base.rgb, vec3(1.0, 0.12, 0.08), 0.30 + 0.45 * charge);
+  } else if (highlight > 1.5) {
     base.rgb = mix(base.rgb, vec3(0.45, 0.80, 1.0), 0.35) + vec3(0.02, 0.08, 0.16);
   } else {
     base.rgb = mix(base.rgb, vec3(1.0, 0.62, 0.22), 0.35 * highlight) +

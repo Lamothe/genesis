@@ -131,22 +131,78 @@ Vec3 Scene::worldPosition(NodeId id) {
   return transformPoint(world(id), Vec3{});
 }
 
-SceneSnapshot Scene::snapshotTransforms() const {
+SceneSnapshot Scene::snapshot() const {
   SceneSnapshot snapshot;
-  for (NodeId id = 1; id < slots_.size(); ++id) {
+  for (NodeId id = 1; id < static_cast<NodeId>(slots_.size()); ++id) {
     if (slots_[id].alive) {
-      snapshot.transforms.emplace_back(id, slots_[id].local);
+      snapshot.nodes.push_back(NodeRecord{id, slots_[id].parent, slots_[id].local});
     }
   }
   return snapshot;
 }
 
-void Scene::restoreTransforms(SceneSnapshot const& snapshot) {
-  for (auto const& entry : snapshot.transforms) {
-    if (valid(entry.first)) {
-      setLocal(entry.first, entry.second);
+void Scene::restore(SceneSnapshot const& snapshot) {
+  // Dedupe by id (first wins) and find the largest id to restore.
+  std::vector<NodeRecord> records = snapshot.nodes;
+  std::sort(records.begin(), records.end(),
+            [](NodeRecord const& a, NodeRecord const& b) { return a.id < b.id; });
+  records.erase(std::unique(records.begin(), records.end(),
+                            [](NodeRecord const& a, NodeRecord const& b) {
+                              return a.id == b.id;
+                            }),
+                records.end());
+  NodeId maxId = 0;
+  for (NodeRecord const& record : records) {
+    if (record.id != kInvalidNode && record.id > maxId) {
+      maxId = record.id;
     }
   }
+  if (static_cast<std::size_t>(maxId) + 1U > slots_.size()) {
+    slots_.resize(static_cast<std::size_t>(maxId) + 1U);
+  }
+  std::vector<bool> keep(slots_.size(), false);
+  for (NodeRecord const& record : records) {
+    if (record.id != kInvalidNode) {
+      keep[record.id] = true;
+    }
+  }
+  // Nodes created since the snapshot go away.
+  for (NodeId id = 1; id < static_cast<NodeId>(slots_.size()); ++id) {
+    if (slots_[id].alive && !keep[id]) {
+      slots_[id].alive = false;
+    }
+  }
+  // Revive or create the recorded nodes in place: tombstones are reused at
+  // their original ids (safe — create() never recycles an id), and world
+  // caches are dropped wholesale below.
+  for (NodeRecord const& record : records) {
+    if (record.id == kInvalidNode) {
+      continue;
+    }
+    Slot& slot = slots_[record.id];
+    slot.alive = true;
+    slot.local = record.local;
+    slot.worldDirty = true;
+    slot.children.clear();
+    slot.parent = kInvalidNode;
+  }
+  // Rebuild parent links and children lists wholesale from the records; a
+  // record whose parent is not part of the snapshot is detached to root.
+  for (NodeRecord const& record : records) {
+    if (record.id == kInvalidNode) {
+      continue;
+    }
+    NodeId parent = record.parent;
+    if (parent != kInvalidNode &&
+        (parent >= static_cast<NodeId>(slots_.size()) || !slots_[parent].alive)) {
+      parent = kInvalidNode;
+    }
+    slots_[record.id].parent = parent;
+    if (parent != kInvalidNode) {
+      slots_[parent].children.push_back(record.id);
+    }
+  }
+  ++epoch_;
 }
 
 void Scene::markSubtreeDirty(NodeId id) {

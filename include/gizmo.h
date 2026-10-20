@@ -43,7 +43,7 @@ struct DragStart {
 // receiving the delta twice through the hierarchy. Nodes whose parent chain
 // is singular (a zero-scale ancestor) are skipped — their descendants inherit
 // the same singular chain, so nothing moves instead of half-transforming.
-// Shared by GizmoDrag and FloorGrab.
+// Shared by GizmoDrag and the stick-driven move/rotate helpers.
 void captureDragStarts(Scene& scene,
                        std::vector<NodeId> const& selection,
                        std::vector<DragStart>& out);
@@ -98,34 +98,6 @@ private:
   float value_{0.0F};
   float prevRawAngle_{0.0F};
   float angleOffset_{0.0F};
-  bool active_{false};
-};
-
-// Grab-and-move on the floor plane (VR: hold the trigger on a model and point
-// where it should go). The selection follows the AIM POINT — the point where
-// the controller's aim beam meets the floor, clamped to 12 m — so pointing at
-// a spot places the model there ("based on the controllers movements")
-// instead of dragging it with arm travel. The offset is horizontal only, so
-// models stay stuck to the floor. As with GizmoDrag, every update recomputes
-// the cumulative offset from the grab start and applies it to the captured
-// start transforms, so repeated updates cannot accumulate drift.
-class FloorGrab {
-public:
-  bool begin(Scene& scene,
-             std::vector<NodeId> const& selection,
-             Vec3 controllerWorld,
-             Vec3 aimDirection);
-  void update(Vec3 controllerWorld, Vec3 aimDirection);
-  void end();
-
-  bool active() const { return active_; }
-  Vec3 offset() const { return offset_; } // cumulative x/z metres (y always 0)
-
-private:
-  Scene* scene_{nullptr};
-  std::vector<DragStart> starts_;
-  Vec3 anchor_{}; // aim point at grab: the model follows the aim point's motion
-  Vec3 offset_{};
   bool active_{false};
 };
 

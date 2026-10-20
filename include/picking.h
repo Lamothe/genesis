@@ -58,14 +58,4 @@ std::vector<NodeId> expandSelection(std::vector<std::pair<NodeId, std::uint32_t>
                                     NodeId picked,
                                     bool partOnly);
 
-// The two-step move rule: a press starts a grab only when the pressed target
-// resolves to exactly the current selection AND the trigger has been quiet
-// for `debounceSeconds` (a very fast re-press is a controller bounce, not a
-// deliberate second click). Otherwise the press only selects — so a wobbly
-// trigger press can change the selection but can never move anything.
-bool pressGrabs(std::vector<NodeId> const& selection,
-                std::vector<NodeId> const& picked,
-                double secondsSinceLastRelease,
-                double debounceSeconds);
-
 } // namespace vredit

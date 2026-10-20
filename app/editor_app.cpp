@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -21,6 +22,7 @@
 #include "xr_shell.h"
 
 #include "camera.h"
+#include "editor_state.h"
 #include "gizmo.h"
 #include "gltf.h"
 #include "handles.h"
@@ -43,9 +45,15 @@ constexpr float kWheelMetres = 1.0F;     // metres per wheel notch
 constexpr float kGizmoPixels = 120.0F;
 constexpr float kPickThresholdPx = 8.0F;
 constexpr float kVrPickThresholdPx = 24.0F; // aim rays jitter: 3x the mouse
-// A re-press closer than this to the previous release is a controller bounce
-// (Quest triggers are wobbly), not a deliberate second click.
-constexpr double kGrabDebounceSeconds = 0.1;
+// Stick-driven editing rates (VR): the right stick slides the selection, the
+// left stick turns it. Grip held runs both at quarter speed (fine control).
+constexpr float kStickDeadZone = 0.12F; // a gesture STARTS past this deflection
+constexpr float kStickEndZone = 0.06F;  // ...and ENDS below this (hysteresis, so one
+                                        // physical gesture is one undo step)
+constexpr float kStickMoveMps = 1.5F;    // metres per second at full deflection
+constexpr float kStickTurnRadps = 1.75F; // ~100 degrees per second at full
+// Hold-X delete: the delete fires when the hold reaches full charge.
+constexpr double kDeleteChargeS = 0.6;
 constexpr float kSnapTranslate = 0.25F;
 constexpr float kSnapRotate = 0.2617994F; // 15 degrees
 constexpr float kSnapScale = 0.25F;
@@ -71,23 +79,9 @@ void panCamera(Camera& camera, float dx, float dy, float viewportHeight) {
   clampAboveGround(camera);
 }
 
-struct NodeVisual {
-  NodeId id{kInvalidNode};
-  MeshHandle mesh{0};
-  TextureHandle texture{0};
-  TextureHandle normalTexture{0};
-  bool normalMapped{false};
-  float normalScale{1.0F};
-  Aabb localBounds{{-0.5F, -0.5F, -0.5F}, {0.5F, 0.5F, 0.5F}};
-  // Exact picking triangles (node-local); shared between visuals that loaded
-  // the same mesh. Null for box-shaped visuals (demo cubes), where the bounds
-  // are the shape.
-  std::shared_ptr<const vredit::PickGeometry> pickGeometry;
-  Vec3 colour{1.0F, 1.0F, 1.0F};
-  float alphaFactor{1.0F};
-  AlphaMode alpha{AlphaMode::Opaque};
-  float alphaCutoff{0.5F};
-};
+// NodeVisual lives in the core now (include/editor_state.h) so delete/undo
+// state is unit-testable; the app uses it directly.
+using vredit::NodeVisual;
 
 struct App {
   Scene scene;
@@ -98,7 +92,9 @@ struct App {
   // ctrl, or grip+trigger in VR) selects a single part. Group 0 = ungrouped.
   std::vector<std::pair<NodeId, std::uint32_t>> modelGroups;
   std::uint32_t nextModelGroup{1};
-  UndoHistory undo;
+  // Full-state undo: structure + visuals + groups + selection, so spawning and
+  // deleting models are undoable exactly like transform drags.
+  vredit::UndoHistory<vredit::EditorSnapshot> undo;
   Camera camera;
   // Backdrop = the ground grid + the tinted clear colour. Toggled off
   // ("show the model without the background"), the scene is a plain void.
@@ -106,7 +102,6 @@ struct App {
   GizmoMode mode{GizmoMode::Translate};
   GizmoSpace space{GizmoSpace::World};
   GizmoDrag drag;
-  FloorGrab grab; // VR: hold the trigger on a model and move the controller
   bool dragging{false};
   // Per-frame pointer hover: the hovered gizmo HANDLE brightens (model hover
   // tints were explicitly rejected: the only model tint is on the selection).
@@ -116,9 +111,19 @@ struct App {
   bool running{true};
   bool snap{false};
   bool partSelect{false}; // shift/ctrl (desktop) or grip (VR): select one part
-  // For the two-step move rule: a re-press too soon after a release is a
-  // controller bounce (Quest triggers are wobbly), not a second click.
-  std::chrono::steady_clock::time_point lastReleaseTime{};
+  // Model library for spawn-on-the-fly (N on desktop, A in VR): the directory
+  // is rescanned on every spawn, so a file dropped in mid-session is spawnable
+  // without a restart.
+  std::string libraryDir;
+  std::size_t libraryIndex{0};
+  // Stick-driven editing (VR): one undo step per stick gesture — begun on the
+  // first deflection past the dead zone, committed when the sticks settle.
+  bool stickSession{false};
+  // Hold-X delete (VR): the selection's tint ramps red over kDeleteChargeS
+  // and the delete fires at full charge; release before that cancels.
+  bool deleteHolding{false};
+  std::chrono::steady_clock::time_point deleteHoldStart{};
+  float deleteCharge{0.0F};
   // Free-flight state (WASD/QE held keys + Shift boost).
   bool flyForward{false};
   bool flyBack{false};
@@ -204,7 +209,10 @@ std::shared_ptr<const vredit::PickGeometry> makePickGeometry(MeshData const& dat
   return geometry;
 }
 
-bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
+bool addModelToScene(App& app,
+                     VkRenderer& renderer,
+                     Model const& model,
+                     std::vector<NodeId>* rootsOut = nullptr) {
   std::vector<MeshHandle> meshHandles(model.meshes.size(), 0U);
   std::vector<std::shared_ptr<const vredit::PickGeometry>> pickGeometries(model.meshes.size());
   for (std::size_t m = 0; m < model.meshes.size(); ++m) {
@@ -232,6 +240,9 @@ bool addModelToScene(App& app, VkRenderer& renderer, Model const& model) {
     NodeId id = app.scene.create(parent);
     app.scene.setLocal(id, node.local);
     handles[n] = id;
+    if (rootsOut != nullptr && node.parent < 0) {
+      rootsOut->push_back(id); // top-level nodes: the spawn placement roots
+    }
     app.modelGroups.push_back({id, modelGroup}); // one file = one model
     if (node.mesh >= 0 && static_cast<std::size_t>(node.mesh) < model.meshes.size()) {
       ModelMesh const& mesh = model.meshes[static_cast<std::size_t>(node.mesh)];
@@ -451,7 +462,7 @@ PointerTarget resolvePointerTarget(App& app, Ray const& ray, float thresholdPx) 
 // mid-edit. Model hover tints were explicitly rejected.
 void updateHover(App& app, Ray const& ray, float thresholdPx, bool partSelect) {
   app.hoverHandle.reset();
-  if (app.dragging || app.grab.active()) {
+  if (app.dragging || app.stickSession) {
     return;
   }
   PointerTarget target = resolvePointerTarget(app, ray, thresholdPx);
@@ -476,29 +487,37 @@ float snapStepFor(App const& app) {
   }
 }
 
-// Defined below; pointerPress commits any live drag before starting anew.
+// Full editor state for undo/redo: structure + visuals + groups + selection.
+vredit::EditorSnapshot snapshot(App const& app) {
+  return vredit::captureState(app.scene, app.visuals, app.modelGroups, app.selection);
+}
+
+void applySnapshot(App& app, vredit::EditorSnapshot const& state) {
+  vredit::restoreState(state, app.scene, app.visuals, app.modelGroups, app.selection);
+}
+
+// Defined below; pointerPress commits any live edit before starting anew.
 bool endDrag(App& app);
+bool endEdits(App& app);
 
 // Pointer interaction shared by the mouse and the VR controller ray. The
 // caller resolves the handle under the pointer (screen-space for the mouse,
-// ray-space for VR); a handle press starts a drag, anything else selects.
+// ray-space for VR); a handle press starts a drag, anything else SELECTS.
 // partSelect (shift/ctrl click, grip+trigger in VR) limits the selection to
-// the single picked part instead of the whole model. When grabPosition is
-// given (VR controller world position), a SECOND press on the already-
-// selected target starts the floor grab: holding the trigger and pointing
-// moves the model on the ground plane with the aim point. A first press only
-// selects (the two-step move rule — see pressGrabs), so an accidental
-// trigger press can never move anything.
+// the single picked part instead of the whole model. A body press never moves
+// anything — movement and rotation are the sticks' job in VR (controller aim
+// is too jittery for accurate placement) and the gizmo's job on desktop.
 void pointerPress(App& app,
                   Ray const& ray,
                   Vec3 const& viewDir,
                   PointerTarget const& target,
-                  bool partSelect,
-                  std::optional<Vec3> grabPosition = std::nullopt) {
-  // A press while a drag is live means its release was never seen (pointer
-  // left the window); commit that drag as one undo step before starting over,
-  // or its transforms would be silently lost from history.
-  endDrag(app);
+                  bool partSelect) {
+  // A press while a live edit is running means its release was never seen
+  // (pointer left the window) or a stick gesture is mid-flight: commit it as
+  // one undo step before starting over. endEdits covers BOTH engines (drag
+  // and stick) — ending only the drag here left the stick session fused with
+  // the drag, clobbering transforms and losing movement from history.
+  endEdits(app);
   if (target.handle.has_value()) {
     Vec3 pivot;
     Quat orientation;
@@ -513,7 +532,7 @@ void pointerPress(App& app,
       if (started) {
         // Snapshot after begin() (it captures state, never mutates) and before
         // the first update() — undo restores exactly this pre-drag state.
-        app.undo.begin(app.scene.snapshotTransforms());
+        app.undo.begin(snapshot(app));
       }
       app.dragging = started;
     }
@@ -523,64 +542,137 @@ void pointerPress(App& app,
     app.selection.clear();
     return;
   }
-  auto const picked = vredit::expandSelection(app.modelGroups, target.node, partSelect);
-  // Two-step move (user request): a press only SELECTS. A press on the
-  // already-selected target GRABS and moves it — so a wobbly trigger press
-  // can change the selection but can never move anything. (Desktop body
-  // presses never grab at all; the gizmo does the moving there.)
-  double const quietSeconds =
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - app.lastReleaseTime)
-          .count();
-  if (grabPosition.has_value() &&
-      vredit::pressGrabs(app.selection, picked, quietSeconds, kGrabDebounceSeconds)) {
-    // Snapshot after begin() (it captures state, never mutates) so undo
-    // restores the pre-grab position.
-    if (app.grab.begin(app.scene, app.selection, *grabPosition, ray.direction)) {
-      app.undo.begin(app.scene.snapshotTransforms());
-    }
-    return;
-  }
-  app.selection = picked;
+  app.selection = vredit::expandSelection(app.modelGroups, target.node, partSelect);
 }
 
-void pointerMove(App& app, Ray const& ray, std::optional<Vec3> grabPosition = std::nullopt) {
-  if (app.grab.active() && grabPosition.has_value()) {
-    app.grab.update(*grabPosition, ray.direction);
-    return;
-  }
+void pointerMove(App& app, Ray const& ray) {
   if (app.dragging) {
     app.drag.update(ray);
   }
 }
 
-// Ends an active drag (handle or grab) and records it as one undo step (no-op
-// when it moved nothing). Shared by release, mode switches and shutdown paths.
+// Ends an active drag and records it as one undo step (no-op when it moved
+// nothing). Drag-only: the trigger release path uses this so a release never
+// cuts a stick gesture short (see endEdits for the both-engines version).
 bool endDrag(App& app) { // returns true when an undo step was recorded
-  bool wasActive = app.grab.active() || app.dragging;
-  app.grab.end();
-  if (app.dragging) {
-    app.drag.end();
-    app.dragging = false;
+  if (!app.dragging) {
+    return false;
   }
-  return wasActive ? app.undo.commit(app.scene.snapshotTransforms()) : false;
-}
-
-// Cancels an active edit (handle drag or grab) without touching the history:
-// restores its pre-edit transforms and drops the pending undo entry, so both
-// the undo and redo stacks stay exactly as they were. Any undo/redo keypress
-// during a live edit does this and nothing else — going through commit()
-// instead would clear an existing redo branch and make the cancelled edit
-// itself redoable.
-void cancelLiveEdit(App& app) {
-  app.grab.end();
   app.drag.end();
   app.dragging = false;
-  app.undo.cancel(app.scene);
+  return app.undo.commit(snapshot(app));
+}
+
+// Cancels an active edit (handle drag or stick gesture) without touching the
+// history: restores its pre-edit state and drops the pending undo entry, so
+// both the undo and redo stacks stay exactly as they were. Any undo/redo
+// keypress during a live edit does this and nothing else — going through
+// commit() instead would clear an existing redo branch and make the cancelled
+// edit itself redoable.
+void cancelLiveEdit(App& app) {
+  app.drag.end();
+  app.dragging = false;
+  app.stickSession = false;
+  vredit::EditorSnapshot state = snapshot(app);
+  if (app.undo.cancel(state)) {
+    applySnapshot(app, state);
+  }
 }
 
 void pointerRelease(App& app) {
   endDrag(app);
-  app.lastReleaseTime = std::chrono::steady_clock::now();
+}
+
+// Commits any live edit — handle drag or stick gesture — as its own undo
+// step. Used where a new action begins (spawn, delete, gizmo-mode switches),
+// as opposed to endDrag (drag-only) which the trigger release path uses so a
+// release never cuts a stick gesture short.
+bool endEdits(App& app) {
+  bool const wasActive = app.dragging || app.stickSession;
+  app.drag.end();
+  app.dragging = false;
+  app.stickSession = false;
+  return wasActive ? app.undo.commit(snapshot(app)) : false;
+}
+
+// The one delete rule (see deleteSubtrees): removes the selected models or
+// parts — subtrees rooted at the selection — as one undo step.
+bool deleteSelection(App& app) {
+  if (app.selection.empty()) {
+    return false;
+  }
+  endEdits(app);
+  app.undo.begin(snapshot(app));
+  std::vector<NodeId> const targets = app.selection;
+  vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection, targets);
+  return app.undo.commit(snapshot(app));
+}
+
+// The spawn library: every .glb/.obj under the folder. Rescanned on every
+// spawn, so a file dropped in mid-session is spawnable without a restart.
+std::vector<std::string> scanLibrary(std::string const& dir) {
+  std::vector<std::string> out;
+  std::error_code ec;
+  std::filesystem::recursive_directory_iterator it(dir, ec);
+  std::filesystem::recursive_directory_iterator const end;
+  for (; !ec && it != end; it.increment(ec)) {
+    // A separate error_code: one unreadable entry must not abort the scan
+    // (the iteration error_code would end the loop with no diagnostic).
+    std::error_code statusEc;
+    if (!it->is_regular_file(statusEc)) {
+      continue;
+    }
+    std::string const name = it->path().filename().string();
+    bool const glb = name.size() >= 4U && name.compare(name.size() - 4U, 4U, ".glb") == 0;
+    bool const obj = name.size() >= 4U && name.compare(name.size() - 4U, 4U, ".obj") == 0;
+    if (glb || obj) {
+      out.push_back(it->path().string());
+    }
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+bool loadModelFile(std::string const& path, Model& model, std::string& error) {
+  if (path.size() >= 4U && path.compare(path.size() - 4U, 4U, ".glb") == 0) {
+    return loadGlbFile(path.c_str(), model, error);
+  }
+  if (path.size() >= 4U && path.compare(path.size() - 4U, 4U, ".obj") == 0) {
+    return loadObjFile(path.c_str(), model, error);
+  }
+  error = "unsupported model type (want .glb or .obj)";
+  return false;
+}
+
+// Spawn-on-the-fly (N on desktop, A in VR): loads the next library model and
+// places it ON THE FLOOR at the aim point ("look where you want it").
+// Spawning the same file twice gives two instances. One undo step; a failed
+// load rolls the scene back completely, as if the spawn never happened.
+bool spawnNextModel(App& app, VkRenderer& renderer, Ray const& aimRay) {
+  std::vector<std::string> const library = scanLibrary(app.libraryDir);
+  if (library.empty()) {
+    std::printf("[library] no .glb/.obj models in %s\n", app.libraryDir.c_str());
+    return false;
+  }
+  std::string const path = library[app.libraryIndex % library.size()];
+  app.libraryIndex = (app.libraryIndex + 1U) % library.size();
+  endEdits(app);
+  app.undo.begin(snapshot(app));
+  Model model;
+  std::string error;
+  std::vector<NodeId> roots;
+  if (!loadModelFile(path, model, error) || !addModelToScene(app, renderer, model, &roots)) {
+    std::printf("failed to spawn %s: %s\n", path.c_str(), error.c_str());
+    vredit::EditorSnapshot rollback = snapshot(app);
+    if (app.undo.cancel(rollback)) {
+      applySnapshot(app, rollback);
+    }
+    return false;
+  }
+  vredit::placeOnFloor(app.scene, app.visuals, roots, vredit::floorAimPoint(aimRay));
+  app.undo.commit(snapshot(app));
+  std::printf("spawned %s\n", path.c_str());
+  return true;
 }
 
 // "Show the model without the background": the grid goes and the clear
@@ -633,8 +725,13 @@ void assembleFrame(App& app,
     item.alpha = visual.alpha;
     item.lit = true;
     // 1 = selected (warm) — the only tint the user wants: the selection is
-    // also visible from the gizmo sitting at the selection's centre.
-    item.highlight = isSelected(visual.id) ? 1.0F : 0.0F;
+    // also visible from the gizmo sitting at the selection's centre. While
+    // the hold-X delete charges, the selection ramps red (3 + charge).
+    if (isSelected(visual.id) && app.deleteCharge > 0.0F) {
+      item.highlight = 3.0F + app.deleteCharge;
+    } else {
+      item.highlight = isSelected(visual.id) ? 1.0F : 0.0F;
+    }
     items.push_back(item);
   };
   // Opaque and mask-cutout items first, blended items last (painter's order).
@@ -830,26 +927,35 @@ void handleEvent(App& app,
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
       // Undo/redo during a live edit cancels that edit first and stops there,
       // leaving both stacks untouched (see cancelLiveEdit).
-      if (app.dragging || app.grab.active()) {
+      if (app.dragging || app.stickSession) {
         cancelLiveEdit(app);
         break;
       }
       bool const redo = (key->state & XCB_MOD_MASK_SHIFT) != 0U;
-      if (redo) {
-        app.undo.redo(app.scene);
-      } else {
-        app.undo.undo(app.scene);
+      vredit::EditorSnapshot state = snapshot(app);
+      if (redo ? app.undo.redo(state) : app.undo.undo(state)) {
+        applySnapshot(app, state);
       }
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      if (app.dragging || app.grab.active()) {
+      if (app.dragging || app.stickSession) {
         cancelLiveEdit(app);
         break;
       }
-      app.undo.redo(app.scene);
+      vredit::EditorSnapshot state = snapshot(app);
+      if (app.undo.redo(state)) {
+        applySnapshot(app, state);
+      }
     } else if (keysym == 0xFF1BU) {
       app.running = false;
       stateChanged = true;
+    } else if (keysym == 0xFFFFU || keysym == 0xFF08U) {
+      // Delete / Backspace: remove the selection (model or part).
+      deleteSelection(app);
+    } else if (keysym == 'n' || keysym == 'N') {
+      // Spawn the next library model at the mouse aim point (rescanned every
+      // time: a file dropped into the folder mid-session is spawnable at once).
+      spawnNextModel(app, renderer, appRay(app, app.lastMouse));
     } else if (keysym == '1' || keysym == 'g' || keysym == 'G') {
       app.mode = GizmoMode::Translate;
       stateChanged = true;
@@ -866,8 +972,8 @@ void handleEvent(App& app,
     } else if (keysym == 'b' || keysym == 'B') {
       toggleBackdrop(app, renderer, nullptr);
     }
-    if (stateChanged && (app.dragging || app.grab.active())) {
-      endDrag(app);
+    if (stateChanged) {
+      endEdits(app);
     }
     break;
   }
@@ -923,17 +1029,7 @@ bool loadModels(App& app, VkRenderer& renderer, std::vector<char const*> const& 
   for (char const* path : paths) {
     Model model;
     std::string error;
-    std::string name(path);
-    bool ok = false;
-    if (name.size() >= 4U && name.compare(name.size() - 4U, 4U, ".glb") == 0) {
-      ok = loadGlbFile(path, model, error);
-    } else if (name.size() >= 4U && name.compare(name.size() - 4U, 4U, ".obj") == 0) {
-      ok = loadObjFile(path, model, error);
-    } else {
-      std::printf("unsupported model type: %s (want .glb or .obj)\n", path);
-      return false;
-    }
-    if (!ok) {
+    if (!loadModelFile(path, model, error)) {
       std::printf("failed to load %s: %s\n", path, error.c_str());
       return false;
     }
@@ -1006,6 +1102,94 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   writePpm(".build/smoke.ppm", pixels, config.width, config.height);
   std::printf("SMOKE pixels: covered=%d reddish=%d bluish=%d (of %d) -> .build/smoke.ppm\n", covered,
               reddish, bluish, config.width * config.height);
+
+  // Structural edit round-trip: select everything, DELETE it (the geometry
+  // leaves the image), UNDO (it returns pixel-exact). This is the end-to-end
+  // proof of the full-state snapshot path: scene + visuals + groups through
+  // deleteSubtrees and the undo history.
+  {
+    auto coveredOf = [&config](std::vector<std::uint8_t> const& px) {
+      int count = 0;
+      for (std::size_t i = 0; i < static_cast<std::size_t>(config.width) * config.height; ++i) {
+        int r = px[i * 4U];
+        int g = px[i * 4U + 1U];
+        int b = px[i * 4U + 2U];
+        if (std::abs(r - 20) > 4 || std::abs(g - 23) > 4 || std::abs(b - 28) > 4) {
+          ++count;
+        }
+      }
+      return count;
+    };
+    std::vector<NodeId> const savedSelection = app.selection;
+    app.selection.clear();
+    for (NodeVisual const& visual : app.visuals) {
+      app.selection.push_back(visual.id);
+    }
+    // Re-render as the round-trip baseline: the selection state (and its warm
+    // tint) must match the post-undo image or the comparison is meaningless.
+    items.clear();
+    depthLines.clear();
+    overlayLines.clear();
+    assembleFrame(app, items, depthLines, overlayLines);
+    if (!renderer.draw(app.camera, items, depthLines, overlayLines) ||
+        !renderer.readback(pixels)) {
+      std::printf("SMOKE FAIL: draw for round-trip baseline\n");
+      return 1;
+    }
+    int const itemsBefore = static_cast<int>(items.size());
+    int const coveredBefore = coveredOf(pixels);
+    if (!deleteSelection(app)) {
+      std::printf("SMOKE FAIL: delete recorded no undo step\n");
+      return 1;
+    }
+    items.clear();
+    depthLines.clear();
+    overlayLines.clear();
+    assembleFrame(app, items, depthLines, overlayLines);
+    if (!renderer.draw(app.camera, items, depthLines, overlayLines) ||
+        !renderer.readback(pixels)) {
+      std::printf("SMOKE FAIL: draw after delete\n");
+      return 1;
+    }
+    int const coveredGone = coveredOf(pixels);
+    if (coveredGone >= coveredBefore || !items.empty()) {
+      std::printf("SMOKE FAIL: delete left geometry behind (%d -> %d pixels, %zu items)\n",
+                  coveredBefore, coveredGone, items.size());
+      return 1;
+    }
+    vredit::EditorSnapshot state = snapshot(app);
+    if (!app.undo.undo(state)) {
+      std::printf("SMOKE FAIL: undo after delete\n");
+      return 1;
+    }
+    applySnapshot(app, state);
+    items.clear();
+    depthLines.clear();
+    overlayLines.clear();
+    assembleFrame(app, items, depthLines, overlayLines);
+    if (!renderer.draw(app.camera, items, depthLines, overlayLines) ||
+        !renderer.readback(pixels)) {
+      std::printf("SMOKE FAIL: draw after undo\n");
+      return 1;
+    }
+    int const coveredRestored = coveredOf(pixels);
+    if (coveredRestored != coveredBefore ||
+        static_cast<int>(items.size()) != itemsBefore) {
+      std::printf("SMOKE FAIL: undo did not restore exactly (%d vs %d pixels, %zu vs %d items)\n",
+                  coveredRestored, coveredBefore, items.size(), itemsBefore);
+      return 1;
+    }
+    std::printf("SMOKE structural round-trip: %d -> %d -> %d pixels OK\n", coveredBefore,
+                coveredGone, coveredRestored);
+    // The round-trip works on the "select everything" state; hand the item
+    // list back exactly as the textured checks found it (their brightness
+    // deltas are sensitive to the selection tint).
+    app.selection = savedSelection;
+    items.clear();
+    depthLines.clear();
+    overlayLines.clear();
+    assembleFrame(app, items, depthLines, overlayLines);
+  }
   if (textured) {
     // Normal-map TBN check: flat normals vs the fixture's +Y map vs a diagonal
     // (+X+Y+Z) map registered here. +Y must brighten (bitangent axis), and the
@@ -1229,7 +1413,10 @@ int runPerfSmoke(char const* shaderDir, std::vector<char const*> const& modelPat
 
 // Interactive or smoke VR session through the OpenXR shell. Returns 0 when no
 // runtime/headset is available (nothing to test against), 2 on setup failure.
-int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, bool smoke) {
+int runXr(char const* shaderDir,
+          std::vector<char const*> const& modelPaths,
+          bool smoke,
+          std::string const& libraryDir) {
   XrShell shell;
   XrShell::InitResult initResult = shell.init();
   if (initResult == XrShell::InitResult::NoRuntime ||
@@ -1247,6 +1434,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
   App app;
   app.width = shell.eyeWidth();
   app.height = shell.eyeHeight();
+  app.libraryDir = libraryDir;
 
   VkRenderer renderer;
   VkRenderer::Config config;
@@ -1293,6 +1481,7 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
   double frameMsTotal = 0.0;
   double frameMsMax = 0.0;
   std::chrono::steady_clock::time_point frameStart = std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point lastFrameTime = frameStart;
   while (running) {
     XrFrameInput input;
     frameStart = std::chrono::steady_clock::now();
@@ -1316,6 +1505,12 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
     }
     skipsInARow = 0;
 
+    // Stick rates and the delete ramp need frame timing.
+    auto const now = std::chrono::steady_clock::now();
+    float dt = std::chrono::duration<float>(now - lastFrameTime).count();
+    lastFrameTime = now;
+    dt = dt > 0.1F ? 0.1F : dt;
+
     // No flight controls: passthrough means you walk in the real world with
     // the models placed in it — the sticks' flight/turn bindings were removed
     // at the user's request ("I can now move in the real world"). Grip is the
@@ -1329,25 +1524,31 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
         app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
                    : app.mode == GizmoMode::Rotate  ? GizmoMode::Scale
                                                     : GizmoMode::Translate;
-        endDrag(app);
+        endEdits(app);
       }
     }
     bool cancelledLiveEdit = false;
     if (input.undoPressed) {
-      if (app.dragging || app.grab.active()) {
+      if (app.dragging || app.stickSession) {
         cancelLiveEdit(app);
         cancelledLiveEdit = true;
       } else {
-        app.undo.undo(app.scene);
+        vredit::EditorSnapshot state = snapshot(app);
+        if (app.undo.undo(state)) {
+          applySnapshot(app, state);
+        }
       }
     }
     // Same guard as the desktop keys: one cancel per frame leaves both stacks
     // untouched even if both arrive together.
     if (input.redoPressed && !cancelledLiveEdit) {
-      if (app.dragging || app.grab.active()) {
+      if (app.dragging || app.stickSession) {
         cancelLiveEdit(app);
       } else {
-        app.undo.redo(app.scene);
+        vredit::EditorSnapshot state = snapshot(app);
+        if (app.undo.redo(state)) {
+          applySnapshot(app, state);
+        }
       }
     }
 
@@ -1366,22 +1567,85 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
                  normalized(transformVector(rigWorld, input.pointerRay.direction))};
 
     // The right controller's aim ray drives the same state machine as the
-    // mouse; the head pose sizes the gizmo. Passing the controller position
-    // enables the floor grab: pressing the model body (not a handle) selects
-    // it, and holding moves it on the ground plane with the aim point.
+    // mouse; the head pose sizes the gizmo. A body press only SELECTS —
+    // movement and rotation are the sticks' job (controller aim is too
+    // jittery for accurate placement).
     app.camera.position = headWorld;
     if (input.selectPressed) {
       // Grip + trigger selects a single part; trigger alone the whole model.
       bool const partSelect = input.gripHeld > 0.5F;
       PointerTarget target = resolvePointerTarget(app, worldRay, kVrPickThresholdPx);
-      pointerPress(app, worldRay, headForward, target, partSelect, worldRay.origin);
+      pointerPress(app, worldRay, headForward, target, partSelect);
     } else if (input.selectHeld) {
-      pointerMove(app, worldRay, worldRay.origin);
+      pointerMove(app, worldRay);
     }
     if (input.selectReleased) {
       pointerRelease(app);
     }
     updateHover(app, worldRay, kVrPickThresholdPx, input.gripHeld > 0.5F);
+
+    // Stick-driven editing (user request: "right stick to move, left stick to
+    // rotate"): the right stick slides the selection across the floor
+    // relative to the head's yaw (pushing forward walks it away from you),
+    // the left stick turns it around vertical — turntable-style, never
+    // tipping it over. Grip held = quarter speed (fine control). One undo
+    // step per gesture: begun on the first deflection, committed at neutral.
+    float const stickFine = input.gripHeld > 0.5F ? 0.25F : 1.0F;
+    Vec3 headForwardFlat{headForward.x, 0.0F, headForward.z};
+    headForwardFlat = dot(headForwardFlat, headForwardFlat) > 1e-8F
+                          ? normalized(headForwardFlat)
+                          : Vec3{0.0F, 0.0F, -1.0F};
+    Vec3 const headRightFlat = cross(headForwardFlat, Vec3{0.0F, 1.0F, 0.0F});
+    float const stickThreshold = app.stickSession ? kStickEndZone : kStickDeadZone;
+    bool const sticksActive = std::fabs(input.rightStick.x) > stickThreshold ||
+                              std::fabs(input.rightStick.y) > stickThreshold ||
+                              std::fabs(input.leftStick.x) > stickThreshold;
+    if (sticksActive && !app.stickSession && !app.dragging && !app.selection.empty()) {
+      app.undo.begin(snapshot(app));
+      app.stickSession = true;
+    }
+    if (app.stickSession && !app.dragging) {
+      if (sticksActive && !app.selection.empty()) {
+        Vec3 const moveDelta =
+            (headRightFlat * input.rightStick.x + headForwardFlat * input.rightStick.y) *
+            (kStickMoveMps * stickFine * dt);
+        vredit::moveSelectionHorizontal(app.scene, app.selection, moveDelta);
+        // Stick right = the model turns to its right: a clockwise turn seen
+        // from above, which is negative around +Y in right-handed maths.
+        float const yawDelta = -input.leftStick.x * kStickTurnRadps * stickFine * dt;
+        if (yawDelta != 0.0F) {
+          vredit::rotateSelectionYaw(app.scene, app.visuals, app.selection, yawDelta);
+        }
+      } else {
+        app.undo.commit(snapshot(app));
+        app.stickSession = false;
+      }
+    }
+
+    // Hold-X delete: the selection's tint ramps red over kDeleteChargeS and
+    // the delete fires at full charge; release before that cancels. Hold-to-
+    // confirm on purpose — face buttons on Quest controllers are wobbly.
+    if (input.deleteHeld && !app.selection.empty()) {
+      if (!app.deleteHolding) {
+        app.deleteHolding = true;
+        app.deleteHoldStart = std::chrono::steady_clock::now();
+      }
+      double const held =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - app.deleteHoldStart)
+              .count();
+      app.deleteCharge = static_cast<float>(std::min(held / kDeleteChargeS, 1.0));
+      if (app.deleteCharge >= 1.0F) {
+        deleteSelection(app);
+        app.deleteHolding = false;
+        app.deleteCharge = 0.0F;
+      }
+    } else {
+      app.deleteHolding = false;
+      app.deleteCharge = 0.0F;
+    }
+    if (input.spawnPressed) {
+      spawnNextModel(app, renderer, worldRay);
+    }
 
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
@@ -1450,9 +1714,9 @@ int runXr(char const* shaderDir, std::vector<char const*> const& modelPaths, boo
                 "renderFalse %llu (runtime hint ignored)\n",
                 static_cast<unsigned long long>(stats.stalePose),
                 static_cast<unsigned long long>(stats.renderFalse));
-    std::printf("[xr] controller sticks (unused — you walk in passthrough): "
-                "move X %.2f Y %.2f, turn X %.2f Y %.2f\n",
-                stats.moveXMax, stats.moveYMax, stats.turnXMax, stats.turnYMax);
+    std::printf("[xr] controller sticks (right = move, left = rotate): "
+                "left X %.2f Y %.2f, right X %.2f Y %.2f (peaks)\n",
+                stats.leftXMax, stats.leftYMax, stats.rightXMax, stats.rightYMax);
   }
 
   renderer.shutdown();
@@ -1492,8 +1756,11 @@ void updateFlight(App& app, float dt) {
   flyCamera(app.camera, local * speed);
 }
 
-int runInteractive(char const* shaderDir, std::vector<char const*> const& modelPaths) {
+int runInteractive(char const* shaderDir,
+                   std::vector<char const*> const& modelPaths,
+                   std::string const& libraryDir) {
   App app;
+  app.libraryDir = libraryDir;
   if (modelPaths.empty()) {
     buildDemoScene(app);
   }
@@ -1583,11 +1850,14 @@ int main(int argc, char** argv) {
   char const* shaderDir = ".build/shaders";
   int frames = 30;
   std::vector<char const*> modelPaths;
+  std::string libraryDir; // spawn library: --library DIR (default below)
 
   for (int i = 1; i < argc; ++i) {
     char const* arg = argv[i];
     if (std::strcmp(arg, "--shaders") == 0 && i + 1 < argc) {
       shaderDir = argv[++i];
+    } else if (std::strcmp(arg, "--library") == 0 && i + 1 < argc) {
+      libraryDir = argv[++i];
     } else if (std::strcmp(arg, "--smoke-offscreen") == 0) {
       mode = Mode::SmokeOffscreen;
     } else if (std::strcmp(arg, "--smoke-textured") == 0) {
@@ -1619,13 +1889,15 @@ int main(int argc, char** argv) {
       mode = Mode::SmokeXr;
     } else if (std::strcmp(arg, "--help") == 0) {
       std::printf(
-          "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR]\n"
+          "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR] [--library DIR]\n"
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
           "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n"
           "keys: WASD/QE fly (RMB look), 1/2/3 move/rotate/scale, L space,\n"
+          "      N spawn next library model, Delete remove selection,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
-          "vr:   trigger select then move, grip+trigger part, B/Y undo/redo,\n"
-          "      grip+menu backdrop, menu gizmo mode, sticks fly/turn/look\n");
+          "vr:   trigger select (grip+trigger part), right stick move on the floor,\n"
+          "      left stick rotate (grip = fine), A spawn, hold X delete,\n"
+          "      B/Y undo/redo, grip+menu backdrop, menu gizmo mode\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);
@@ -1633,6 +1905,17 @@ int main(int argc, char** argv) {
     } else {
       modelPaths.push_back(arg);
     }
+  }
+
+  // Spawn library default: ~/Downloads/VR when it exists (the model
+  // collection), else the working directory. Rescanned on every spawn.
+  if (libraryDir.empty()) {
+    char const* home = std::getenv("HOME");
+    std::string const candidate =
+        home != nullptr ? std::string(home) + "/Downloads/VR" : std::string();
+    std::error_code ec;
+    libraryDir = (!candidate.empty() && std::filesystem::is_directory(candidate, ec)) ? candidate
+                                                                                     : ".";
   }
 
   switch (mode) {
@@ -1644,14 +1927,14 @@ int main(int argc, char** argv) {
     return runSmokeOffscreen(shaderDir, fixtures, true);
   }
   case Mode::Xr:
-    return runXr(shaderDir, modelPaths, false);
+    return runXr(shaderDir, modelPaths, false, libraryDir);
   case Mode::SmokeXr:
-    return runXr(shaderDir, modelPaths, true);
+    return runXr(shaderDir, modelPaths, true, libraryDir);
   case Mode::SmokeWindow:
     return runSmokeWindow(shaderDir, frames, modelPaths);
   case Mode::SmokePerf:
     return runPerfSmoke(shaderDir, modelPaths);
   default:
-    return runInteractive(shaderDir, modelPaths);
+    return runInteractive(shaderDir, modelPaths, libraryDir);
   }
 }

@@ -23,14 +23,16 @@ struct XrFrameInput {
   Ray aimRays[2];        // per-hand aim rays in XR local space (left, right)
   bool aimValid[2] = {false, false}; // aimRays[i] is tracked this frame
   Vec3 headPosition{0.0F, 0.0F, 0.0F}; // midpoint of the eyes (tracking space)
-  Vec2 moveStick{0.0F, 0.0F}; // left stick: x = strafe, y = forward
-  Vec2 turnStick{0.0F, 0.0F}; // right stick: x = yaw, y = pitch
+  Vec2 leftStick{0.0F, 0.0F};  // left stick: stick-driven ROTATE of the selection
+  Vec2 rightStick{0.0F, 0.0F}; // right stick: stick-driven MOVE of the selection
   bool selectHeld{false};
   bool selectPressed{false};
   bool selectReleased{false};
   bool menuPressed{false};
   bool undoPressed{false};  // latched: Face button on Touch, trackpad on Vive
   bool redoPressed{false};
+  bool spawnPressed{false}; // latched: A on Touch (spawn next library model)
+  bool deleteHeld{false};   // X on Touch held: hold-to-delete with red ramp
   float gripHeld{0.0F};
 };
 
@@ -60,10 +62,10 @@ public:
     std::uint64_t acquireFail{0};   // swapchain acquire/wait failed
     // Stick extremes seen all session (|value| high-water marks): the
     // telemetry that decides whether a dead axis is the app or the runtime.
-    float moveXMax{0.0F};
-    float moveYMax{0.0F};
-    float turnXMax{0.0F};
-    float turnYMax{0.0F};
+    float leftXMax{0.0F};
+    float leftYMax{0.0F};
+    float rightXMax{0.0F};
+    float rightYMax{0.0F};
   };
 
   XrShell() = default;

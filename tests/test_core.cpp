@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "camera.h"
+#include "editor_state.h"
 #include "gizmo.h"
 #include "gltf.h"
 #include "handles.h"
@@ -343,6 +344,7 @@ void testSceneSnapshotRestore() {
   vredit::Scene scene;
   vredit::NodeId a = scene.create();
   vredit::NodeId b = scene.create();
+  vredit::NodeId child = scene.create(b);
   vredit::Transform ta;
   ta.translation = {1.0F, 0.0F, 0.0F};
   scene.setLocal(a, ta);
@@ -350,26 +352,58 @@ void testSceneSnapshotRestore() {
   tb.translation = {0.0F, 2.0F, 0.0F};
   scene.setLocal(b, tb);
 
-  vredit::SceneSnapshot snapshot = scene.snapshotTransforms();
-  CHECK(snapshot.transforms.size() == 2U);
+  vredit::SceneSnapshot snapshot = scene.snapshot();
+  CHECK(snapshot.nodes.size() == 3U);
+  CHECK(snapshot.nodes[0].id == a);
+  CHECK(snapshot.nodes[1].id == b);
+  CHECK(snapshot.nodes[2].parent == b);
 
   vredit::Transform moved = ta;
   moved.translation = {9.0F, 9.0F, 9.0F};
   scene.setLocal(a, moved);
   scene.setLocal(b, moved);
-  CHECK(!vredit::sameSnapshot(snapshot, scene.snapshotTransforms()));
+  CHECK(!vredit::sameSnapshot(snapshot, scene.snapshot()));
 
-  scene.restoreTransforms(snapshot);
-  CHECK(vredit::sameSnapshot(snapshot, scene.snapshotTransforms()));
+  scene.restore(snapshot);
+  CHECK(vredit::sameSnapshot(snapshot, scene.snapshot()));
   CHECK_NEAR(scene.local(a).translation.x, 1.0F, 1e-5F);
   CHECK_NEAR(scene.local(b).translation.y, 2.0F, 1e-5F);
 
-  // Restoring after destroying a node skips it rather than resurrecting it.
-  scene.destroy(b);
-  scene.setLocal(a, moved);
-  scene.restoreTransforms(snapshot);
+  // Restoring after destroying nodes RESURRECTS them with their original ids
+  // (this is what makes delete undoable), hierarchy included.
+  scene.destroy(b); // subtree: b + child
   CHECK(!scene.valid(b));
+  CHECK(!scene.valid(child));
+  scene.setLocal(a, moved);
+  scene.restore(snapshot);
+  CHECK(scene.valid(b));
+  CHECK(scene.valid(child));
+  CHECK(scene.parent(child) == b);
   CHECK_NEAR(scene.local(a).translation.x, 1.0F, 1e-5F);
+  CHECK_NEAR(scene.local(b).translation.y, 2.0F, 1e-5F);
+  CHECK(vredit::sameSnapshot(snapshot, scene.snapshot()));
+
+  // Nodes created since the snapshot go away again on restore.
+  vredit::NodeId extra = scene.create();
+  scene.restore(snapshot);
+  CHECK(!scene.valid(extra));
+  CHECK(vredit::sameSnapshot(snapshot, scene.snapshot()));
+
+  // A parent destroyed without its recorded child: the child is detached to
+  // root rather than left dangling on a dead slot.
+  vredit::SceneSnapshot partial;
+  partial.nodes.push_back(vredit::NodeRecord{child, vredit::kInvalidNode, {}});
+  scene.restore(partial);
+  CHECK(scene.valid(child));
+  CHECK(scene.parent(child) == vredit::kInvalidNode);
+  CHECK(!scene.valid(a));
+  CHECK(!scene.valid(b));
+
+  // Restore trusts captured states (acyclic); ids keep their identity across
+  // any number of restore cycles.
+  scene.restore(snapshot);
+  CHECK(scene.valid(a) && scene.valid(b) && scene.valid(child));
+  CHECK(vredit::sameSnapshot(snapshot, scene.snapshot()));
 }
 
 void testUndoHistory() {
@@ -379,63 +413,80 @@ void testUndoHistory() {
   t0.translation = {1.0F, 0.0F, 0.0F};
   scene.setLocal(n, t0);
 
-  vredit::UndoHistory undo;
+  vredit::UndoHistory<vredit::SceneSnapshot> undo;
+  auto apply = [&scene](vredit::SceneSnapshot& s) { scene.restore(s); };
+  auto undoStep = [&]() {
+    vredit::SceneSnapshot current = scene.snapshot();
+    bool did = undo.undo(current);
+    if (did) {
+      apply(current);
+    }
+    return did;
+  };
+  auto redoStep = [&]() {
+    vredit::SceneSnapshot current = scene.snapshot();
+    bool did = undo.redo(current);
+    if (did) {
+      apply(current);
+    }
+    return did;
+  };
   CHECK(!undo.canUndo());
   CHECK(!undo.canRedo());
 
   // One drag: begin before the change, commit after; exactly one undo step.
-  undo.begin(scene.snapshotTransforms());
+  undo.begin(scene.snapshot());
   vredit::Transform t1 = t0;
   t1.translation = {5.0F, 0.0F, 0.0F};
   scene.setLocal(n, t1);
-  undo.commit(scene.snapshotTransforms());
+  undo.commit(scene.snapshot());
   CHECK(undo.canUndo());
   CHECK(!undo.canRedo());
 
-  CHECK(undo.undo(scene));
+  CHECK(undoStep());
   CHECK_NEAR(scene.local(n).translation.x, 1.0F, 1e-5F);
   CHECK(undo.canRedo());
   CHECK(!undo.canUndo());
 
-  CHECK(undo.redo(scene));
+  CHECK(redoStep());
   CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F);
   CHECK(undo.canUndo());
 
   // A commit that changed nothing records no step.
-  undo.begin(scene.snapshotTransforms());
-  undo.commit(scene.snapshotTransforms());
-  CHECK(undo.undo(scene)); // only the first drag is undone...
+  undo.begin(scene.snapshot());
+  undo.commit(scene.snapshot());
+  CHECK(undoStep()); // only the first drag is undone...
   CHECK_NEAR(scene.local(n).translation.x, 1.0F, 1e-5F);
   CHECK(!undo.canUndo()); // ...and nothing more
 
   // A new edit after undo clears the redo branch.
-  undo.redo(scene);
+  redoStep();
   CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F);
-  undo.begin(scene.snapshotTransforms());
+  undo.begin(scene.snapshot());
   vredit::Transform t2 = t1;
   t2.translation = {7.0F, 0.0F, 0.0F};
   scene.setLocal(n, t2);
-  undo.commit(scene.snapshotTransforms());
+  undo.commit(scene.snapshot());
   CHECK(!undo.canRedo());
-  CHECK(undo.undo(scene));
+  CHECK(undoStep());
   CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F);
 
   // Regression: begin() with an edit still open (a drag whose release was
   // lost) must commit that edit, not overwrite it — otherwise its transforms
   // are silently lost from history.
   undo.clear();
-  undo.begin(scene.snapshotTransforms()); // base: x=5
+  undo.begin(scene.snapshot()); // base: x=5
   vredit::Transform t3 = t1;
   t3.translation = {8.0F, 0.0F, 0.0F};
   scene.setLocal(n, t3); // dangling edit, never committed
-  undo.begin(scene.snapshotTransforms()); // new drag starts at x=8
+  undo.begin(scene.snapshot()); // new drag starts at x=8
   vredit::Transform t4 = t1;
   t4.translation = {9.0F, 0.0F, 0.0F};
   scene.setLocal(n, t4);
-  undo.commit(scene.snapshotTransforms());
-  CHECK(undo.undo(scene));
+  undo.commit(scene.snapshot());
+  CHECK(undoStep());
   CHECK_NEAR(scene.local(n).translation.x, 8.0F, 1e-5F); // second drag undone
-  CHECK(undo.undo(scene));
+  CHECK(undoStep());
   CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F); // dangling edit too
 }
 
@@ -446,31 +497,46 @@ void testCancelPendingEdit() {
   t0.translation = {1.0F, 0.0F, 0.0F};
   scene.setLocal(n, t0);
 
-  vredit::UndoHistory undo;
-  CHECK(!undo.cancel(scene)); // nothing pending
+  vredit::UndoHistory<vredit::SceneSnapshot> undo;
+  {
+    vredit::SceneSnapshot current = scene.snapshot();
+    CHECK(!undo.cancel(current)); // nothing pending
+  }
 
   // Build one step and take it back, so a redo branch exists.
-  undo.begin(scene.snapshotTransforms());
+  undo.begin(scene.snapshot());
   vredit::Transform t1 = t0;
   t1.translation = {5.0F, 0.0F, 0.0F};
   scene.setLocal(n, t1);
-  undo.commit(scene.snapshotTransforms());
-  CHECK(undo.undo(scene));
+  undo.commit(scene.snapshot());
+  {
+    vredit::SceneSnapshot current = scene.snapshot();
+    CHECK(undo.undo(current));
+    scene.restore(current);
+  }
   CHECK(undo.canRedo());
 
   // A live grab, cancelled: the pre-drag state returns and no step lands on
   // either stack.
-  undo.begin(scene.snapshotTransforms());
+  undo.begin(scene.snapshot());
   vredit::Transform grab = t0;
   grab.translation = {99.0F, 0.0F, 0.0F};
   scene.setLocal(n, grab);
-  CHECK(undo.cancel(scene));
+  {
+    vredit::SceneSnapshot current = scene.snapshot();
+    CHECK(undo.cancel(current));
+    scene.restore(current);
+  }
   CHECK_NEAR(scene.local(n).translation.x, 1.0F, 1e-5F);
   CHECK(!undo.canUndo()); // the cancelled grab is not undoable...
   CHECK(undo.canRedo());  // ...and it did not eat the existing redo branch
 
   // Redo replays the ORIGINAL edit, not the cancelled grab.
-  CHECK(undo.redo(scene));
+  {
+    vredit::SceneSnapshot current = scene.snapshot();
+    CHECK(undo.redo(current));
+    scene.restore(current);
+  }
   CHECK_NEAR(scene.local(n).translation.x, 5.0F, 1e-5F);
 }
 
@@ -661,22 +727,41 @@ void testGizmoRotateSnapped() {
 }
 
 void testGizmoScaleAxis() {
-  vredit::Scene scene;
-  vredit::NodeId n = scene.create();
-  vredit::Transform t;
-  t.translation = {2.0F, 0.0F, 0.0F};
-  scene.setLocal(n, t);
+  // Uniform scale ONLY: every handle — axis or free — drives one factor on
+  // all three axes ("I never, ever want scaling on just one axis").
+  struct Case {
+    vredit::GizmoHandle handle;
+    vredit::Vec3 view;
+    vredit::Ray start;
+    vredit::Ray update;
+  };
+  vredit::Vec3 const downZ{0.0F, 0.0F, -1.0F};
+  vredit::Vec3 const downY{0.0F, -1.0F, 0.0F};
+  Case const cases[] = {
+      {vredit::GizmoHandle::AxisX, downZ, {{2.0F, 0.0F, 5.0F}, downZ}, {{4.0F, 0.0F, 5.0F}, downZ}},
+      {vredit::GizmoHandle::AxisY, downZ, {{0.0F, 2.0F, 5.0F}, downZ}, {{0.0F, 4.0F, 5.0F}, downZ}},
+      // Z points at a -Z camera (degenerate), so this case views from above.
+      {vredit::GizmoHandle::AxisZ, downY, {{2.0F, 5.0F, 2.0F}, downY}, {{2.0F, 5.0F, 4.0F}, downY}},
+      {vredit::GizmoHandle::Free, downZ, {{2.0F, 0.0F, 5.0F}, downZ}, {{4.0F, 0.0F, 5.0F}, downZ}},
+  };
+  for (Case const& c : cases) {
+    vredit::Scene scene;
+    vredit::NodeId n = scene.create();
+    vredit::Transform t;
+    t.translation = {2.0F, 0.0F, 0.0F};
+    scene.setLocal(n, t);
 
-  vredit::GizmoDrag drag;
-  vredit::GizmoSettings settings;
-  settings.mode = vredit::GizmoMode::Scale;
-  settings.snapStep = 0.25F;
-  CHECK(drag.begin(scene, {n}, {0.0F, 0.0F, 0.0F}, {}, vredit::GizmoHandle::AxisX,
-                   {{2.0F, 0.0F, 5.0F}, {0.0F, 0.0F, -1.0F}}, {0.0F, 0.0F, -1.0F}, settings));
-  drag.update({{4.0F, 0.0F, 5.0F}, {0.0F, 0.0F, -1.0F}});
-  CHECK_NEAR(drag.cumulative(), 2.0F, 1e-5F);
-  CHECK_NEAR3(scene.worldPosition(n), {4.0F, 0.0F, 0.0F});
-  CHECK_NEAR3(scene.local(n).scale, {2.0F, 1.0F, 1.0F});
+    vredit::GizmoDrag drag;
+    vredit::GizmoSettings settings;
+    settings.mode = vredit::GizmoMode::Scale;
+    settings.snapStep = 0.25F;
+    CHECK(drag.begin(scene, {n}, {0.0F, 0.0F, 0.0F}, {}, c.handle, c.start, c.view, settings));
+    drag.update(c.update);
+    CHECK_NEAR(drag.cumulative(), 2.0F, 1e-5F);
+    CHECK_NEAR3(scene.local(n).scale, {2.0F, 2.0F, 2.0F});
+    // Scaling about the pivot (origin) also doubles the offset.
+    CHECK_NEAR3(scene.worldPosition(n), {4.0F, 0.0F, 0.0F});
+  }
 }
 
 void testGizmoLocalSpaceRotate() {
@@ -881,135 +966,6 @@ void testGizmoPlaneHandle() {
                    {{2.0F, 3.0F, 5.0F}, {0.0F, 0.0F, -1.0F}}, {0.0F, 0.0F, -1.0F}, settings));
   drag.update({{2.3F, 3.4F, 5.0F}, {0.0F, 0.0F, -1.0F}});
   CHECK_NEAR3(scene.worldPosition(node), {0.3F, 0.4F, 0.0F});
-}
-
-void testFloorGrab() {
-  vredit::Scene scene;
-  vredit::NodeId node = scene.create();
-  vredit::Vec3 const down{0.0F, -1.0F, 0.0F};
-
-  // The model follows the AIM POINT where the beam meets the floor ("move
-  // around the X/Y axis based on the controllers movements"). With the beam
-  // straight down the controller's horizontal motion sweeps the aim point 1:1
-  // across the floor...
-  vredit::FloorGrab grab;
-  CHECK(grab.begin(scene, {node}, {10.0F, 1.6F, -4.0F}, down));
-  CHECK(grab.active());
-  grab.update({10.5F, 1.6F, -3.0F}, down);
-  CHECK_NEAR3(scene.worldPosition(node), {0.5F, 0.0F, 1.0F});
-  CHECK_NEAR3(grab.offset(), {0.5F, 0.0F, 1.0F});
-
-  // ...while raising the controller never lifts the model off the floor.
-  grab.update({12.0F, 3.9F, -3.0F}, down);
-  CHECK_NEAR3(scene.worldPosition(node), {2.0F, 0.0F, 1.0F});
-
-  // A first update with no motion is an exact no-op.
-  vredit::FloorGrab still;
-  vredit::Scene stillScene;
-  vredit::NodeId stillNode = stillScene.create();
-  CHECK(still.begin(stillScene, {stillNode}, {1.0F, 2.0F, 1.0F}, down));
-  still.update({1.0F, 2.0F, 1.0F}, down);
-  CHECK(still.offset().x == 0.0F && still.offset().y == 0.0F && still.offset().z == 0.0F);
-  CHECK(stillScene.worldPosition(stillNode).x == 0.0F);
-
-  // A hand at floor level: the carry point is the hand's own floor position
-  // (no divide-by-zero jump to the clamp).
-  vredit::FloorGrab low;
-  vredit::Scene lowScene;
-  vredit::NodeId lowNode = lowScene.create();
-  CHECK(low.begin(lowScene, {lowNode}, {2.0F, 0.0F, 3.0F}, down));
-  low.update({2.5F, 0.0F, 3.0F}, down);
-  CHECK_NEAR3(lowScene.worldPosition(lowNode), {0.5F, 0.0F, 0.0F});
-
-  // Pointing at a different spot moves the model there with the controller
-  // itself barely moving — that is what makes layout fast.
-  vredit::Scene aimScene;
-  vredit::NodeId aimNode = aimScene.create();
-  vredit::FloorGrab aimGrab;
-  vredit::Vec3 diagonal = vredit::normalized(vredit::Vec3{0.0F, -1.0F, -1.0F});
-  CHECK(aimGrab.begin(aimScene, {aimNode}, {0.0F, 1.0F, 0.0F}, diagonal));
-  aimGrab.update({0.0F, 1.0F, 0.0F},
-                 vredit::normalized(vredit::Vec3{0.5F, -1.0F, -1.0F}));
-  CHECK_NEAR3(aimScene.worldPosition(aimNode), {0.5F, 0.0F, 0.0F}); // aim only
-
-  // A grazing aim is clamped (no flinging across the room) and never lifts.
-  vredit::Vec3 before = aimScene.worldPosition(aimNode);
-  aimGrab.update({0.0F, 1.0F, 0.0F}, vredit::normalized(vredit::Vec3{1.0F, -0.01F, 0.0F}));
-  CHECK(vredit::length(aimScene.worldPosition(aimNode) - before) < 12.5F);
-  CHECK_NEAR(aimScene.worldPosition(aimNode).y, 0.0F, 1e-5F);
-
-  // An upward aim also stays clamped and floor-locked.
-  before = aimScene.worldPosition(aimNode);
-  aimGrab.update({0.0F, 1.0F, 0.0F}, vredit::normalized(vredit::Vec3{0.0F, 1.0F, 0.0F}));
-  CHECK(vredit::length(aimScene.worldPosition(aimNode) - before) < 12.5F);
-  CHECK(aimScene.worldPosition(aimNode).y == 0.0F);
-
-  // Drift-free: the transform is recomputed from the start state every
-  // update, so repeated updates cannot accumulate rounding error.
-  for (int i = 0; i < 1000; ++i) {
-    grab.update({12.0F + 0.001F * static_cast<float>(i % 7), 1.6F, -3.0F}, down);
-  }
-  grab.update({12.0F, 1.6F, -3.0F}, down);
-  CHECK_NEAR3(scene.worldPosition(node), {2.0F, 0.0F, 1.0F});
-
-  // Rigid-group semantics: a child of a selected node rides along instead of
-  // receiving the offset twice through the hierarchy.
-  vredit::Scene grouped;
-  vredit::NodeId parent = grouped.create();
-  vredit::NodeId child = grouped.create(parent);
-  vredit::Transform ct;
-  ct.translation = {1.0F, 0.0F, 0.0F};
-  grouped.setLocal(child, ct);
-  vredit::FloorGrab groupGrab;
-  CHECK(groupGrab.begin(grouped, {parent, child}, {0.0F, 2.0F, 0.0F}, down));
-  groupGrab.update({3.0F, 2.0F, -2.0F}, down);
-  CHECK_NEAR3(grouped.worldPosition(child), {4.0F, 0.0F, -2.0F}); // once, not twice
-
-  // A body press with no movable node is refused and stays inactive.
-  vredit::FloorGrab refused;
-  CHECK(!refused.begin(grouped, {}, {0.0F, 2.0F, 0.0F}, down));
-  CHECK(!refused.active());
-
-  // Movement is 1:1 with the controller in WORLD units even under a scaled
-  // parent chain (glTF roots often carry 0.01/100 unit conversions): the delta
-  // is applied in world space and only converted back through the parent.
-  vredit::Scene scaled;
-  vredit::NodeId root = scaled.create();
-  vredit::Transform rootT;
-  rootT.scale = {0.01F, 0.01F, 0.01F};
-  scaled.setLocal(root, rootT);
-  vredit::NodeId scaledChild = scaled.create(root);
-  vredit::Transform childT;
-  childT.translation = {2.0F, 0.0F, -1.0F};
-  scaled.setLocal(scaledChild, childT);
-  vredit::FloorGrab scaledGrab;
-  CHECK(scaledGrab.begin(scaled, {root, scaledChild}, {0.0F, 2.0F, 0.0F}, down));
-  scaledGrab.update({0.5F, 2.0F, -0.25F}, down);
-  CHECK_NEAR3(scaled.worldPosition(root), {0.5F, 0.0F, -0.25F});
-  CHECK_NEAR3(scaled.worldPosition(scaledChild), {0.52F, 0.0F, -0.26F}); // 1:1, not 100:1
-
-  // Part-select under a scaled parent: here the child IS the grabbed node and
-  // the world->local conversion runs through the scaled parent (invParent) —
-  // the same path a grip+trigger part grab takes on a unit-converted glTF.
-  vredit::Scene partScaled;
-  vredit::NodeId partRoot = partScaled.create();
-  vredit::Transform partRootT;
-  partRootT.scale = {0.01F, 0.01F, 0.01F};
-  partScaled.setLocal(partRoot, partRootT);
-  vredit::NodeId partChild = partScaled.create(partRoot);
-  vredit::Transform partChildT;
-  partChildT.translation = {2.0F, 0.0F, -1.0F};
-  partScaled.setLocal(partChild, partChildT);
-  vredit::FloorGrab partGrab;
-  CHECK(partGrab.begin(partScaled, {partChild}, {0.0F, 2.0F, 0.0F}, down));
-  partGrab.update({0.5F, 2.0F, -0.25F}, down);
-  CHECK_NEAR3(partScaled.worldPosition(partChild), {0.52F, 0.0F, -0.26F});
-
-  // End clears the grab; further updates are no-ops.
-  groupGrab.end();
-  CHECK(!groupGrab.active());
-  groupGrab.update({99.0F, 2.0F, 99.0F}, down);
-  CHECK_NEAR3(grouped.worldPosition(child), {4.0F, 0.0F, -2.0F});
 }
 
 void testEpochStructuralChanges() {
@@ -1262,23 +1218,116 @@ void testSegmentAndPolygonPicking() {
   CHECK(!pointInPolygon(square, {0.5F, 1.5F}));
 }
 
-void testPressGrabs() {
-  using vredit::NodeId;
-  using vredit::pressGrabs;
-  std::vector<NodeId> const model{1, 2, 3};
-  std::vector<NodeId> const part{2};
-  std::vector<NodeId> const none{};
+void testStickMotion() {
+  // Stick-driven move: horizontal only — models never leave the floor.
+  vredit::Scene scene;
+  vredit::NodeId parent = scene.create();
+  vredit::NodeId child = scene.create(parent);
+  vredit::NodeVisual vp;
+  vp.id = parent;
+  vredit::NodeVisual vc;
+  vc.id = child;
+  std::vector<vredit::NodeVisual> visuals{vp, vc};
 
-  // A first press (nothing selected) only ever selects.
-  CHECK(!pressGrabs(none, model, 10.0, 0.1));
-  // A press resolving to a different target only selects.
-  CHECK(!pressGrabs(model, part, 10.0, 0.1));
-  CHECK(!pressGrabs(part, model, 10.0, 0.1));
-  // The second press on the already-selected target grabs — unless it lands
-  // within the bounce window of the previous release.
-  CHECK(pressGrabs(model, model, 10.0, 0.1));
-  CHECK(pressGrabs(part, part, 0.5, 0.1));
-  CHECK(!pressGrabs(model, model, 0.02, 0.1));
+  vredit::moveSelectionHorizontal(scene, {parent, child}, {2.0F, 5.0F, -3.0F});
+  CHECK_NEAR3(scene.worldPosition(parent), {2.0F, 0.0F, -3.0F});
+  // The selected child rides along ONCE: its local transform is untouched
+  // (no double-move through the hierarchy).
+  CHECK_NEAR3(scene.local(child).translation, {0.0F, 0.0F, 0.0F});
+  CHECK_NEAR3(scene.worldPosition(child), {2.0F, 0.0F, -3.0F});
+
+  // The y component of the requested delta is ignored entirely.
+  vredit::moveSelectionHorizontal(scene, {parent}, {0.0F, 100.0F, 0.0F});
+  CHECK_NEAR(scene.worldPosition(parent).y, 0.0F, 1e-6F);
+
+  // Stick-driven rotate: turntable around world up through the selection's
+  // bounds centre; height is preserved, the model never tips over.
+  vredit::Transform t;
+  t.translation = {2.0F, 1.0F, 0.0F};
+  scene.setLocal(parent, t);
+  vredit::rotateSelectionYaw(scene, visuals, {parent}, kHalfPi);
+  CHECK_NEAR(scene.worldPosition(parent).y, 1.0F, 1e-5F);
+  // A quarter turn around its own centre keeps the centre fixed.
+  CHECK_NEAR3(scene.worldPosition(parent), {2.0F, 1.0F, 0.0F});
+  vredit::Transform childStart;
+  childStart.translation = {1.0F, 0.0F, 0.0F};
+  scene.setLocal(child, childStart);
+  vredit::rotateSelectionYaw(scene, visuals, {parent, child}, kHalfPi);
+  // Selected child rides along once: both turn about the shared bounds
+  // centre ((2,1,-0.5): the two unit cubes at (2,1,0) and (2,1,-1)).
+  CHECK_NEAR3(scene.worldPosition(child), {1.5F, 1.0F, -0.5F});
+  CHECK_NEAR3(scene.worldPosition(parent), {2.5F, 1.0F, -0.5F});
+  CHECK_NEAR3(scene.local(child).translation, {1.0F, 0.0F, 0.0F});
+}
+
+void testEditorStateOps() {
+  using vredit::EditorSnapshot;
+  using vredit::ModelGroups;
+  using vredit::NodeVisual;
+
+  vredit::Scene scene;
+  std::vector<NodeVisual> visuals;
+  ModelGroups groups;
+  std::vector<vredit::NodeId> selection;
+
+  // One model file = one group: a root with two parts.
+  vredit::NodeId root = scene.create();
+  vredit::NodeId partA = scene.create(root);
+  vredit::NodeId partB = scene.create(root);
+  NodeVisual vr;
+  vr.id = root;
+  vr.colour = {0.9F, 0.1F, 0.1F};
+  NodeVisual va;
+  va.id = partA;
+  NodeVisual vb;
+  vb.id = partB;
+  visuals = {vr, va, vb};
+  groups = {{root, 1U}, {partA, 1U}, {partB, 1U}};
+
+  // Capture/restore round-trips the FULL state: structure, visuals, groups.
+  EditorSnapshot snapshot = vredit::captureState(scene, visuals, groups, selection);
+  CHECK(snapshot.visuals.size() == 3U);
+  CHECK(snapshot.groups.size() == 3U);
+  CHECK(vredit::sameSnapshot(snapshot, vredit::captureState(scene, visuals, groups, selection)));
+
+  // Deleting a part: the subtree root goes, its visuals and group entries
+  // with it; the rest of the model survives.
+  selection = {partA};
+  vredit::deleteSubtrees(scene, visuals, groups, selection, {partA});
+  CHECK(!scene.valid(partA));
+  CHECK(scene.valid(root) && scene.valid(partB));
+  CHECK(visuals.size() == 2U);
+  CHECK(groups.size() == 2U);
+  CHECK(selection.empty()); // the deleted id left the selection
+
+  // Undo restores it exactly — same ids, same visuals, same colours.
+  vredit::restoreState(snapshot, scene, visuals, groups, selection);
+  CHECK(scene.valid(partA));
+  CHECK(visuals.size() == 3U);
+  CHECK_NEAR(visuals[0].colour.x, 0.9F, 1e-6F);
+  CHECK(vredit::sameSnapshot(snapshot, vredit::captureState(scene, visuals, groups, selection)));
+
+  // Whole-model delete = the same rule over the whole selection: roots that
+  // are descendants of other roots collapse, so {root, partA, partB} is one
+  // subtree delete, not three.
+  selection = {root, partA, partB};
+  vredit::deleteSubtrees(scene, visuals, groups, selection, {root, partA, partB});
+  CHECK(visuals.empty());
+  CHECK(groups.empty());
+  CHECK(selection.empty());
+  vredit::restoreState(snapshot, scene, visuals, groups, selection);
+  CHECK(vredit::sameSnapshot(snapshot, vredit::captureState(scene, visuals, groups, selection)));
+
+  // Spawn placement: the loaded subtree lands ON THE FLOOR centred at target.
+  vredit::Transform tall;
+  tall.translation = {0.0F, 5.0F, 0.0F}; // parts float above the origin
+  scene.setLocal(root, tall);
+  vredit::placeOnFloor(scene, visuals, {root}, {3.0F, 0.0F, -2.0F});
+  vredit::Aabb bounds{};
+  CHECK(vredit::nodesBounds(scene, visuals, {root, partA, partB}, bounds));
+  CHECK_NEAR(bounds.min.y, 0.0F, 1e-5F);   // standing on the floor
+  CHECK_NEAR(vredit::aabbCentre(bounds).x, 3.0F, 1e-4F);
+  CHECK_NEAR(vredit::aabbCentre(bounds).z, -2.0F, 1e-4F);
 }
 
 void testHandlePicking() {
@@ -2130,7 +2179,7 @@ int main() {
   testGizmoScaleClamp();
   testGizmoBeginFailureClean();
   testGizmoPlaneHandle();
-  testFloorGrab();
+
   testEpochStructuralChanges();
   testCameraFraming();
   testCameraManipulation();
@@ -2140,7 +2189,8 @@ int main() {
   testUpscaleToPot();
   testMipChain();
   testSegmentAndPolygonPicking();
-  testPressGrabs();
+  testStickMotion();
+  testEditorStateOps();
   testHandlePicking();
   testHandlePickingBehindCamera();
   testHandlePickingByRay();

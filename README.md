@@ -49,37 +49,40 @@ only: **all project logic is typed C/C++ (project rule — no Python)**.
 
 ## Controls
 
-Free-flight, first-person (VR-friendly): **WASD** move, **Q/E** down/up,
+Free-flight, first-person (desktop debugging): **WASD** move, **Q/E** down/up,
 **Shift** boost, **RMB** mouse-look, **MMB** or **Shift+RMB** pan, **wheel** fly
 forward/back.
 
 **LMB** selects and drags the gizmo: a click selects the whole model under the
 cursor, **Shift+LMB** or **Ctrl+LMB** selects a single part. **1**/**G**
 translate, **2**/**R** rotate, **3** scale, **L** world/local space, **Ctrl**
-snap, **Ctrl-Z** undo (cancels a live grab), **Ctrl-Y** / **Ctrl-Shift-Z**
-redo, **Esc** quits. The gizmo sits at the centre of the selection's bounds;
-the selection is tinted and outlined.
+snap, **Ctrl-Z** undo (cancels a live edit), **Ctrl-Y** / **Ctrl-Shift-Z**
+redo, **N** spawns the next library model at the mouse aim point, **Delete**
+removes the selection (model or part), **Esc** quits. Scale is UNIFORM only —
+every scale handle drives one factor on all three axes; per-axis scaling does
+not exist. The gizmo sits at the centre of the selection's bounds; the
+selection is tinted.
 
-In VR the trigger selects the whole model and grip+trigger selects a single
-part — grip doubles as the snap/boost modifier, mirroring Ctrl's desktop
-overlap. Moving is a deliberate two-step: the first press only *selects*, and
-a second press on the already-selected target *grabs* it — hold and point
-where it should go, and the model slides on the ground plane following the
-point where your aim beam meets the floor (pointing at a spot places it there
-fast, aiming close gives precise nudges). It never lifts off the floor;
-release drops it as one undo step. This way a wobbly trigger press can only
-change the selection — it can never move anything — and a re-press within
-100 ms of a release is treated as a controller bounce, not a second click.
-Aim at a gizmo handle instead for precise axis/rotate/scale work — a handle
-wins only where it is nearer than the model surface, so grabbing the body is
-what happens when you press the model itself. The bounding box is not a
-click target: pressing empty space next to a model selects nothing. Handles
-brighten when hovered; the selection is shown by the warm tint and the
-gizmo sitting at the selection's centre. Undo/redo on the controllers: B
-(right) and Y (left) on Touch, trackpad click on Vive. Passthrough is the
-DEFAULT view: the real world with the models drawn over it (grip + menu, or
-desktop B, toggles the grid backdrop back). There are no flight controls in
-VR by design: passthrough means you walk around the real world with the
+In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
+Movement and rotation are the **sticks** (controller aim is too jittery for
+accurate placement): the **right stick** slides the selection across the floor
+relative to your head (pushing forward walks it away from you; it never lifts
+off the floor), the **left stick** turns it around vertical — turntable-style,
+never tipping it over. **Grip** held runs both at quarter speed for fine
+control. Each stick gesture is one undo step. Aim at a gizmo handle for
+precise axis/rotate/uniform-scale work — a handle wins only where it is nearer
+than the model surface. The bounding box is not a click target: pressing empty
+space next to a model selects nothing. Handles brighten when hovered; the
+selection is shown by the warm tint and the gizmo at the selection's centre.
+**A** spawns the next library model where your aim beam meets the floor (the
+library folder is rescanned every time — drop a file in and spawn it without
+restarting; spawning twice gives two instances). **Hold X** to delete: the
+selection ramps red and the delete fires at full charge (0.6 s); release
+before that to cancel. **B** (right) / **Y** (left) on Touch undo/redo,
+trackpad click on Vive. Passthrough is the DEFAULT view: the real world with
+the models drawn over it (grip + menu, or desktop B, toggles the grid backdrop
+back). There are no flight controls in VR by design: passthrough means you
+walk around the real world with the
 models placed in it, so locomotion is physical — you walk, turn and crouch,
 and the sticks are unused (their output is still logged at session end as
 controller diagnostics). The view is horizon-locked: the head's physical

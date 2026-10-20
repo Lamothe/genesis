@@ -57,11 +57,13 @@ struct XrShell::ImplData {
   XrSpace space{XR_NULL_HANDLE};
   XrActionSet actionSet{XR_NULL_HANDLE};
   XrAction triggerAction{XR_NULL_HANDLE};
-  XrAction moveAction{XR_NULL_HANDLE};
-  XrAction turnAction{XR_NULL_HANDLE};
+  XrAction leftStickAction{XR_NULL_HANDLE};
+  XrAction rightStickAction{XR_NULL_HANDLE};
   XrAction menuAction{XR_NULL_HANDLE};
-  XrAction undoAction{XR_NULL_HANDLE}; // right stick click
-  XrAction redoAction{XR_NULL_HANDLE}; // left stick click
+  XrAction undoAction{XR_NULL_HANDLE}; // B on Touch
+  XrAction redoAction{XR_NULL_HANDLE}; // Y on Touch
+  XrAction spawnAction{XR_NULL_HANDLE}; // A on Touch: spawn next library model
+  XrAction deleteAction{XR_NULL_HANDLE}; // X on Touch: hold to delete
   XrAction gripAction{XR_NULL_HANDLE};
   XrAction aimAction{XR_NULL_HANDLE};
   XrSpace aimSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE}; // left, right
@@ -84,8 +86,10 @@ struct XrShell::ImplData {
   bool menuPrev{false};
   bool undoPrev{false};
   bool redoPrev{false};
+  bool spawnPrev{false};
   bool undoPending{false}; // latched until a frame renders and consumes it
   bool redoPending{false};
+  bool spawnPending{false};
 
   // XR_KHR_vulkan_enable2 entry points.
   PFN_xrCreateVulkanInstanceKHR pfnCreateVulkanInstance{nullptr};
@@ -396,9 +400,10 @@ bool XrShell::createActions() {
     return xrOk(xrCreateAction(xr_->actionSet, &info, out), name);
   };
 
-  if (!makeFloat("trigger", &xr_->triggerAction) || !makeVec2("move", &xr_->moveAction) ||
-      !makeVec2("turn", &xr_->turnAction) || !makeBool("menu", &xr_->menuAction) ||
+  if (!makeFloat("trigger", &xr_->triggerAction) || !makeVec2("leftstick", &xr_->leftStickAction) ||
+      !makeVec2("rightstick", &xr_->rightStickAction) || !makeBool("menu", &xr_->menuAction) ||
       !makeBool("undo", &xr_->undoAction) || !makeBool("redo", &xr_->redoAction) ||
+      !makeBool("spawn", &xr_->spawnAction) || !makeBool("delete", &xr_->deleteAction) ||
       !makeFloat("grip", &xr_->gripAction) || !makePose("aim", &xr_->aimAction)) {
     return false;
   }
@@ -420,22 +425,25 @@ bool XrShell::createActions() {
       {"/interaction_profiles/oculus/touch_controller",
        {{"/user/hand/right/input/trigger/value", xr_->triggerAction},
         {"/user/hand/left/input/trigger/value", xr_->triggerAction},
-        {"/user/hand/left/input/thumbstick", xr_->moveAction},
-        {"/user/hand/right/input/thumbstick", xr_->turnAction},
+        {"/user/hand/left/input/thumbstick", xr_->leftStickAction},
+        {"/user/hand/right/input/thumbstick", xr_->rightStickAction},
         {"/user/hand/left/input/menu/click", xr_->menuAction},
         {"/user/hand/right/input/squeeze/value", xr_->gripAction},
         {"/user/hand/left/input/squeeze/value", xr_->gripAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
         {"/user/hand/left/input/aim/pose", xr_->aimAction},
-        // Undo/redo on the face buttons, NOT the stick clicks: clicking the
-        // locomotion stick mid-stride is a natural accident.
+        // Undo/redo/spawn on the face buttons, NOT the stick clicks: the
+        // sticks are the editing controls now and clicking one mid-gesture is
+        // a natural accident. A = spawn, X (held) = delete.
         {"/user/hand/right/input/b/click", xr_->undoAction},
-        {"/user/hand/left/input/y/click", xr_->redoAction}}},
+        {"/user/hand/left/input/y/click", xr_->redoAction},
+        {"/user/hand/right/input/a/click", xr_->spawnAction},
+        {"/user/hand/left/input/x/click", xr_->deleteAction}}},
       {"/interaction_profiles/htc/vive_controller",
        {{"/user/hand/right/input/trigger/click", xr_->triggerAction},
         {"/user/hand/left/input/trigger/click", xr_->triggerAction},
-        {"/user/hand/left/input/trackpad", xr_->moveAction},
-        {"/user/hand/right/input/trackpad", xr_->turnAction},
+        {"/user/hand/left/input/trackpad", xr_->leftStickAction},
+        {"/user/hand/right/input/trackpad", xr_->rightStickAction},
         {"/user/hand/right/input/menu/click", xr_->menuAction},
         {"/user/hand/left/input/menu/click", xr_->menuAction},
         {"/user/hand/right/input/squeeze/click", xr_->gripAction},
@@ -661,24 +669,24 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   input.selectReleased = !selectNow && xr_->selectPrev;
   xr_->selectPrev = selectNow;
 
-  XrActionStateVector2f moveState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
-  getInfo.action = xr_->moveAction;
+  XrActionStateVector2f leftStickState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
+  getInfo.action = xr_->leftStickAction;
   getInfo.subactionPath = leftPath;
-  xrGetActionStateVector2f(xr_->session, &getInfo, &moveState);
-  if (moveState.isActive) {
-    input.moveStick = {moveState.currentState.x, moveState.currentState.y};
-    stats_.moveXMax = std::max(stats_.moveXMax, std::abs(input.moveStick.x));
-    stats_.moveYMax = std::max(stats_.moveYMax, std::abs(input.moveStick.y));
+  xrGetActionStateVector2f(xr_->session, &getInfo, &leftStickState);
+  if (leftStickState.isActive) {
+    input.leftStick = {leftStickState.currentState.x, leftStickState.currentState.y};
+    stats_.leftXMax = std::max(stats_.leftXMax, std::abs(input.leftStick.x));
+    stats_.leftYMax = std::max(stats_.leftYMax, std::abs(input.leftStick.y));
   }
 
-  XrActionStateVector2f turnState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
-  getInfo.action = xr_->turnAction;
+  XrActionStateVector2f rightStickState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
+  getInfo.action = xr_->rightStickAction;
   getInfo.subactionPath = rightPath;
-  xrGetActionStateVector2f(xr_->session, &getInfo, &turnState);
-  if (turnState.isActive) {
-    input.turnStick = {turnState.currentState.x, turnState.currentState.y};
-    stats_.turnXMax = std::max(stats_.turnXMax, std::abs(input.turnStick.x));
-    stats_.turnYMax = std::max(stats_.turnYMax, std::abs(input.turnStick.y));
+  xrGetActionStateVector2f(xr_->session, &getInfo, &rightStickState);
+  if (rightStickState.isActive) {
+    input.rightStick = {rightStickState.currentState.x, rightStickState.currentState.y};
+    stats_.rightXMax = std::max(stats_.rightXMax, std::abs(input.rightStick.x));
+    stats_.rightYMax = std::max(stats_.rightYMax, std::abs(input.rightStick.y));
   }
 
   XrActionStateBoolean menuLeft = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
@@ -713,6 +721,23 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   xr_->redoPrev = redoNow;
   input.undoPressed = xr_->undoPending;
   input.redoPressed = xr_->redoPending;
+
+  // Spawn (A on Touch): latched like undo/redo so a skipped frame cannot
+  // swallow it. Delete (X on Touch) is a HELD state — the app turns the hold
+  // into a charge ramp and fires at full charge.
+  XrActionStateBoolean spawnState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
+  getInfo.action = xr_->spawnAction;
+  getInfo.subactionPath = rightPath;
+  xrGetActionStateBoolean(xr_->session, &getInfo, &spawnState);
+  bool spawnNow = spawnState.isActive ? spawnState.currentState : xr_->spawnPrev;
+  xr_->spawnPending = xr_->spawnPending || (spawnNow && !xr_->spawnPrev);
+  xr_->spawnPrev = spawnNow;
+  input.spawnPressed = xr_->spawnPending;
+  XrActionStateBoolean deleteState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
+  getInfo.action = xr_->deleteAction;
+  getInfo.subactionPath = leftPath;
+  xrGetActionStateBoolean(xr_->session, &getInfo, &deleteState);
+  input.deleteHeld = deleteState.isActive && deleteState.currentState;
 
   XrActionStateFloat gripState = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
   getInfo.action = xr_->gripAction;
@@ -887,6 +912,7 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   // not swallow a fresh press or replay this one.
   xr_->undoPending = false;
   xr_->redoPending = false;
+  xr_->spawnPending = false;
   return FrameStatus::Render;
 }
 

@@ -35,19 +35,29 @@ inline bool sameTransform(Transform const& a, Transform const& b) {
          a.scale.z == b.scale.z;
 }
 
-// Snapshot of every alive node's local transform, for undo/redo. Entries keep
-// NodeId order (ascending) so snapshots compare deterministically.
+// One alive node's full record: identity, hierarchy link and local transform.
+struct NodeRecord {
+  NodeId id{kInvalidNode};
+  NodeId parent{kInvalidNode};
+  Transform local{};
+};
+
+inline bool sameRecord(NodeRecord const& a, NodeRecord const& b) {
+  return a.id == b.id && a.parent == b.parent && sameTransform(a.local, b.local);
+}
+
+// Snapshot of every alive node, for undo/redo. Entries keep NodeId order
+// (ascending) so snapshots compare deterministically.
 struct SceneSnapshot {
-  std::vector<std::pair<NodeId, Transform>> transforms;
+  std::vector<NodeRecord> nodes;
 };
 
 inline bool sameSnapshot(SceneSnapshot const& a, SceneSnapshot const& b) {
-  if (a.transforms.size() != b.transforms.size()) {
+  if (a.nodes.size() != b.nodes.size()) {
     return false;
   }
-  for (std::size_t i = 0; i < a.transforms.size(); ++i) {
-    if (a.transforms[i].first != b.transforms[i].first ||
-        !sameTransform(a.transforms[i].second, b.transforms[i].second)) {
+  for (std::size_t i = 0; i < a.nodes.size(); ++i) {
+    if (!sameRecord(a.nodes[i], b.nodes[i])) {
       return false;
     }
   }
@@ -75,10 +85,15 @@ public:
   Mat4 world(NodeId id);
   Vec3 worldPosition(NodeId id);
 
-  // Undo support: capture/restore all local transforms. Restore skips nodes
-  // destroyed since the snapshot was taken.
-  SceneSnapshot snapshotTransforms() const;
-  void restoreTransforms(SceneSnapshot const& snapshot);
+  // Undo support: capture/restore every alive node (id, parent, local).
+  // Restore is a faithful state restore: nodes destroyed since the snapshot
+  // are RECREATED with their original ids (safe: ids are monotonic — create()
+  // never reuses a tombstone), and nodes created since are destroyed. The
+  // snapshot's parent links are rebuilt wholesale, so a restored hierarchy is
+  // exactly the captured one. Restore trusts the snapshot to be acyclic (all
+  // captured states are).
+  SceneSnapshot snapshot() const;
+  void restore(SceneSnapshot const& snapshot);
 
   // Monotonic counter, bumps on any structural or transform change. The neural
   // seam maps a change here to a temporal discontinuity (NEURAL-SEAM.md).

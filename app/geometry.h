@@ -26,7 +26,8 @@ struct DrawItem {
   float alphaCutoff{0.5F};
   AlphaMode alpha{AlphaMode::Opaque};
   bool lit{true};
-  float highlight{0.0F};      // 1 = selected (warm), 2 = hovered (cool)
+  float highlight{0.0F}; // 1 = selected (warm), 2 = hovered (cool),
+                         // 3 + charge = delete ramp (red; charge 0..1)
 };
 
 void appendCube(std::vector<RendererVertex>& out);
