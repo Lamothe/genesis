@@ -31,7 +31,7 @@ struct XrFrameInput {
   bool menuPressed{false};
   bool undoPressed{false};  // latched: Face button on Touch, trackpad on Vive
   bool redoPressed{false};
-  bool spawnPressed{false}; // latched: A on Touch (spawn next library model)
+  bool spawnPressed{false}; // latched: A on Touch (model chooser: stage/place)
   bool deleteHeld{false};   // X on Touch held: hold-to-delete with red ramp
   float gripHeld{0.0F};
 };

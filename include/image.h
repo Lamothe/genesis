@@ -6,6 +6,13 @@
 
 namespace vredit {
 
+// Asset files (models and images) are read whole into memory; this cap keeps a
+// corrupt or absurd file from turning into a std::bad_alloc that terminates
+// the process (a real crash seen during on-the-fly spawning). Shared by every
+// loader so the limit has one source of truth. 2 GiB is far above any real
+// asset.
+constexpr std::uint64_t kMaxAssetFileSize = 2ULL * 1024 * 1024 * 1024;
+
 // Decoded image in straight-alpha RGBA8 (row-major, top row first).
 struct Image {
   std::uint32_t width{0};

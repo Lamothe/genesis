@@ -103,6 +103,15 @@ void rotateSelectionYaw(Scene& scene,
                         std::vector<NodeId> const& selection,
                         float radians);
 
+// Uniformly scales the selection about its bounds centre (the viewer's zoom:
+// grow/shrink a model to work on it — the ONLY kind of scaling in the editor;
+// per-axis scaling does not exist). `factor` is multiplicative (1.05 = 5%
+// larger). Same parent-vs-descendant rules as the other stick helpers.
+bool scaleSelectionUniform(Scene& scene,
+                           std::vector<NodeVisual> const& visuals,
+                           std::vector<NodeId> const& selection,
+                           float factor);
+
 // Where an aim ray means "put it here": the point where the beam meets the
 // floor (y = 0). A ray that never reaches the floor (level or up-aimed)
 // falls back to 2.5 m ahead of its origin, projected onto the floor.

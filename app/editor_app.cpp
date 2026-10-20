@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,6 +53,8 @@ constexpr float kStickEndZone = 0.06F;  // ...and ENDS below this (hysteresis, s
                                         // physical gesture is one undo step)
 constexpr float kStickMoveMps = 1.5F;    // metres per second at full deflection
 constexpr float kStickTurnRadps = 1.75F; // ~100 degrees per second at full
+constexpr float kStickScaleRate = 1.2F;  // left stick Y = the viewer's zoom:
+                                         // full deflection ≈ e^1.2 growth/s
 // Hold-X delete: the delete fires when the hold reaches full charge.
 constexpr double kDeleteChargeS = 0.6;
 constexpr float kSnapTranslate = 0.25F;
@@ -116,9 +119,22 @@ struct App {
   // without a restart.
   std::string libraryDir;
   std::size_t libraryIndex{0};
+  // Staged spawn = the model CHOOSER: the library model appears at the aim
+  // point and follows it; stick X or [ ] swap between library models; the
+  // spawn key confirms (one undo step), undo cancels. All swaps happen inside
+  // one pending edit, so cancelling drops the whole staging session at once.
+  bool staging{false};
+  std::size_t stagedIndex{0};
+  std::vector<std::string> stagedFiles;
+  std::vector<vredit::NodeId> stagedRoots;
+  bool stageSwapLatched{false}; // one stick push = one swap
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
   // first deflection past the dead zone, committed when the sticks settle.
   bool stickSession{false};
+  // Accumulated zoom of the current stick gesture, clamped to [0.01x, 100x]
+  // (the gizmo's factor clamp): without a bound, ~74 s of full left-stick-Y
+  // overflows float to an infinite scale that can never be zoomed back.
+  float stickZoomLog{0.0F};
   // Hold-X delete (VR): the selection's tint ramps red over kDeleteChargeS
   // and the delete fires at full charge; release before that cancels.
   bool deleteHolding{false};
@@ -209,10 +225,13 @@ std::shared_ptr<const vredit::PickGeometry> makePickGeometry(MeshData const& dat
   return geometry;
 }
 
-bool addModelToScene(App& app,
-                     VkRenderer& renderer,
-                     Model const& model,
-                     std::vector<NodeId>* rootsOut = nullptr) {
+// The insertion itself: copies mesh/pick data and allocates, so it CAN throw
+// on a hostile/huge model. Never let that terminate the process (this runs on
+// arbitrary user files during on-the-fly spawning).
+bool addModelToSceneImpl(App& app,
+                         VkRenderer& renderer,
+                         Model const& model,
+                         std::vector<NodeId>* rootsOut = nullptr) {
   std::vector<MeshHandle> meshHandles(model.meshes.size(), 0U);
   std::vector<std::shared_ptr<const vredit::PickGeometry>> pickGeometries(model.meshes.size());
   for (std::size_t m = 0; m < model.meshes.size(); ++m) {
@@ -268,6 +287,18 @@ bool addModelToScene(App& app,
     }
   }
   return true;
+}
+
+bool addModelToScene(App& app,
+                     VkRenderer& renderer,
+                     Model const& model,
+                     std::vector<NodeId>* rootsOut = nullptr) {
+  try {
+    return addModelToSceneImpl(app, renderer, model, rootsOut);
+  } catch (std::exception const& e) {
+    std::printf("model insertion failed (%s) — model not added\n", e.what());
+    return false;
+  }
 }
 
 // Frames the camera on the combined world bounds of all visuals.
@@ -499,6 +530,7 @@ void applySnapshot(App& app, vredit::EditorSnapshot const& state) {
 // Defined below; pointerPress commits any live edit before starting anew.
 bool endDrag(App& app);
 bool endEdits(App& app);
+bool cancelStaging(App& app);
 
 // Pointer interaction shared by the mouse and the VR controller ray. The
 // caller resolves the handle under the pointer (screen-space for the mouse,
@@ -512,6 +544,12 @@ void pointerPress(App& app,
                   Vec3 const& viewDir,
                   PointerTarget const& target,
                   bool partSelect) {
+  // While staging a spawn the chooser owns the interaction: the staged model
+  // follows the aim, clicks do nothing (they would also tangle with the one
+  // pending edit covering the whole staging session).
+  if (app.staging) {
+    return;
+  }
   // A press while a live edit is running means its release was never seen
   // (pointer left the window) or a stick gesture is mid-flight: commit it as
   // one undo step before starting over. endEdits covers BOTH engines (drag
@@ -573,6 +611,10 @@ void cancelLiveEdit(App& app) {
   app.drag.end();
   app.dragging = false;
   app.stickSession = false;
+  if (app.staging) {
+    cancelStaging(app); // one rollback drops every staged change
+    return;
+  }
   vredit::EditorSnapshot state = snapshot(app);
   if (app.undo.cancel(state)) {
     applySnapshot(app, state);
@@ -598,7 +640,10 @@ bool endEdits(App& app) {
 // The one delete rule (see deleteSubtrees): removes the selected models or
 // parts — subtrees rooted at the selection — as one undo step.
 bool deleteSelection(App& app) {
-  if (app.selection.empty()) {
+  if (app.selection.empty() || app.staging) {
+    // While staging, delete must not fire: it would auto-commit the pending
+    // staging edit (undo.begin commits) and delete the PRE-staging selection
+    // mid-chooser. The chooser owns the session; nothing else mutates.
     return false;
   }
   endEdits(app);
@@ -606,6 +651,18 @@ bool deleteSelection(App& app) {
   std::vector<NodeId> const targets = app.selection;
   vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection, targets);
   return app.undo.commit(snapshot(app));
+}
+
+// Lowercased 4-character filename suffix for extension checks. The library
+// scan and the loader entry point share this so "Model.GLB" can never pass
+// one and fail the other (that mismatch was the "stopped loading models"
+// report: case-sensitive loader vs case-insensitive scan).
+std::string lowerSuffix(std::string const& name) {
+  std::string ext = name.size() >= 4U ? name.substr(name.size() - 4U) : std::string();
+  for (char& c : ext) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return ext;
 }
 
 // The spawn library: every .glb/.obj under the folder. Rescanned on every
@@ -623,8 +680,9 @@ std::vector<std::string> scanLibrary(std::string const& dir) {
       continue;
     }
     std::string const name = it->path().filename().string();
-    bool const glb = name.size() >= 4U && name.compare(name.size() - 4U, 4U, ".glb") == 0;
-    bool const obj = name.size() >= 4U && name.compare(name.size() - 4U, 4U, ".obj") == 0;
+    std::string const ext = lowerSuffix(name);
+    bool const glb = ext == ".glb";
+    bool const obj = ext == ".obj";
     if (glb || obj) {
       out.push_back(it->path().string());
     }
@@ -634,44 +692,138 @@ std::vector<std::string> scanLibrary(std::string const& dir) {
 }
 
 bool loadModelFile(std::string const& path, Model& model, std::string& error) {
-  if (path.size() >= 4U && path.compare(path.size() - 4U, 4U, ".glb") == 0) {
-    return loadGlbFile(path.c_str(), model, error);
-  }
-  if (path.size() >= 4U && path.compare(path.size() - 4U, 4U, ".obj") == 0) {
-    return loadObjFile(path.c_str(), model, error);
-  }
-  error = "unsupported model type (want .glb or .obj)";
-  return false;
-}
-
-// Spawn-on-the-fly (N on desktop, A in VR): loads the next library model and
-// places it ON THE FLOOR at the aim point ("look where you want it").
-// Spawning the same file twice gives two instances. One undo step; a failed
-// load rolls the scene back completely, as if the spawn never happened.
-bool spawnNextModel(App& app, VkRenderer& renderer, Ray const& aimRay) {
-  std::vector<std::string> const library = scanLibrary(app.libraryDir);
-  if (library.empty()) {
-    std::printf("[library] no .glb/.obj models in %s\n", app.libraryDir.c_str());
+  // Extension matching is case-INSENSITIVE (see lowerSuffix).
+  try {
+    std::string const ext = lowerSuffix(path);
+    if (ext == ".glb") {
+      return loadGlbFile(path.c_str(), model, error);
+    }
+    if (ext == ".obj") {
+      return loadObjFile(path.c_str(), model, error);
+    }
+    error = "unsupported model type (want .glb or .obj)";
+    return false;
+  } catch (std::exception const& e) {
+    // A loader must never take the process down: treat allocation/format
+    // surprises as a failed load (this path is exercised by on-the-fly spawns
+    // of arbitrary user files).
+    error = std::string("load failed (") + e.what() + ")";
     return false;
   }
-  std::string const path = library[app.libraryIndex % library.size()];
-  app.libraryIndex = (app.libraryIndex + 1U) % library.size();
-  endEdits(app);
-  app.undo.begin(snapshot(app));
+}
+
+// The model chooser ("I want a way to select the model to open"). The spawn
+// key stages a library model at the aim point — it appears and FOLLOWS the
+// aim — and stick X / [ ] cycle through the library until the right one is
+// showing. The spawn key again confirms (one undo step), undo cancels the
+// whole staging session. Everything happens inside one pending edit, so the
+// scene can never be left half-staged, and a failed load rolls back cleanly.
+
+// Loads library[index] as the staged model at the aim point.
+bool stageLoadAt(App& app, VkRenderer& renderer, Ray const& aimRay, std::size_t index) {
+  std::size_t const count = app.stagedFiles.size();
+  std::string const& path = app.stagedFiles[index % count];
   Model model;
   std::string error;
   std::vector<NodeId> roots;
   if (!loadModelFile(path, model, error) || !addModelToScene(app, renderer, model, &roots)) {
-    std::printf("failed to spawn %s: %s\n", path.c_str(), error.c_str());
+    if (error.empty()) {
+      error = "could not add to scene (GPU registration failed?)";
+    }
+    std::printf("cannot open %s: %s\n", path.c_str(), error.c_str());
+    return false;
+  }
+  vredit::placeOnFloor(app.scene, app.visuals, roots, vredit::floorAimPoint(aimRay));
+  app.stagedIndex = index % count;
+  app.stagedRoots = std::move(roots);
+  return true;
+}
+
+// Removes the staged model (a swap), leaving the pending edit in place so the
+// caller can stage another one.
+void stageRemove(App& app) {
+  if (app.stagedRoots.empty()) {
+    return;
+  }
+  vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection,
+                         app.stagedRoots);
+  app.stagedRoots.clear();
+}
+
+// Spawn key: starts staging, or confirms the staged model when staging.
+bool stageOrConfirm(App& app, VkRenderer& renderer, Ray const& aimRay) {
+  if (app.staging) {
+    if (app.stagedRoots.empty()) {
+      // Nothing is staged (every library model failed to load): claiming
+      // "placed" here would commit a no-op edit and mislead.
+      std::printf("[spawn] nothing staged — cancelled\n");
+      return cancelStaging(app);
+    }
+    app.staging = false;
+    app.stageSwapLatched = false;
+    app.undo.commit(snapshot(app));
+    std::printf("[spawn] placed %s\n", app.stagedFiles[app.stagedIndex].c_str());
+    return true;
+  }
+  app.stagedFiles = scanLibrary(app.libraryDir);
+  if (app.stagedFiles.empty()) {
+    std::printf("[library] no .glb/.obj models in %s\n", app.libraryDir.c_str());
+    return false;
+  }
+  endEdits(app);
+  app.undo.begin(snapshot(app));
+  if (!stageLoadAt(app, renderer, aimRay, 0)) {
     vredit::EditorSnapshot rollback = snapshot(app);
     if (app.undo.cancel(rollback)) {
       applySnapshot(app, rollback);
     }
     return false;
   }
-  vredit::placeOnFloor(app.scene, app.visuals, roots, vredit::floorAimPoint(aimRay));
-  app.undo.commit(snapshot(app));
-  std::printf("spawned %s\n", path.c_str());
+  app.staging = true;
+  std::printf("[spawn] staging %s (%zu models in %s)\n"
+              "[spawn]   spawn key places it, stick X / [ ] changes model, undo cancels\n",
+              app.stagedFiles[app.stagedIndex].c_str(), app.stagedFiles.size(),
+              app.libraryDir.c_str());
+  return true;
+}
+
+// Swap the staged model for another library one (inside the pending edit).
+// Unloadable files are skipped instead of getting stuck on one.
+void stageSwap(App& app, VkRenderer& renderer, Ray const& aimRay, int direction) {
+  if (!app.staging || app.stagedFiles.empty()) {
+    return;
+  }
+  std::size_t const count = app.stagedFiles.size();
+  std::size_t const step = direction > 0 ? 1U : count - 1U;
+  std::size_t next = (app.stagedIndex + step) % count;
+  stageRemove(app);
+  for (std::size_t attempt = 0; attempt < count; ++attempt) {
+    if (stageLoadAt(app, renderer, aimRay, next)) {
+      std::printf("[spawn] staging %s (%zu/%zu)\n", app.stagedFiles[app.stagedIndex].c_str(),
+                  app.stagedIndex + 1U, count);
+      return;
+    }
+    next = (next + step) % count;
+  }
+  // Every file failed: end the session cleanly rather than leaving an empty
+  // staging state whose "confirm" would be meaningless.
+  std::printf("[spawn] no loadable model in %s\n", app.libraryDir.c_str());
+  cancelStaging(app);
+}
+
+// Cancel the staging session: one rollback drops every staged change.
+bool cancelStaging(App& app) {
+  if (!app.staging) {
+    return false;
+  }
+  app.staging = false;
+  app.stageSwapLatched = false; // a latched stick must not kill the next session's first swap
+  vredit::EditorSnapshot rollback = snapshot(app);
+  if (app.undo.cancel(rollback)) {
+    applySnapshot(app, rollback);
+  }
+  app.stagedRoots.clear();
+  std::printf("[spawn] cancelled\n");
   return true;
 }
 
@@ -927,7 +1079,7 @@ void handleEvent(App& app,
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
       // Undo/redo during a live edit cancels that edit first and stops there,
       // leaving both stacks untouched (see cancelLiveEdit).
-      if (app.dragging || app.stickSession) {
+      if (app.dragging || app.stickSession || app.staging) {
         cancelLiveEdit(app);
         break;
       }
@@ -938,7 +1090,7 @@ void handleEvent(App& app,
       }
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      if (app.dragging || app.stickSession) {
+      if (app.dragging || app.stickSession || app.staging) {
         cancelLiveEdit(app);
         break;
       }
@@ -953,9 +1105,13 @@ void handleEvent(App& app,
       // Delete / Backspace: remove the selection (model or part).
       deleteSelection(app);
     } else if (keysym == 'n' || keysym == 'N') {
-      // Spawn the next library model at the mouse aim point (rescanned every
-      // time: a file dropped into the folder mid-session is spawnable at once).
-      spawnNextModel(app, renderer, appRay(app, app.lastMouse));
+      // The model chooser: stages a library model at the mouse aim point, or
+      // places the staged one. [ ] change which library model is showing.
+      (void)stageOrConfirm(app, renderer, appRay(app, app.lastMouse));
+    } else if (keysym == '[') {
+      stageSwap(app, renderer, appRay(app, app.lastMouse), -1);
+    } else if (keysym == ']') {
+      stageSwap(app, renderer, appRay(app, app.lastMouse), 1);
     } else if (keysym == '1' || keysym == 'g' || keysym == 'G') {
       app.mode = GizmoMode::Translate;
       stateChanged = true;
@@ -1529,7 +1685,7 @@ int runXr(char const* shaderDir,
     }
     bool cancelledLiveEdit = false;
     if (input.undoPressed) {
-      if (app.dragging || app.stickSession) {
+      if (app.dragging || app.stickSession || app.staging) {
         cancelLiveEdit(app);
         cancelledLiveEdit = true;
       } else {
@@ -1542,7 +1698,7 @@ int runXr(char const* shaderDir,
     // Same guard as the desktop keys: one cancel per frame leaves both stacks
     // untouched even if both arrive together.
     if (input.redoPressed && !cancelledLiveEdit) {
-      if (app.dragging || app.stickSession) {
+      if (app.dragging || app.stickSession || app.staging) {
         cancelLiveEdit(app);
       } else {
         vredit::EditorSnapshot state = snapshot(app);
@@ -1597,12 +1753,17 @@ int runXr(char const* shaderDir,
                           : Vec3{0.0F, 0.0F, -1.0F};
     Vec3 const headRightFlat = cross(headForwardFlat, Vec3{0.0F, 1.0F, 0.0F});
     float const stickThreshold = app.stickSession ? kStickEndZone : kStickDeadZone;
+    // ALL four stick axes count: left stick Y (zoom) was missing here, which
+    // made a pure up/down push start no edit session and scale nothing.
     bool const sticksActive = std::fabs(input.rightStick.x) > stickThreshold ||
                               std::fabs(input.rightStick.y) > stickThreshold ||
-                              std::fabs(input.leftStick.x) > stickThreshold;
-    if (sticksActive && !app.stickSession && !app.dragging && !app.selection.empty()) {
+                              std::fabs(input.leftStick.x) > stickThreshold ||
+                              std::fabs(input.leftStick.y) > stickThreshold;
+    if (sticksActive && !app.stickSession && !app.dragging && !app.staging &&
+        !app.selection.empty()) {
       app.undo.begin(snapshot(app));
       app.stickSession = true;
+      app.stickZoomLog = 0.0F; // each gesture zooms 0.01x..100x max
     }
     if (app.stickSession && !app.dragging) {
       if (sticksActive && !app.selection.empty()) {
@@ -1615,6 +1776,18 @@ int runXr(char const* shaderDir,
         float const yawDelta = -input.leftStick.x * kStickTurnRadps * stickFine * dt;
         if (yawDelta != 0.0F) {
           vredit::rotateSelectionYaw(app.scene, app.visuals, app.selection, yawDelta);
+        }
+        // Left stick Y = the viewer's zoom: grow/shrink the selection
+        // uniformly (never per-axis) — walk closer, or make it bigger.
+        if (std::fabs(input.leftStick.y) > 0.02F) {
+          float const logStep = input.leftStick.y * kStickScaleRate * stickFine * dt;
+          float const previousLog = app.stickZoomLog;
+          float const clamped =
+              std::clamp(previousLog + logStep, -4.6F, 4.6F); // [0.01x, 100x]
+          app.stickZoomLog = clamped;
+          // Apply the ACTUAL step taken (clamped), not the request.
+          vredit::scaleSelectionUniform(app.scene, app.visuals, app.selection,
+                                        std::exp(clamped - previousLog));
         }
       } else {
         app.undo.commit(snapshot(app));
@@ -1643,8 +1816,30 @@ int runXr(char const* shaderDir,
       app.deleteHolding = false;
       app.deleteCharge = 0.0F;
     }
-    if (input.spawnPressed) {
-      spawnNextModel(app, renderer, worldRay);
+    // The model chooser: the spawn key stages a library model at the aim
+    // point (or places the staged one), grip+spawn cancels the staging.
+    if (input.spawnPressed && input.gripHeld > 0.5F) {
+      cancelStaging(app);
+    } else if (input.spawnPressed) {
+      (void)stageOrConfirm(app, renderer, worldRay);
+    }
+    // While staging, the LEFT stick swaps between library models (the whole
+    // point of the session — rotating the selection can wait), latched so one
+    // deliberate push = one swap.
+    if (app.staging) {
+      float const cycle = input.leftStick.x;
+      bool const past = std::fabs(cycle) > 0.5F;
+      if (past && !app.stageSwapLatched) {
+        stageSwap(app, renderer, worldRay, cycle > 0.0F ? 1 : -1);
+        app.stageSwapLatched = true;
+      } else if (std::fabs(cycle) < 0.3F) {
+        app.stageSwapLatched = false;
+      }
+      // The staged model follows the aim point — aim where it should land.
+      if (!app.stagedRoots.empty()) {
+        vredit::placeOnFloor(app.scene, app.visuals, app.stagedRoots,
+                             vredit::floorAimPoint(worldRay));
+      }
     }
 
     std::vector<DrawItem> items;
@@ -1813,6 +2008,12 @@ int runInteractive(char const* shaderDir,
       dt = 0.1F; // tab stalls must not teleport the camera
     }
     updateFlight(app, dt);
+    // While staging a spawn, the staged model follows the mouse aim point —
+    // the same "aim where it should land" behaviour as VR.
+    if (app.staging && !app.stagedRoots.empty()) {
+      vredit::placeOnFloor(app.scene, app.visuals, app.stagedRoots,
+                           vredit::floorAimPoint(appRay(app, app.lastMouse)));
+    }
     if (app.width == 0U || app.height == 0U) {
       std::this_thread::sleep_for(std::chrono::milliseconds(8)); // minimised: no busy spin
       continue;
@@ -1893,11 +2094,12 @@ int main(int argc, char** argv) {
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
           "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n"
           "keys: WASD/QE fly (RMB look), 1/2/3 move/rotate/scale, L space,\n"
-          "      N spawn next library model, Delete remove selection,\n"
+          "      N stage/place model, [ ] change staged model, Delete remove,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
           "vr:   trigger select (grip+trigger part), right stick move on the floor,\n"
-          "      left stick rotate (grip = fine), A spawn, hold X delete,\n"
-          "      B/Y undo/redo, grip+menu backdrop, menu gizmo mode\n");
+          "      left stick rotate, left stick up/down zoom (uniform scale),\n"
+          "      grip = fine, A stage/place model, stick X change staged model,\n"
+          "      hold X delete, B/Y undo/redo, grip+menu backdrop\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);

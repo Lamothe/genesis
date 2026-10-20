@@ -407,6 +407,17 @@ bool loadObjFile(char const* path, Model& out, std::string& error) {
     error = std::string("cannot open ") + path;
     return false;
   }
+  file.seekg(0, std::ios::end);
+  std::streamsize const size = file.tellg();
+  if (size < 0) {
+    error = std::string("cannot read ") + path;
+    return false;
+  }
+  if (static_cast<std::uint64_t>(size) > kMaxAssetFileSize) {
+    error = std::string("model too large (over 2 GiB): ") + path;
+    return false;
+  }
+  file.seekg(0);
   std::ostringstream content;
   content << file.rdbuf();
   std::string text = content.str();

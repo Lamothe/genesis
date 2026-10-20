@@ -203,6 +203,27 @@ void rotateSelectionYaw(Scene& scene,
   applyDragStarts(scene, starts, delta);
 }
 
+bool scaleSelectionUniform(Scene& scene,
+                           std::vector<NodeVisual> const& visuals,
+                           std::vector<NodeId> const& selection,
+                           float factor) {
+  if (!(factor > 0.0F)) {
+    return false;
+  }
+  Aabb bounds{};
+  if (!nodesBounds(scene, visuals, selection, bounds)) {
+    return false;
+  }
+  Vec3 const pivot = aabbCentre(bounds);
+  std::vector<DragStart> starts;
+  captureDragStarts(scene, selection, starts);
+  Mat4 const delta = mul(translationMatrix(pivot),
+                         mul(scaleMatrix(Vec3{factor, factor, factor}),
+                             translationMatrix(-pivot)));
+  applyDragStarts(scene, starts, delta);
+  return true;
+}
+
 Vec3 floorAimPoint(Ray const& aimRay) {
   if (aimRay.direction.y < -1e-4F) {
     float const t = -aimRay.origin.y / aimRay.direction.y;

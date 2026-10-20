@@ -1260,6 +1260,47 @@ void testStickMotion() {
   CHECK_NEAR3(scene.local(child).translation, {1.0F, 0.0F, 0.0F});
 }
 
+void testScaleSelectionUniform() {
+  // The viewer's zoom: grow/shrink a model uniformly about its bounds centre.
+  // Points at (2,0,0) and (2,0,-1) give a known centre (2,0,-0.5).
+  vredit::Scene scene;
+  vredit::NodeId parent = scene.create();
+  vredit::NodeId child = scene.create(parent);
+  vredit::NodeVisual vp;
+  vp.id = parent;
+  vredit::NodeVisual vc;
+  vc.id = child;
+  std::vector<vredit::NodeVisual> visuals{vp, vc};
+
+  vredit::Transform parentStart;
+  parentStart.translation = {2.0F, 0.0F, 0.0F};
+  scene.setLocal(parent, parentStart);
+  vredit::Transform childStart;
+  childStart.translation = {0.0F, 0.0F, -1.0F};
+  scene.setLocal(child, childStart);
+
+  CHECK(vredit::scaleSelectionUniform(scene, visuals, {parent, child}, 2.0F));
+  // The bounds centre stays put and both points spread 2x from it.
+  CHECK_NEAR3(scene.worldPosition(parent), {2.0F, 0.0F, 0.5F});
+  // The selected child RIDES: local untouched, world scaled with the parent.
+  CHECK_NEAR3(scene.local(child).translation, {0.0F, 0.0F, -1.0F});
+  CHECK_NEAR3(scene.worldPosition(child), {2.0F, 0.0F, -1.5F});
+
+  // UNIFORM: every basis axis of the world matrix grows identically (the
+  // columns are the basis vectors in this column-major Mat4).
+  vredit::Mat4 const world = scene.world(parent);
+  CHECK_NEAR(vredit::length(vredit::Vec3{world.m[0], world.m[1], world.m[2]}), 2.0F, 1e-5F);
+  CHECK_NEAR(vredit::length(vredit::Vec3{world.m[4], world.m[5], world.m[6]}), 2.0F, 1e-5F);
+  CHECK_NEAR(vredit::length(vredit::Vec3{world.m[8], world.m[9], world.m[10]}), 2.0F, 1e-5F);
+
+  // Guards: zero/negative factors and an empty selection change nothing.
+  vredit::Vec3 const before = scene.worldPosition(parent);
+  CHECK(!vredit::scaleSelectionUniform(scene, visuals, {parent}, 0.0F));
+  CHECK(!vredit::scaleSelectionUniform(scene, visuals, {parent}, -1.0F));
+  CHECK(!vredit::scaleSelectionUniform(scene, visuals, {}, 1.5F));
+  CHECK_NEAR3(scene.worldPosition(parent), before);
+}
+
 void testEditorStateOps() {
   using vredit::EditorSnapshot;
   using vredit::ModelGroups;
@@ -2190,6 +2231,7 @@ int main() {
   testMipChain();
   testSegmentAndPolygonPicking();
   testStickMotion();
+  testScaleSelectionUniform();
   testEditorStateOps();
   testHandlePicking();
   testHandlePickingBehindCamera();

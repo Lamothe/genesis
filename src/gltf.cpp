@@ -771,6 +771,7 @@ bool loadGlb(std::vector<std::uint8_t> const& bytes, Model& out, std::string& er
   return true;
 }
 
+// The size cap (kMaxAssetFileSize, image.h) guards hostile files — see there.
 bool loadGlbFile(char const* path, Model& out, std::string& error) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file) {
@@ -780,6 +781,10 @@ bool loadGlbFile(char const* path, Model& out, std::string& error) {
   std::streamsize size = file.tellg();
   if (size < 0) {
     error = std::string("cannot read ") + path;
+    return false;
+  }
+  if (static_cast<std::uint64_t>(size) > kMaxAssetFileSize) {
+    error = std::string("model too large (over 2 GiB): ") + path;
     return false;
   }
   file.seekg(0);

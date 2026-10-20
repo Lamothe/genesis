@@ -62,7 +62,7 @@ struct XrShell::ImplData {
   XrAction menuAction{XR_NULL_HANDLE};
   XrAction undoAction{XR_NULL_HANDLE}; // B on Touch
   XrAction redoAction{XR_NULL_HANDLE}; // Y on Touch
-  XrAction spawnAction{XR_NULL_HANDLE}; // A on Touch: spawn next library model
+  XrAction spawnAction{XR_NULL_HANDLE}; // A on Touch: model chooser (stage/place)
   XrAction deleteAction{XR_NULL_HANDLE}; // X on Touch: hold to delete
   XrAction gripAction{XR_NULL_HANDLE};
   XrAction aimAction{XR_NULL_HANDLE};

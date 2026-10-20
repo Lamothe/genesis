@@ -33,7 +33,7 @@ renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash run-tests.sh        # core tests (435 checks; image fixtures via ImageMagick)
+bash run-tests.sh        # core tests (548 checks; image fixtures via ImageMagick)
 bash run-editor.sh       # build + interactive editor
 bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
@@ -57,35 +57,40 @@ forward/back.
 cursor, **Shift+LMB** or **Ctrl+LMB** selects a single part. **1**/**G**
 translate, **2**/**R** rotate, **3** scale, **L** world/local space, **Ctrl**
 snap, **Ctrl-Z** undo (cancels a live edit), **Ctrl-Y** / **Ctrl-Shift-Z**
-redo, **N** spawns the next library model at the mouse aim point, **Delete**
-removes the selection (model or part), **Esc** quits. Scale is UNIFORM only —
-every scale handle drives one factor on all three axes; per-axis scaling does
-not exist. The gizmo sits at the centre of the selection's bounds; the
-selection is tinted.
+redo, **N** stages a library model at the mouse aim point (**[** / **]**
+change which library model is staged; **N** again places it, Ctrl-Z cancels
+the whole staging session), **Delete** removes the selection (model or part),
+**Esc** quits. Scale is UNIFORM only — every scale handle drives one factor on
+all three axes; per-axis scaling does not exist. The gizmo sits at the centre
+of the selection's bounds; the selection is tinted.
 
 In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
 Movement and rotation are the **sticks** (controller aim is too jittery for
 accurate placement): the **right stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
 off the floor), the **left stick** turns it around vertical — turntable-style,
-never tipping it over. **Grip** held runs both at quarter speed for fine
-control. Each stick gesture is one undo step. Aim at a gizmo handle for
-precise axis/rotate/uniform-scale work — a handle wins only where it is nearer
-than the model surface. The bounding box is not a click target: pressing empty
-space next to a model selects nothing. Handles brighten when hovered; the
-selection is shown by the warm tint and the gizmo at the selection's centre.
-**A** spawns the next library model where your aim beam meets the floor (the
+never tipping it over. **Left stick up/down is the zoom**: it grows/shrinks
+the selection uniformly (walk closer, or make the model bigger). **Grip** held
+runs all three at quarter speed for fine control. Each stick gesture is one
+undo step. Aim at a gizmo handle for precise axis/rotate/uniform-scale work —
+a handle wins only where it is nearer than the model surface. The bounding box
+is not a click target: pressing empty space next to a model selects nothing.
+Handles brighten when hovered; the selection is shown by the warm tint and the
+gizmo at the selection's centre. **A** is the model chooser: the first press
+stages a library model where your aim beam meets the floor — it appears and
+FOLLOWS your aim, **stick X** changes which library model is showing (the
 library folder is rescanned every time — drop a file in and spawn it without
-restarting; spawning twice gives two instances). **Hold X** to delete: the
+restarting), **A** again places it as one undo step, and undo (or grip+A)
+cancels the whole staging session. **Hold X** to delete: the
 selection ramps red and the delete fires at full charge (0.6 s); release
 before that to cancel. **B** (right) / **Y** (left) on Touch undo/redo,
 trackpad click on Vive. Passthrough is the DEFAULT view: the real world with
 the models drawn over it (grip + menu, or desktop B, toggles the grid backdrop
 back). There are no flight controls in VR by design: passthrough means you
 walk around the real world with the
-models placed in it, so locomotion is physical — you walk, turn and crouch,
-and the sticks are unused (their output is still logged at session end as
-controller diagnostics). The view is horizon-locked: the head's physical
+models placed in it, so locomotion is physical — you walk, turn and crouch.
+The sticks are for EDITING, not locomotion (their output is still logged at
+session end as controller diagnostics). The view is horizon-locked: the head's physical
 roll is stripped (the look direction is kept exactly), so the ground stays
 level with gravity however you move or turn. Desktop keeps its keyboard
 flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
