@@ -84,6 +84,12 @@ void panCamera(Camera& camera, float dx, float dy, float viewportHeight) {
 // state is unit-testable; the app uses it directly.
 using vredit::NodeVisual;
 
+struct GallerySlot {
+  std::string file;
+  std::vector<vredit::NodeId> roots; // top-level nodes of the preview load
+  std::vector<vredit::NodeId> nodes; // the preview's whole node set (hover)
+};
+
 struct App {
   Scene scene;
   std::vector<NodeVisual> visuals;
@@ -116,18 +122,21 @@ struct App {
   // is rescanned on every spawn, so a file dropped in mid-session is spawnable
   // without a restart.
   std::string libraryDir;
-  // Staged spawn = the model CHOOSER: the library model appears at the aim
-  // point and follows it; stick X or [ ] swap between library models; the
-  // spawn key confirms (one undo step), undo cancels. All swaps happen inside
-  // one pending edit, so cancelling drops the whole staging session at once.
-  bool staging{false};
-  std::size_t stagedIndex{0};
-  std::vector<std::string> stagedFiles;
-  std::vector<vredit::NodeId> stagedRoots;
-  bool stageSwapLatched{false}; // one stick push = one swap
+  // The model gallery (spawn key): small geometry-only previews of the library
+  // in an arc; the aimed one brightens, the trigger spawns the full model at
+  // the aim point (one undo step). Previews never touch undo history.
+  bool galleryActive{false};
+  std::vector<GallerySlot> gallerySlots;
+  std::vector<vredit::NodeId> galleryHoverNodes; // warm-tinted in the frame
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
   // first deflection past the dead zone, committed when the sticks settle.
   bool stickSession{false};
+  // Menu tap/hold (VR): tap cycles the gizmo mode (fires on release), hold
+  // toggles the backdrop once at 0.4 s and cancels the tap.
+  float menuCharge{0.0F};
+  bool menuHoldLatched{false};
+  bool menuTapped{false};
+  bool menuPrevHeld{false};
   // Hold-X delete (VR): the selection's tint ramps red over kDeleteChargeS
   // and the delete fires at full charge; release before that cancels.
   bool deleteHolding{false};
@@ -237,6 +246,13 @@ bool addModelToSceneImpl(App& app,
   }
   std::vector<TextureHandle> textureHandles(model.textures.size(), 0U);
   for (std::size_t t = 0; t < model.textures.size(); ++t) {
+    Image const& image = model.textures[t].image;
+    if (image.width == 0 || image.height == 0) {
+      // An empty image (the geometry-only preview loads, or a skipped decode)
+      // means UNTEXTURED — handle 0 binds nothing. It is not a failure.
+      textureHandles[t] = 0U;
+      continue;
+    }
     textureHandles[t] = renderer.addTexture(model.textures[t].image, model.textures[t].repeatU,
                                             model.textures[t].repeatV);
     if (textureHandles[t] == kInvalidTexture) {
@@ -271,7 +287,10 @@ bool addModelToSceneImpl(App& app,
         visual.texture = textureHandles[static_cast<std::size_t>(mesh.texture)];
       }
       if (mesh.normalTexture >= 0 &&
-          static_cast<std::size_t>(mesh.normalTexture) < textureHandles.size()) {
+          static_cast<std::size_t>(mesh.normalTexture) < textureHandles.size() &&
+          model.textures[static_cast<std::size_t>(mesh.normalTexture)].image.width > 0U) {
+        // An empty normal image (geometry-only previews) means FLAT: binding
+        // the white fallback as a normal map would distort the lighting.
         visual.normalTexture = textureHandles[static_cast<std::size_t>(mesh.normalTexture)];
         visual.normalMapped = true;
         visual.normalScale = mesh.normalScale;
@@ -486,8 +505,8 @@ PointerTarget resolvePointerTarget(App& app, Ray const& ray, float thresholdPx) 
 // mid-edit. Model hover tints were explicitly rejected.
 void updateHover(App& app, Ray const& ray, float thresholdPx, bool partSelect) {
   app.hoverHandle.reset();
-  if (app.dragging || app.stickSession) {
-    return;
+  if (app.dragging || app.stickSession || app.galleryActive) {
+    return; // the gallery runs its own preview hover instead
   }
   PointerTarget target = resolvePointerTarget(app, ray, thresholdPx);
   if (target.handle.has_value()) {
@@ -523,7 +542,8 @@ void applySnapshot(App& app, vredit::EditorSnapshot const& state) {
 // Defined below; pointerPress commits any live edit before starting anew.
 bool endDrag(App& app);
 bool endEdits(App& app);
-bool cancelStaging(App& app);
+void galleryClose(App& app);
+bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay);
 
 // Pointer interaction shared by the mouse and the VR controller ray. The
 // caller resolves the handle under the pointer (screen-space for the mouse,
@@ -537,10 +557,9 @@ void pointerPress(App& app,
                   Vec3 const& viewDir,
                   PointerTarget const& target,
                   bool partSelect) {
-  // While staging a spawn the chooser owns the interaction: the staged model
-  // follows the aim, clicks do nothing (they would also tangle with the one
-  // pending edit covering the whole staging session).
-  if (app.staging) {
+  // While the model gallery is open it owns the interaction: previews are
+  // transient UI and clicking elsewhere must not touch the world.
+  if (app.galleryActive) {
     return;
   }
   // A press while a live edit is running means its release was never seen
@@ -604,8 +623,8 @@ void cancelLiveEdit(App& app) {
   app.drag.end();
   app.dragging = false;
   app.stickSession = false;
-  if (app.staging) {
-    cancelStaging(app); // one rollback drops every staged change
+  if (app.galleryActive) {
+    galleryClose(app); // previews leave; no history was taken for them
     return;
   }
   vredit::EditorSnapshot state = snapshot(app);
@@ -633,10 +652,9 @@ bool endEdits(App& app) {
 // The one delete rule (see deleteSubtrees): removes the selected models or
 // parts — subtrees rooted at the selection — as one undo step.
 bool deleteSelection(App& app) {
-  if (app.selection.empty() || app.staging) {
-    // While staging, delete must not fire: it would auto-commit the pending
-    // staging edit (undo.begin commits) and delete the PRE-staging selection
-    // mid-chooser. The chooser owns the session; nothing else mutates.
+  if (app.selection.empty() || app.galleryActive) {
+    // While the gallery is open, delete must not fire: the previews are
+    // transient UI and the gallery owns the session. Nothing else mutates.
     return false;
   }
   endEdits(app);
@@ -684,15 +702,18 @@ std::vector<std::string> scanLibrary(std::string const& dir) {
   return out;
 }
 
-bool loadModelFile(std::string const& path, Model& model, std::string& error) {
+bool loadModelFile(std::string const& path,
+                   Model& model,
+                   std::string& error,
+                   bool withImages = true) {
   // Extension matching is case-INSENSITIVE (see lowerSuffix).
   try {
     std::string const ext = lowerSuffix(path);
     if (ext == ".glb") {
-      return loadGlbFile(path.c_str(), model, error);
+      return loadGlbFile(path.c_str(), model, error, withImages);
     }
     if (ext == ".obj") {
-      return loadObjFile(path.c_str(), model, error);
+      return loadObjFile(path.c_str(), model, error, withImages);
     }
     error = "unsupported model type (want .glb or .obj)";
     return false;
@@ -705,122 +726,185 @@ bool loadModelFile(std::string const& path, Model& model, std::string& error) {
   }
 }
 
-// The model chooser ("I want a way to select the model to open"). The spawn
-// key stages a library model at the aim point — it appears and FOLLOWS the
-// aim — and stick X / [ ] cycle through the library until the right one is
-// showing. The spawn key again confirms (one undo step), undo cancels the
-// whole staging session. Everything happens inside one pending edit, so the
-// scene can never be left half-staged, and a failed load rolls back cleanly.
+// The model gallery ("I want a model selector"). The spawn key opens a
+// gallery: small, geometry-only preview copies of every library model laid
+// out in an arc in front of the viewer. The aimed preview brightens; the
+// trigger (click on desktop) spawns the FULL textured model on the floor at
+// the aim point as one undo step and closes the gallery. The spawn key or
+// undo (B) closes without spawning. Previews decode no images (megabytes of
+// geometry, not gigabytes of textures) and live only while the gallery is
+// open — the pick closes it BEFORE its undo step, so history never contains
+// a preview.
 
-// Loads library[index] as the staged model at the aim point.
-bool stageLoadAt(App& app, VkRenderer& renderer, Ray const& aimRay, std::size_t index) {
-  std::size_t const count = app.stagedFiles.size();
-  std::string const& path = app.stagedFiles[index % count];
-  Model model;
-  std::string error;
-  std::vector<NodeId> roots;
-  if (!loadModelFile(path, model, error) || !addModelToScene(app, renderer, model, &roots)) {
-    if (error.empty()) {
-      error = "could not add to scene (GPU registration failed?)";
-    }
-    std::printf("cannot open %s: %s\n", path.c_str(), error.c_str());
-    return false;
+// The preview slot under the aim ray, or -1. World models do not count: the
+// gallery picks only among its own previews, never a placed model behind them.
+int gallerySlotAt(App& app, Ray const& aimRay) {
+  auto hit = pickNode(app, aimRay);
+  if (!hit.has_value()) {
+    return -1;
   }
-  vredit::placeOnFloor(app.scene, app.visuals, roots, vredit::floorAimPoint(aimRay));
-  app.stagedIndex = index % count;
-  app.stagedRoots = std::move(roots);
-  return true;
+  for (std::size_t s = 0; s < app.gallerySlots.size(); ++s) {
+    std::vector<vredit::NodeId> const& nodes = app.gallerySlots[s].nodes;
+    if (std::find(nodes.begin(), nodes.end(), hit->node) != nodes.end()) {
+      return static_cast<int>(s);
+    }
+  }
+  return -1;
 }
 
-// Removes the staged model (a swap), leaving the pending edit in place so the
-// caller can stage another one.
-void stageRemove(App& app) {
-  if (app.stagedRoots.empty()) {
+// Removes every preview and closes the gallery (no history impact: previews
+// are transient UI, and the pick path closes BEFORE taking its undo step).
+void galleryClose(App& app) {
+  std::vector<vredit::NodeId> all;
+  for (GallerySlot const& slot : app.gallerySlots) {
+    all.insert(all.end(), slot.roots.begin(), slot.roots.end());
+  }
+  if (!all.empty()) {
+    vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection, all);
+  }
+  app.gallerySlots.clear();
+  app.galleryHoverNodes.clear();
+  app.galleryActive = false;
+  std::printf("[gallery] closed\n");
+}
+
+// Opens the gallery: every library model becomes a small preview in an arc in
+// front of the viewer (a second row when there are more than 8). Files that
+// fail to load are skipped with a message — one bad file cannot block others.
+void galleryOpen(App& app,
+                 VkRenderer& renderer,
+                 Vec3 const& viewPos,
+                 Vec3 const& viewForward) {
+  if (app.galleryActive) {
     return;
   }
-  vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection,
-                         app.stagedRoots);
-  app.stagedRoots.clear();
+  // A live drag or stick gesture must not keep mutating the world behind the
+  // gallery (and its pending edit would tangle with the pick's): close it as
+  // its own undo step first.
+  endEdits(app);
+  std::vector<std::string> files = scanLibrary(app.libraryDir);
+  if (files.empty()) {
+    std::printf("[gallery] library folder is empty: %s\n", app.libraryDir.c_str());
+    return;
+  }
+  // Set before any load: a failed load still leaves a closeable gallery.
+  app.galleryActive = true;
+  Vec3 centre{viewPos.x, 0.0F, viewPos.z};
+  Vec3 fwd{viewForward.x, 0.0F, viewForward.z};
+  if (dot(fwd, fwd) < 1e-6F) {
+    fwd = {0.0F, 0.0F, -1.0F};
+  }
+  fwd = normalized(fwd);
+  Vec3 const right{fwd.z, 0.0F, -fwd.x};
+  constexpr std::size_t kPerRow = 8;
+  for (std::size_t i = 0; i < files.size(); ++i) {
+    Model model;
+    std::string error;
+    std::vector<vredit::NodeId> roots;
+    vredit::EditorSnapshot beforeFile = snapshot(app);
+    if (!loadModelFile(files[i], model, error, /*withImages=*/false) ||
+        !addModelToScene(app, renderer, model, &roots) || roots.empty()) {
+      // A hostile model can throw MID-insert (addModelToScene catches), and a
+      // scene with no top-level nodes loads "successfully" with zero roots:
+      // both leave junk in the scene. Restore the pre-file state so no preview
+      // can leak into the scene or later undo snapshots.
+      if (!roots.empty() || !app.visuals.empty()) {
+        applySnapshot(app, beforeFile);
+      }
+      std::printf("[gallery] cannot show %s: %s\n", files[i].c_str(),
+                  error.empty() ? "could not add to scene" : error.c_str());
+      continue;
+    }
+    GallerySlot slot;
+    slot.file = files[i];
+    slot.roots = roots;
+    slot.nodes = vredit::expandSelection(app.modelGroups, roots[0], false);
+    // Rows of up to 8: arc angles from -62 to +62 degrees, each further row
+    // 0.9 m deeper and staggered by half a column so rows never coincide.
+    // Previews are scaled to ~0.4 m and sit ON the floor like everything else.
+    std::size_t const row = i / kPerRow;
+    std::size_t const col = i % kPerRow;
+    std::size_t const rowCount =
+        std::min(kPerRow, files.size() - row * kPerRow);
+    float const spacing = rowCount > 1 ? 2.18F / static_cast<float>(rowCount - 1) : 2.18F;
+    float t = rowCount > 1 ? static_cast<float>(col) / static_cast<float>(rowCount - 1) : 0.5F;
+    if (row % 2 == 1) {
+      t += 0.5F * spacing / 2.18F; // stagger back rows by half a column
+    }
+    float const angle = (t - 0.5F) * 2.18F; // +/-62.5 degrees
+    float const radius = 2.0F + 0.9F * static_cast<float>(row);
+    Vec3 const slotPos = centre + (fwd * std::cos(angle) + right * std::sin(angle)) * radius;
+    // Scale-to-fit must see the WHOLE model (meshless wrapper roots make
+    // root-only bounds degenerate — the preview would stay full size).
+    vredit::Aabb bounds{};
+    if (vredit::nodesBounds(app.scene, app.visuals, slot.nodes, bounds)) {
+      float const maxExtent =
+          std::fmax(bounds.max.x - bounds.min.x,
+                    std::fmax(bounds.max.y - bounds.min.y, bounds.max.z - bounds.min.z));
+      if (maxExtent > 1e-4F) {
+        vredit::scaleSelectionUniform(app.scene, app.visuals, roots, 0.4F / maxExtent);
+      }
+    }
+    vredit::placeOnFloor(app.scene, app.visuals, roots, slotPos);
+    app.gallerySlots.push_back(std::move(slot));
+    std::printf("[gallery] %s\n", files[i].c_str());
+  }
+  if (app.gallerySlots.empty()) {
+    std::printf("[gallery] no loadable model in %s\n", app.libraryDir.c_str());
+    galleryClose(app);
+    return;
+  }
+  std::printf("[gallery] %zu models — the trigger (click) on a preview spawns it\n",
+              app.gallerySlots.size());
 }
 
-// Spawn key: starts staging, or confirms the staged model when staging.
-bool stageOrConfirm(App& app, VkRenderer& renderer, Ray const& aimRay) {
-  if (app.staging) {
-    if (app.stagedRoots.empty()) {
-      // Nothing is staged (every library model failed to load): claiming
-      // "placed" here would commit a no-op edit and mislead.
-      std::printf("[spawn] nothing staged — cancelled\n");
-      return cancelStaging(app);
-    }
-    app.staging = false;
-    app.stageSwapLatched = false;
-    app.undo.commit(snapshot(app));
-    std::printf("[spawn] placed %s\n", app.stagedFiles[app.stagedIndex].c_str());
-    return true;
+// The preview under the aim: its node set tints warm in the frame — the
+// selector's "you are pointing at THIS one" feedback.
+void galleryHover(App& app, Ray const& aimRay) {
+  app.galleryHoverNodes.clear();
+  if (!app.galleryActive) {
+    return;
   }
-  app.stagedFiles = scanLibrary(app.libraryDir);
-  if (app.stagedFiles.empty()) {
-    std::printf("[library] no .glb/.obj models in %s\n", app.libraryDir.c_str());
+  int const slot = gallerySlotAt(app, aimRay);
+  if (slot >= 0) {
+    app.galleryHoverNodes = app.gallerySlots[static_cast<std::size_t>(slot)].nodes;
+  }
+}
+
+// The trigger while the gallery is open: spawn the hovered preview's model
+// (full textures) on the floor at the aim point as ONE undo step and close.
+// No hovered preview = no spawn (never pick the wrong thing by accident).
+bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
+  if (!app.galleryActive) {
     return false;
   }
+  // Belt and braces: no live edit should exist while the gallery is open, but
+  // if one does, commit it as its own step before the spawn's.
   endEdits(app);
+  int const slot = gallerySlotAt(app, aimRay);
+  if (slot < 0) {
+    return false;
+  }
+  std::string const file = app.gallerySlots[static_cast<std::size_t>(slot)].file;
+  // Close FIRST: the previews leave the scene before the undo step is taken,
+  // so history contains the spawn alone — never a preview.
+  galleryClose(app);
   app.undo.begin(snapshot(app));
-  if (!stageLoadAt(app, renderer, aimRay, 0)) {
+  Model model;
+  std::string error;
+  std::vector<vredit::NodeId> roots;
+  if (!loadModelFile(file, model, error) || !addModelToScene(app, renderer, model, &roots)) {
+    std::printf("[gallery] cannot open %s: %s\n", file.c_str(),
+                error.empty() ? "could not add to scene" : error.c_str());
     vredit::EditorSnapshot rollback = snapshot(app);
     if (app.undo.cancel(rollback)) {
       applySnapshot(app, rollback);
     }
     return false;
   }
-  app.staging = true;
-  // Require the swap stick to be neutral before the first swap: A may be
-  // pressed mid-rotation (left stick held), and without this the held stick
-  // would instantly swap away the just-staged model on the same frame.
-  app.stageSwapLatched = true;
-  std::printf("[spawn] staging %s (%zu models in %s)\n"
-              "[spawn]   spawn key places it, stick X / [ ] changes model, undo cancels\n",
-              app.stagedFiles[app.stagedIndex].c_str(), app.stagedFiles.size(),
-              app.libraryDir.c_str());
-  return true;
-}
-
-// Swap the staged model for another library one (inside the pending edit).
-// Unloadable files are skipped instead of getting stuck on one.
-void stageSwap(App& app, VkRenderer& renderer, Ray const& aimRay, int direction) {
-  if (!app.staging || app.stagedFiles.empty()) {
-    return;
-  }
-  std::size_t const count = app.stagedFiles.size();
-  std::size_t const step = direction > 0 ? 1U : count - 1U;
-  std::size_t next = (app.stagedIndex + step) % count;
-  stageRemove(app);
-  for (std::size_t attempt = 0; attempt < count; ++attempt) {
-    if (stageLoadAt(app, renderer, aimRay, next)) {
-      std::printf("[spawn] staging %s (%zu/%zu)\n", app.stagedFiles[app.stagedIndex].c_str(),
-                  app.stagedIndex + 1U, count);
-      return;
-    }
-    next = (next + step) % count;
-  }
-  // Every file failed: end the session cleanly rather than leaving an empty
-  // staging state whose "confirm" would be meaningless.
-  std::printf("[spawn] no loadable model in %s\n", app.libraryDir.c_str());
-  cancelStaging(app);
-}
-
-// Cancel the staging session: one rollback drops every staged change.
-bool cancelStaging(App& app) {
-  if (!app.staging) {
-    return false;
-  }
-  app.staging = false;
-  app.stageSwapLatched = false; // a latched stick must not kill the next session's first swap
-  vredit::EditorSnapshot rollback = snapshot(app);
-  if (app.undo.cancel(rollback)) {
-    applySnapshot(app, rollback);
-  }
-  app.stagedRoots.clear();
-  std::printf("[spawn] cancelled\n");
+  vredit::placeOnFloor(app.scene, app.visuals, roots, vredit::floorAimPoint(aimRay));
+  app.undo.commit(snapshot(app));
+  std::printf("[gallery] spawned %s\n", file.c_str());
   return true;
 }
 
@@ -860,7 +944,11 @@ void assembleFrame(App& app,
   auto isSelected = [&app](NodeId id) {
     return std::find(app.selection.begin(), app.selection.end(), id) != app.selection.end();
   };
-  auto appendItem = [&app, &items, &isSelected](NodeVisual const& visual) {
+  auto isGalleryHovered = [&app](NodeId id) {
+    return std::find(app.galleryHoverNodes.begin(), app.galleryHoverNodes.end(), id) !=
+           app.galleryHoverNodes.end();
+  };
+  auto appendItem = [&app, &items, &isSelected, &isGalleryHovered](NodeVisual const& visual) {
     DrawItem item;
     item.mesh = visual.mesh;
     item.texture = visual.texture;
@@ -875,11 +963,13 @@ void assembleFrame(App& app,
     item.lit = true;
     // 1 = selected (warm) — the only tint the user wants: the selection is
     // also visible from the gizmo sitting at the selection's centre. While
-    // the hold-X delete charges, the selection ramps red (3 + charge).
+    // the hold-X delete charges, the selection ramps red (3 + charge). The
+    // gallery's aimed preview gets the same warm tint (the selector's
+    // "you are pointing at THIS one" feedback).
     if (isSelected(visual.id) && app.deleteCharge > 0.0F) {
       item.highlight = 3.0F + app.deleteCharge;
     } else {
-      item.highlight = isSelected(visual.id) ? 1.0F : 0.0F;
+      item.highlight = (isSelected(visual.id) || isGalleryHovered(visual.id)) ? 1.0F : 0.0F;
     }
     items.push_back(item);
   };
@@ -987,8 +1077,13 @@ void handleEvent(App& app,
       break; // minimised: pointer maths would divide by zero
     }
     if (press->detail == 1U) {
-      bool const partSelect = (press->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
       Ray mouseRay = appRay(app, mouse);
+      if (app.galleryActive) {
+        // The gallery owns clicks: a click on a preview spawns that model.
+        (void)galleryPick(app, renderer, mouseRay);
+        break;
+      }
+      bool const partSelect = (press->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
       PointerTarget target = resolvePointerTarget(app, mouseRay, kPickThresholdPx);
       pointerPress(app, mouseRay, cameraForward(app.camera), target, partSelect);
     } else if (press->detail == 3U) {
@@ -1076,7 +1171,7 @@ void handleEvent(App& app,
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
       // Undo/redo during a live edit cancels that edit first and stops there,
       // leaving both stacks untouched (see cancelLiveEdit).
-      if (app.dragging || app.stickSession || app.staging) {
+      if (app.dragging || app.stickSession || app.galleryActive) {
         cancelLiveEdit(app);
         break;
       }
@@ -1087,7 +1182,7 @@ void handleEvent(App& app,
       }
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      if (app.dragging || app.stickSession || app.staging) {
+      if (app.dragging || app.stickSession || app.galleryActive) {
         cancelLiveEdit(app);
         break;
       }
@@ -1102,13 +1197,15 @@ void handleEvent(App& app,
       // Delete / Backspace: remove the selection (model or part).
       deleteSelection(app);
     } else if (keysym == 'n' || keysym == 'N') {
-      // The model chooser: stages a library model at the mouse aim point, or
-      // places the staged one. [ ] change which library model is showing.
-      (void)stageOrConfirm(app, renderer, appRay(app, app.lastMouse));
-    } else if (keysym == '[') {
-      stageSwap(app, renderer, appRay(app, app.lastMouse), -1);
-    } else if (keysym == ']') {
-      stageSwap(app, renderer, appRay(app, app.lastMouse), 1);
+      // The model gallery: N opens it (previews in an arc), N closes again.
+      // A click on a preview spawns that model at the mouse aim point.
+      if (app.galleryActive) {
+        galleryClose(app);
+      } else {
+        galleryOpen(app, renderer, app.camera.position, cameraForward(app.camera));
+      }
+    } else if (keysym == '[' || keysym == ']') {
+      // The gallery shows every model at once; there is nothing to cycle.
     } else if (keysym == '1' || keysym == 'g' || keysym == 'G') {
       app.mode = GizmoMode::Translate;
       stateChanged = true;
@@ -1670,19 +1767,40 @@ int runXr(char const* shaderDir,
     // gizmo snap modifier.
     app.snap = input.gripHeld > 0.5F;
 
-    if (input.menuPressed) {
-      if (input.gripHeld > 0.5F) {
+    // NO grip chords on face buttons — the grip sensor spikes when squeezing
+    // the controller to press one, which made this dispatch silently take the
+    // wrong branch (the reported "can only rotate horizontally": the mode
+    // cycle was unreachable behind a grip+menu backdrop chord). Tap/hold on
+    // ONE button instead: TAP (< 0.4 s) = gizmo mode cycle (on release),
+    // HOLD = backdrop toggle (fires once at threshold, the tap is cancelled —
+    // the same pattern as hold-X delete).
+    if (input.menuPressed || (input.menuHeld && !app.menuPrevHeld)) {
+      // The app-side rising edge backs up the shell's edge: a press swallowed
+      // by a skipped frame must still initialise the tap/hold state, or a
+      // later hold resumes from a stale charge (and can fire the backdrop
+      // instead of the mode cycle).
+      app.menuCharge = 0.0F;
+      app.menuHoldLatched = false;
+      app.menuTapped = true;
+    }
+    app.menuPrevHeld = input.menuHeld;
+    if (input.menuHeld) {
+      app.menuCharge += dt;
+      if (!app.menuHoldLatched && app.menuCharge >= 0.4) {
+        app.menuHoldLatched = true;
+        app.menuTapped = false;
         toggleBackdrop(app, renderer, &shell);
-      } else {
-        app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
-                   : app.mode == GizmoMode::Rotate  ? GizmoMode::Scale
-                                                    : GizmoMode::Translate;
-        endEdits(app);
       }
+    } else if (app.menuTapped) {
+      app.menuTapped = false;
+      app.mode = app.mode == GizmoMode::Translate ? GizmoMode::Rotate
+                 : app.mode == GizmoMode::Rotate  ? GizmoMode::Scale
+                                                  : GizmoMode::Translate;
+      endEdits(app);
     }
     bool cancelledLiveEdit = false;
     if (input.undoPressed) {
-      if (app.dragging || app.stickSession || app.staging) {
+      if (app.dragging || app.stickSession || app.galleryActive) {
         cancelLiveEdit(app);
         cancelledLiveEdit = true;
       } else {
@@ -1695,7 +1813,7 @@ int runXr(char const* shaderDir,
     // Same guard as the desktop keys: one cancel per frame leaves both stacks
     // untouched even if both arrive together.
     if (input.redoPressed && !cancelledLiveEdit) {
-      if (app.dragging || app.stickSession || app.staging) {
+      if (app.dragging || app.stickSession || app.galleryActive) {
         cancelLiveEdit(app);
       } else {
         vredit::EditorSnapshot state = snapshot(app);
@@ -1725,11 +1843,17 @@ int runXr(char const* shaderDir,
     // jittery for accurate placement).
     app.camera.position = headWorld;
     if (input.selectPressed) {
-      // Grip + trigger selects a single part; trigger alone the whole model.
-      bool const partSelect = input.gripHeld > 0.5F;
-      PointerTarget target = resolvePointerTarget(app, worldRay, kVrPickThresholdPx);
-      pointerPress(app, worldRay, headForward, target, partSelect);
-    } else if (input.selectHeld) {
+      if (app.galleryActive) {
+        // The gallery owns the trigger: a press on a preview spawns that model
+        // at the aim point; a press on empty space does nothing.
+        (void)galleryPick(app, renderer, worldRay);
+      } else {
+        // Grip + trigger selects a single part; trigger alone the whole model.
+        bool const partSelect = input.gripHeld > 0.5F;
+        PointerTarget target = resolvePointerTarget(app, worldRay, kVrPickThresholdPx);
+        pointerPress(app, worldRay, headForward, target, partSelect);
+      }
+    } else if (input.selectHeld && !app.galleryActive) {
       pointerMove(app, worldRay);
     }
     if (input.selectReleased) {
@@ -1762,12 +1886,12 @@ int runXr(char const* shaderDir,
     bool const gestureAlive =
         sticksActive ||
         (app.stickSession && std::fabs(input.leftStick.y) > stickThreshold);
-    if (sticksActive && !app.stickSession && !app.dragging && !app.staging &&
+    if (sticksActive && !app.stickSession && !app.dragging && !app.galleryActive &&
         !app.selection.empty()) {
       app.undo.begin(snapshot(app));
       app.stickSession = true;
     }
-    if (app.stickSession && !app.dragging) {
+    if (app.stickSession && !app.dragging && !app.galleryActive) {
       if (gestureAlive && !app.selection.empty()) {
         Vec3 const moveDelta =
             (headRightFlat * input.rightStick.x + headForwardFlat * input.rightStick.y) *
@@ -1788,7 +1912,7 @@ int runXr(char const* shaderDir,
     // Hold-X delete: the selection's tint ramps red over kDeleteChargeS and
     // the delete fires at full charge; release before that cancels. Hold-to-
     // confirm on purpose — face buttons on Quest controllers are wobbly.
-    if (input.deleteHeld && !app.selection.empty()) {
+    if (input.deleteHeld && !app.selection.empty() && !app.galleryActive) {
       if (!app.deleteHolding) {
         app.deleteHolding = true;
         app.deleteHoldStart = std::chrono::steady_clock::now();
@@ -1806,32 +1930,23 @@ int runXr(char const* shaderDir,
       app.deleteHolding = false;
       app.deleteCharge = 0.0F;
     }
-    // The model chooser: the spawn key stages a library model at the aim
-    // point (or places the staged one). NO grip chord here on purpose — the
-    // grip sensor spikes when squeezing the controller to press A, and the
-    // old "grip+A cancels" chord silently swallowed EVERY press (the reported
-    // "nothing appears when I press A"). Cancelling is undo (B) — a single,
-    // stable button the user already has.
+    // The model gallery: the spawn key opens it (small previews of every
+    // library model in an arc) or closes it. NO grip chord here on purpose —
+    // the grip sensor spikes when squeezing the controller to press A, and
+    // the old "grip+A cancels" chord silently swallowed EVERY press (the
+    // reported "nothing appears when I press A"). Cancelling is undo (B) — a
+    // single, stable button the user already has.
     if (input.spawnPressed) {
-      (void)stageOrConfirm(app, renderer, worldRay);
+      if (app.galleryActive) {
+        galleryClose(app);
+      } else {
+        galleryOpen(app, renderer, headWorld, headForward);
+      }
     }
-    // While staging, the LEFT stick swaps between library models (the whole
-    // point of the session — rotating the selection can wait), latched so one
-    // deliberate push = one swap.
-    if (app.staging) {
-      float const cycle = input.leftStick.x;
-      bool const past = std::fabs(cycle) > 0.5F;
-      if (past && !app.stageSwapLatched) {
-        stageSwap(app, renderer, worldRay, cycle > 0.0F ? 1 : -1);
-        app.stageSwapLatched = true;
-      } else if (std::fabs(cycle) < 0.3F) {
-        app.stageSwapLatched = false;
-      }
-      // The staged model follows the aim point — aim where it should land.
-      if (!app.stagedRoots.empty()) {
-        vredit::placeOnFloor(app.scene, app.visuals, app.stagedRoots,
-                             vredit::floorAimPoint(worldRay));
-      }
+    if (app.galleryActive) {
+      // The gallery owns the pointer: the aimed preview brightens and the
+      // trigger spawns it at the aim point (handled at the trigger press).
+      galleryHover(app, worldRay);
     }
 
     std::vector<DrawItem> items;
@@ -1969,7 +2084,7 @@ int runInteractive(char const* shaderDir,
     return 1;
   }
   // Passthrough is the default view in VR; on desktop that same state is a
-  // plain void (grip + menu / B toggles the grid backdrop back).
+  // plain void (menu hold in VR, B on desktop, toggles the grid backdrop back).
   applyBackdrop(app, renderer, nullptr);
   if (!modelPaths.empty()) {
     if (!loadModels(app, renderer, modelPaths)) {
@@ -2000,11 +2115,10 @@ int runInteractive(char const* shaderDir,
       dt = 0.1F; // tab stalls must not teleport the camera
     }
     updateFlight(app, dt);
-    // While staging a spawn, the staged model follows the mouse aim point —
-    // the same "aim where it should land" behaviour as VR.
-    if (app.staging && !app.stagedRoots.empty()) {
-      vredit::placeOnFloor(app.scene, app.visuals, app.stagedRoots,
-                           vredit::floorAimPoint(appRay(app, app.lastMouse)));
+    // The gallery's preview under the mouse brightens (the same "you are
+    // pointing at THIS one" feedback as the controller aim in VR).
+    if (app.galleryActive) {
+      galleryHover(app, appRay(app, app.lastMouse));
     }
     if (app.width == 0U || app.height == 0U) {
       std::this_thread::sleep_for(std::chrono::milliseconds(8)); // minimised: no busy spin
@@ -2086,12 +2200,12 @@ int main(int argc, char** argv) {
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
           "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n"
           "keys: WASD/QE fly (RMB look), 1/2/3 move/rotate/scale, L space,\n"
-          "      N stage/place model, [ ] change staged model, Delete remove,\n"
+          "      N model gallery (click preview spawns; N closes), Delete remove,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
           "vr:   trigger select (grip+trigger part), right stick move on the floor,\n"
           "      left stick rotate (Y does nothing), grip = fine,\n"
-          "      A stage/place model, stick X change staged model,\n"
-          "      hold X delete, B/Y undo/redo, grip+menu backdrop\n");
+          "      A model gallery (trigger on preview spawns),\n"
+          "      hold X delete, B/Y undo/redo, menu tap = mode, menu hold = backdrop\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);

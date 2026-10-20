@@ -39,6 +39,11 @@ bool parseMtl(std::string_view text, MtlMaterials& out);
 
 // Loads an OBJ file; a sibling .mtl named by `mtllib` is loaded when present
 // and its `map_Kd` images are decoded (missing images load untextured).
-bool loadObjFile(char const* path, Model& out, std::string& error);
+// `withImages = false` skips image decoding entirely (geometry-only preview
+// loads) while keeping the texture entries so mesh indices stay stable.
+bool loadObjFile(char const* path,
+                 Model& out,
+                 std::string& error,
+                 bool withImages = true);
 
 } // namespace vredit

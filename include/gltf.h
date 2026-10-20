@@ -16,7 +16,13 @@ namespace vredit {
 // matrices are preserved; multi-primitive meshes become a wrapper node with one
 // child per primitive. Index/offset/count fields are read as checked
 // non-negative integers so hostile files cannot wrap the size arithmetic.
-bool loadGlb(std::vector<std::uint8_t> const& bytes, Model& out, std::string& error);
-bool loadGlbFile(char const* path, Model& out, std::string& error);
+bool loadGlb(std::vector<std::uint8_t> const& bytes,
+             Model& out,
+             std::string& error,
+             bool withImages = true);
+bool loadGlbFile(char const* path,
+                 Model& out,
+                 std::string& error,
+                 bool withImages = true);
 
 } // namespace vredit

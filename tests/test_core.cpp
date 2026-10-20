@@ -1760,6 +1760,17 @@ void testGlbTextureAndUv() {
   CHECK(model.meshes[0].normalTexture == 1); // material.normalTexture index
   CHECK_NEAR(model.meshes[0].normalScale, 0.7F, 1e-6F);
   CHECK(model.meshes[0].alpha == AlphaMode::Mask);
+
+  // Geometry-only preview load (the model gallery): the texture ENTRIES stay
+  // (mesh indices stay valid) but no image is decoded (empty = untextured).
+  Model preview;
+  CHECK(loadGlb(buildGlb(json, bin), preview, error, /*withImages=*/false));
+  CHECK(preview.textures.size() == 2U);
+  CHECK(preview.textures[0].image.width == 0U && preview.textures[0].image.height == 0U);
+  CHECK(preview.textures[1].image.width == 0U);
+  CHECK(preview.meshes.size() == 1U);
+  CHECK(preview.meshes[0].texture == 0);        // indices identical to the full load
+  CHECK(preview.meshes[0].normalTexture == 1);
   CHECK_NEAR(model.meshes[0].alphaCutoff, 0.4F, 1e-6F);
   CHECK_NEAR(model.meshes[0].alphaFactor, 1.0F, 1e-6F);
   CHECK_NEAR2(model.meshes[0].data.vertices[1].uv, {1.0F, 0.0F});

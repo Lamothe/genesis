@@ -401,7 +401,7 @@ bool loadObj(std::string_view text, MtlMaterials const& materials,
   return true;
 }
 
-bool loadObjFile(char const* path, Model& out, std::string& error) {
+bool loadObjFile(char const* path, Model& out, std::string& error, bool withImages) {
   std::ifstream file(path);
   if (!file) {
     error = std::string("cannot open ") + path;
@@ -462,6 +462,15 @@ bool loadObjFile(char const* path, Model& out, std::string& error) {
       }
     }
     std::ifstream imageFile(directory + path, std::ios::binary);
+    if (!withImages) {
+      // Geometry-only preview load: keep the texture entry (mesh indices stay
+      // stable), skip all image I/O and decoding.
+      ModelTexture texture;
+      textures.push_back(std::move(texture));
+      std::int32_t const handle = static_cast<std::int32_t>(textures.size() - 1U);
+      resolvedImages.push_back({path, handle});
+      return handle;
+    }
     if (!imageFile) {
       std::printf("obj: %s %s not found; skipped\n", what, path.c_str());
       return -1;

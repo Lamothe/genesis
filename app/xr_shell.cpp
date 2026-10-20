@@ -699,6 +699,7 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   bool menuNow = (menuLeft.isActive && menuLeft.currentState) ||
                  (menuRight.isActive && menuRight.currentState);
   input.menuPressed = menuNow && !xr_->menuPrev;
+  input.menuHeld = menuNow;
   xr_->menuPrev = menuNow;
 
   // Undo/redo: face buttons on Touch (B = undo, Y = redo), trackpad click on

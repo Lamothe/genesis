@@ -57,9 +57,10 @@ forward/back.
 cursor, **Shift+LMB** or **Ctrl+LMB** selects a single part. **1**/**G**
 translate, **2**/**R** rotate, **3** scale, **L** world/local space, **Ctrl**
 snap, **Ctrl-Z** undo (cancels a live edit), **Ctrl-Y** / **Ctrl-Shift-Z**
-redo, **N** stages a library model at the mouse aim point (**[** / **]**
-change which library model is staged; **N** again places it, Ctrl-Z cancels
-the whole staging session), **Delete** removes the selection (model or part),
+redo, **N** opens the model gallery (small previews of every model in the
+library folder arranged in an arc; the pointed-at one brightens and a click
+spawns that model at the mouse aim point as one undo step; **N** closes
+without spawning), **Delete** removes the selection (model or part),
 **Esc** quits. Scale is UNIFORM only — every scale handle drives one factor on
 all three axes; per-axis scaling does not exist. The gizmo sits at the centre
 of the selection's bounds; the selection is tinted.
@@ -78,12 +79,13 @@ undo step. Aim at a gizmo handle for precise axis/rotate/uniform-scale work —
 a handle wins only where it is nearer than the model surface. The bounding box
 is not a click target: pressing empty space next to a model selects nothing.
 Handles brighten when hovered; the selection is shown by the warm tint and the
-gizmo at the selection's centre. **A** is the model chooser: the first press
-stages a library model where your aim beam meets the floor — it appears and
-FOLLOWS your aim, **stick X** changes which library model is showing (the
-library folder is rescanned every time — drop a file in and spawn it without
-restarting), **A** again places it as one undo step, and undo (B)
-cancels the whole staging session. **Hold X** to delete: the
+gizmo at the selection's centre. **A** is the model gallery: small previews of
+every model in the library folder appear in an arc in front of you (two rows
+beyond eight), the aimed preview brightens, and the trigger spawns that model
+on the floor where your aim beam meets it — one undo step, and the gallery
+closes. **A** or undo (B) closes without spawning. The library folder
+(`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
+opens — drop a file in and spawn it without restarting. **Hold X** to delete: the
 selection ramps red and the delete fires at full charge (0.6 s); release
 before that to cancel. **B** (right) / **Y** (left) on Touch undo/redo,
 trackpad click on Vive. Passthrough is the DEFAULT view: the real world with

@@ -130,8 +130,11 @@ std::uint32_t readIndexScalar(AccessorView const& view, std::size_t element) {
 
 class GlbReader {
 public:
-  GlbReader(std::vector<std::uint8_t> const& bytes, Model& model, std::string& error)
-      : bytes_(bytes), model_(model), error_(error) {}
+  GlbReader(std::vector<std::uint8_t> const& bytes,
+            Model& model,
+            std::string& error,
+            bool withImages)
+      : bytes_(bytes), model_(model), error_(error), withImages_(withImages) {}
 
   bool run();
 
@@ -160,6 +163,7 @@ private:
   std::vector<std::uint8_t> const& bytes_;
   Model& model_;
   std::string& error_;
+  bool withImages_{true}; // false = geometry-only preview load (no image decode)
   JsonDocument document_;
   std::uint8_t const* bin_{nullptr};
   std::size_t binLength_{0};
@@ -507,6 +511,16 @@ void GlbReader::bindTexture(std::size_t textureIndex, std::int32_t& slotOut) {
   ModelTexture texture;
   texture.repeatU = repeatU;
   texture.repeatV = repeatV;
+  if (!withImages_) {
+    // Geometry-only preview load: keep the texture ENTRY so mesh texture
+    // indices stay stable, but skip the image entirely (the empty image
+    // registers as untextured). Previews cost megabytes, not gigabytes.
+    model_.textures.push_back(std::move(texture));
+    std::int32_t handle = static_cast<std::int32_t>(model_.textures.size() - 1U);
+    textureCache_.push_back({sourceIndex, repeatU, repeatV, handle});
+    slotOut = handle;
+    return;
+  }
   if (!decodeImage(view.data, view.length, texture.image, error_)) {
     std::printf("glb: image %zu failed to decode (%s); texture skipped\n", sourceIndex,
                 error_.c_str());
@@ -761,9 +775,12 @@ bool GlbReader::run() {
 
 } // namespace
 
-bool loadGlb(std::vector<std::uint8_t> const& bytes, Model& out, std::string& error) {
+bool loadGlb(std::vector<std::uint8_t> const& bytes,
+             Model& out,
+             std::string& error,
+             bool withImages) {
   out = Model{};
-  GlbReader reader(bytes, out, error);
+  GlbReader reader(bytes, out, error, withImages);
   if (!reader.run()) {
     out = Model{}; // defined state on failure
     return false;
@@ -772,7 +789,7 @@ bool loadGlb(std::vector<std::uint8_t> const& bytes, Model& out, std::string& er
 }
 
 // The size cap (kMaxAssetFileSize, image.h) guards hostile files — see there.
-bool loadGlbFile(char const* path, Model& out, std::string& error) {
+bool loadGlbFile(char const* path, Model& out, std::string& error, bool withImages) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file) {
     error = std::string("cannot open ") + path;
@@ -793,7 +810,7 @@ bool loadGlbFile(char const* path, Model& out, std::string& error) {
     error = std::string("cannot read ") + path;
     return false;
   }
-  return loadGlb(bytes, out, error);
+  return loadGlb(bytes, out, error, withImages);
 }
 
 } // namespace vredit
