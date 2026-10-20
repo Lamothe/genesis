@@ -53,8 +53,6 @@ constexpr float kStickEndZone = 0.06F;  // ...and ENDS below this (hysteresis, s
                                         // physical gesture is one undo step)
 constexpr float kStickMoveMps = 1.5F;    // metres per second at full deflection
 constexpr float kStickTurnRadps = 1.75F; // ~100 degrees per second at full
-constexpr float kStickScaleRate = 1.2F;  // left stick Y = the viewer's zoom:
-                                         // full deflection ≈ e^1.2 growth/s
 // Hold-X delete: the delete fires when the hold reaches full charge.
 constexpr double kDeleteChargeS = 0.6;
 constexpr float kSnapTranslate = 0.25F;
@@ -118,7 +116,6 @@ struct App {
   // is rescanned on every spawn, so a file dropped in mid-session is spawnable
   // without a restart.
   std::string libraryDir;
-  std::size_t libraryIndex{0};
   // Staged spawn = the model CHOOSER: the library model appears at the aim
   // point and follows it; stick X or [ ] swap between library models; the
   // spawn key confirms (one undo step), undo cancels. All swaps happen inside
@@ -131,10 +128,6 @@ struct App {
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
   // first deflection past the dead zone, committed when the sticks settle.
   bool stickSession{false};
-  // Accumulated zoom of the current stick gesture, clamped to [0.01x, 100x]
-  // (the gizmo's factor clamp): without a bound, ~74 s of full left-stick-Y
-  // overflows float to an infinite scale that can never be zoomed back.
-  float stickZoomLog{0.0F};
   // Hold-X delete (VR): the selection's tint ramps red over kDeleteChargeS
   // and the delete fires at full charge; release before that cancels.
   bool deleteHolding{false};
@@ -780,6 +773,10 @@ bool stageOrConfirm(App& app, VkRenderer& renderer, Ray const& aimRay) {
     return false;
   }
   app.staging = true;
+  // Require the swap stick to be neutral before the first swap: A may be
+  // pressed mid-rotation (left stick held), and without this the held stick
+  // would instantly swap away the just-staged model on the same frame.
+  app.stageSwapLatched = true;
   std::printf("[spawn] staging %s (%zu models in %s)\n"
               "[spawn]   spawn key places it, stick X / [ ] changes model, undo cancels\n",
               app.stagedFiles[app.stagedIndex].c_str(), app.stagedFiles.size(),
@@ -1753,20 +1750,25 @@ int runXr(char const* shaderDir,
                           : Vec3{0.0F, 0.0F, -1.0F};
     Vec3 const headRightFlat = cross(headForwardFlat, Vec3{0.0F, 1.0F, 0.0F});
     float const stickThreshold = app.stickSession ? kStickEndZone : kStickDeadZone;
-    // ALL four stick axes count: left stick Y (zoom) was missing here, which
-    // made a pure up/down push start no edit session and scale nothing.
+    // The left stick rotates (X) and the right stick moves (X/Z); left stick
+    // Y deliberately does NOTHING (it used to zoom and that ruined rotation —
+    // any vertical drift while turning scaled the model).
     bool const sticksActive = std::fabs(input.rightStick.x) > stickThreshold ||
                               std::fabs(input.rightStick.y) > stickThreshold ||
-                              std::fabs(input.leftStick.x) > stickThreshold ||
-                              std::fabs(input.leftStick.y) > stickThreshold;
+                              std::fabs(input.leftStick.x) > stickThreshold;
+    // A Y-deflected left stick keeps an OPEN gesture alive (so an arcing
+    // rotation whose X dips momentarily stays ONE undo step) but never starts
+    // a gesture on its own — Y applies no edit.
+    bool const gestureAlive =
+        sticksActive ||
+        (app.stickSession && std::fabs(input.leftStick.y) > stickThreshold);
     if (sticksActive && !app.stickSession && !app.dragging && !app.staging &&
         !app.selection.empty()) {
       app.undo.begin(snapshot(app));
       app.stickSession = true;
-      app.stickZoomLog = 0.0F; // each gesture zooms 0.01x..100x max
     }
     if (app.stickSession && !app.dragging) {
-      if (sticksActive && !app.selection.empty()) {
+      if (gestureAlive && !app.selection.empty()) {
         Vec3 const moveDelta =
             (headRightFlat * input.rightStick.x + headForwardFlat * input.rightStick.y) *
             (kStickMoveMps * stickFine * dt);
@@ -1776,18 +1778,6 @@ int runXr(char const* shaderDir,
         float const yawDelta = -input.leftStick.x * kStickTurnRadps * stickFine * dt;
         if (yawDelta != 0.0F) {
           vredit::rotateSelectionYaw(app.scene, app.visuals, app.selection, yawDelta);
-        }
-        // Left stick Y = the viewer's zoom: grow/shrink the selection
-        // uniformly (never per-axis) — walk closer, or make it bigger.
-        if (std::fabs(input.leftStick.y) > 0.02F) {
-          float const logStep = input.leftStick.y * kStickScaleRate * stickFine * dt;
-          float const previousLog = app.stickZoomLog;
-          float const clamped =
-              std::clamp(previousLog + logStep, -4.6F, 4.6F); // [0.01x, 100x]
-          app.stickZoomLog = clamped;
-          // Apply the ACTUAL step taken (clamped), not the request.
-          vredit::scaleSelectionUniform(app.scene, app.visuals, app.selection,
-                                        std::exp(clamped - previousLog));
         }
       } else {
         app.undo.commit(snapshot(app));
@@ -1817,10 +1807,12 @@ int runXr(char const* shaderDir,
       app.deleteCharge = 0.0F;
     }
     // The model chooser: the spawn key stages a library model at the aim
-    // point (or places the staged one), grip+spawn cancels the staging.
-    if (input.spawnPressed && input.gripHeld > 0.5F) {
-      cancelStaging(app);
-    } else if (input.spawnPressed) {
+    // point (or places the staged one). NO grip chord here on purpose — the
+    // grip sensor spikes when squeezing the controller to press A, and the
+    // old "grip+A cancels" chord silently swallowed EVERY press (the reported
+    // "nothing appears when I press A"). Cancelling is undo (B) — a single,
+    // stable button the user already has.
+    if (input.spawnPressed) {
       (void)stageOrConfirm(app, renderer, worldRay);
     }
     // While staging, the LEFT stick swaps between library models (the whole
@@ -2097,8 +2089,8 @@ int main(int argc, char** argv) {
           "      N stage/place model, [ ] change staged model, Delete remove,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
           "vr:   trigger select (grip+trigger part), right stick move on the floor,\n"
-          "      left stick rotate, left stick up/down zoom (uniform scale),\n"
-          "      grip = fine, A stage/place model, stick X change staged model,\n"
+          "      left stick rotate (Y does nothing), grip = fine,\n"
+          "      A stage/place model, stick X change staged model,\n"
           "      hold X delete, B/Y undo/redo, grip+menu backdrop\n");
       return 0;
     } else if (arg[0] == '-') {

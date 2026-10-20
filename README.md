@@ -69,9 +69,11 @@ Movement and rotation are the **sticks** (controller aim is too jittery for
 accurate placement): the **right stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
 off the floor), the **left stick** turns it around vertical — turntable-style,
-never tipping it over. **Left stick up/down is the zoom**: it grows/shrinks
-the selection uniformly (walk closer, or make the model bigger). **Grip** held
-runs all three at quarter speed for fine control. Each stick gesture is one
+never tipping it over. Left stick up/down does *nothing* (it briefly zoomed;
+that ruined rotation and was removed). To make the model bigger or smaller:
+scale mode (menu button cycles translate → rotate → scale; desktop key **3**)
+and the scale handles (uniform), or walk closer. **Grip** held
+runs both sticks at quarter speed for fine control. Each stick gesture is one
 undo step. Aim at a gizmo handle for precise axis/rotate/uniform-scale work —
 a handle wins only where it is nearer than the model surface. The bounding box
 is not a click target: pressing empty space next to a model selects nothing.
@@ -80,7 +82,7 @@ gizmo at the selection's centre. **A** is the model chooser: the first press
 stages a library model where your aim beam meets the floor — it appears and
 FOLLOWS your aim, **stick X** changes which library model is showing (the
 library folder is rescanned every time — drop a file in and spawn it without
-restarting), **A** again places it as one undo step, and undo (or grip+A)
+restarting), **A** again places it as one undo step, and undo (B)
 cancels the whole staging session. **Hold X** to delete: the
 selection ramps red and the delete fires at full charge (0.6 s); release
 before that to cancel. **B** (right) / **Y** (left) on Touch undo/redo,

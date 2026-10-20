@@ -1261,7 +1261,7 @@ void testStickMotion() {
 }
 
 void testScaleSelectionUniform() {
-  // The viewer's zoom: grow/shrink a model uniformly about its bounds centre.
+  // Uniform scale primitive: grow/shrink a model about its bounds centre.
   // Points at (2,0,0) and (2,0,-1) give a known centre (2,0,-0.5).
   vredit::Scene scene;
   vredit::NodeId parent = scene.create();
