@@ -35,6 +35,12 @@ struct NodeVisual {
 // Model grouping: every node created for one loaded model shares a group id,
 // so a plain click selects the whole model and a secondary click (shift/
 // ctrl, or grip+trigger in VR) selects a single part. Group 0 = ungrouped.
+
+// The editor's two input modes (the menu button toggles them): move = the
+// left stick scales (X) and changes height (Y); rotate = it spins (X) and
+// tips (Y; grip = roll). NOTHING rotates outside rotate — that rule lives
+// in the app's mode switch, driven by this enum.
+enum class EditMode : std::uint8_t { move, rotate };
 using ModelGroups = std::vector<std::pair<NodeId, std::uint32_t>>;
 
 // Full editor state for undo/redo: scene structure + visuals + groups +
@@ -88,15 +94,16 @@ void placeOnFloor(Scene& scene,
                   std::vector<NodeId> const& roots,
                   Vec3 const& target);
 
-// Stick-driven editing (VR): right stick translates the selection
-// horizontally ("models stay stuck to the floor" — y is never touched), the
-// left stick rotates the selection: X spins it around world up through the
-// selection's bounds centre (turntable-style), Y tips it around an arbitrary
-// axis (pitch about the viewer's right, roll about the view axis with grip —
-// see the VR dispatch), after which dropSelectionToFloor re-rests it on the
-// ground. All are drift-free (built on the gizmo's capture/apply machinery)
-// and respect the no-double-move rule: a selected child rides along with its
-// selected ancestor instead of receiving the delta twice.
+// Stick-driven editing (VR): the right stick translates the selection
+// horizontally ("models stay stuck to the floor" — y is never touched) in
+// both modes; the left stick is mode-driven (the app's EditMode): move =
+// X uniform scale / Y height, rotate = X spin about the selection's own up
+// through its bounds centre, Y tip (pitch about the model's right; roll
+// about its forward with grip — see the VR dispatch), after which
+// dropSelectionToFloor re-rests it on the ground. All are drift-free (built
+// on the gizmo's capture/apply machinery) and respect the no-double-move
+// rule: a selected child rides along with its selected ancestor instead of
+// receiving the delta twice.
 void moveSelectionHorizontal(Scene& scene,
                              std::vector<NodeId> const& selection,
                              Vec3 const& worldDelta);
@@ -161,8 +168,8 @@ void dropSelectionToFloor(Scene& scene,
 
 // Uniformly scales the selection about its bounds centre — the ONLY kind of
 // scaling in the editor; per-axis scaling does not exist. `factor` is
-// multiplicative (1.05 = 5% larger). A core editing primitive (used by tests
-// and any future scale UI; no in-VR binding currently calls it). Same
+// multiplicative (1.05 = 5% larger). Called by the move-mode left stick X
+// (VR and desktop arrows) and the carousel's stage/place sizing. Same
 // parent-vs-descendant rules as the other stick helpers.
 bool scaleSelectionUniform(Scene& scene,
                            std::vector<NodeVisual> const& visuals,

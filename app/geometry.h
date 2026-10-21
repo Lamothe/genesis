@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string_view>
 #include <vector>
 
 #include "handles.h"
@@ -26,9 +27,9 @@ struct DrawItem {
   float alphaCutoff{0.5F};
   AlphaMode alpha{AlphaMode::Opaque};
   bool lit{true};
-  float highlight{0.0F}; // 1 = gallery hover (warm),
+  float highlight{0.0F}; // 5 = selected (thin warm shader rim),
                          // 3 + charge = delete ramp (red; charge 0..1)
-                         // 0 = plain (selection shows via the marker)
+                         // 0 = plain
 };
 
 void appendCube(std::vector<RendererVertex>& out);
@@ -37,5 +38,13 @@ void appendGrid(std::vector<RendererVertex>& out, float extent, float step);
 // Controller pointer: beam from the aim origin along the ray, with a small
 // cross marking the tip so the aimed point is visible on plain surfaces.
 void appendRayBeam(std::vector<RendererVertex>& out, Ray const& ray, float length, Vec3 colour);
+
+// Line-font text into an overlay line list (the VR mode HUD): uppercase
+// stroke glyphs on a unit cell (baseline y = 0, cap height y = 1), drawn
+// through `place` — text occupies its XY plane and faces +Z toward the
+// viewer — at `height` metres. Unknown characters render as spaces. No
+// font files, no textures; the strokes are ordinary line vertices.
+void appendTextLines(std::vector<RendererVertex>& out, std::string_view text, Mat4 const& place,
+                     float height, Vec3 colour);
 
 } // namespace vredit

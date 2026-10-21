@@ -33,7 +33,7 @@ renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash run-tests.sh        # core tests (548 checks; image fixtures via ImageMagick)
+bash run-tests.sh        # core tests (603 checks; image fixtures via ImageMagick)
 bash run-editor.sh       # build + interactive editor
 bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
@@ -56,43 +56,48 @@ forward/back.
 **LMB** selects: a click selects the whole model under the cursor,
 **Shift+LMB** or **Ctrl+LMB** selects a single part. There is no gizmo — the
 coloured axis handles were removed; all editing is the **arrow keys** (the
-desktop mirror of the sticks): **left/right** spins the selection about its
-own up, **up/down** drives the mode's Y — **1** height (lift/lower, no floor
-rule), **2** tip (stick up tips the top away; **Shift** = roll), **3** uniform
-scale (per-axis scaling does not exist). **Shift** runs the arrows at quarter
-speed (fine). Each arrow gesture is one undo step. **Ctrl-Z** undo (cancels a
-live edit), **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model gallery
-(small previews of every model in the library folder arranged in an arc; the
-pointed-at one brightens and a click spawns that model at the mouse aim point
-as one undo step; **N** closes
-without spawning), **Delete** removes the selection (model or part),
-**Esc** quits. The selection is marked by a small orange diamond floating over
-its bounds (a part selection marks the part).
+desktop mirror of the sticks) and it is **mode-driven** with two modes:
+**1** = move (**left/right** uniform scale — per-axis scaling does not exist;
+**up/down** height, no floor rule), **2** = rotate (**left/right** spins about
+the selection's own up; **up/down** tip, **Shift** = roll). **Shift** runs
+the arrows at quarter speed (fine). Nothing rotates outside rotate mode. Each
+arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
+**Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (one
+staged model appears at eye height in front of the camera; **[** **]** cycle
+the library, a click places the
+staged model at the floor point under the cursor as one undo step; **N**
+closes without placing), **Delete** removes the selection (model or part),
+**Esc** quits. The selection is marked by a thin warm rim in the shader (a
+part selection marks the part) and the current mode's name shows as
+line-font text floating in front of the camera.
 
 In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
 Movement and rotation are the **sticks** (controller aim is too jittery for
 accurate placement): the **right stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
-off the floor), the **left stick**'s X spins the model about its own up, and
-its **Y is mode-driven** — the **menu button taps** cycle: **height**
-(lift/lower), **tip** (up tips the top away; grip+Y = roll), **scale**
-(uniform). The rotation axes come from the model's own frame and are mutually
-perpendicular (a spin follows the model's tipped up axis); the axes and rate
-are latched per gesture (turning your head or toggling grip mid-gesture does
-not steer a gesture in flight). Whole models re-rest on the floor after a tip;
-part selections tip in place. **Grip** held
-runs both sticks at quarter speed for fine control (and selects roll on Y in
-tip mode). Each stick gesture is one undo step. The bounding box
-is not a click target: pressing empty space next to a model selects nothing.
-Handles brighten when hovered; the selection is shown by the warm tint and the
-gizmo at the selection's centre. **A** is the model gallery: small previews of
-every model in the library folder appear in an arc in front of you (two rows
-beyond eight), the aimed preview brightens, and the trigger spawns that model
-on the floor where your aim beam meets it — one undo step, and the gallery
-closes. **A** or undo (B) closes without spawning. The library folder
+off the floor) in **both** modes, and the **left stick is mode-driven** — the
+**menu button taps** toggle the two modes: **MOVE** (X = uniform scale,
+right = bigger; Y = height, up = lift) and **ROTATE** (X = spin about the
+model's own up; Y = tip, up tips the top away; grip+Y = roll). Nothing
+rotates outside ROTATE. The rotation axes come from the model's own frame and
+are mutually perpendicular (a spin follows the model's tipped up axis); the
+axes, rate and grip mode are latched per gesture (turning your head or
+toggling grip mid-gesture does not steer a gesture in flight). Whole models
+re-rest on the floor after a tip; part selections tip in place. **Grip** held
+runs both sticks at quarter speed for fine control. Each stick gesture is one
+undo step. The bounding box is not a click target: pressing empty space next
+to a model selects nothing. The selection is shown by a thin warm rim; the
+current mode (and the staged model's name) shows as line-font text floating
+in front of your head. **A** is the model carousel: one library model is
+staged at eye height in front of you (loaded and textured), **stick X**
+cycles the library (only one model is ever loaded at a time), and the trigger
+places the staged model at natural size on the floor where your aim beam
+meets it — one undo step (undo removes it entirely), and the carousel
+closes. **A** or undo (B) closes without placing. The library folder
 (`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
-opens — drop a file in and spawn it without restarting. **Hold X** to delete: the
-selection ramps red and the delete fires at full charge (0.6 s); release
+opens — drop a file in and place it without restarting. **Hold X** to
+delete: the selection ramps red and the delete fires at full charge (0.6 s);
+release
 before that to cancel. **B** (right) / **Y** (left) on Touch undo/redo,
 trackpad click on Vive. Passthrough is the DEFAULT view: the real world with
 the models drawn over it (grip + menu, or desktop B, toggles the grid backdrop
@@ -107,6 +112,13 @@ flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
 
 ## Design notes
 
+- **Renderer resources are registered, never released** (there is no
+  removeMesh/removeTexture API): image-content dedupe means re-staging or
+  re-placing a model reuses its registrations, but distinct models
+  accumulate. The texture registry holds 256 (a device-limit check at init
+  fails loudly below that) — after ~17 heavily textured models in one
+  session, further textured loads degrade to untextured with a log message.
+  A refcounted release path tied to undo history is the eventual fix.
 - **Gizmo drags are cumulative from drag start**, not incremental per event:
   every update recomputes the total delta and re-applies it to captured start
   transforms, so rounding cannot accumulate.

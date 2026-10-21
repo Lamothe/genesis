@@ -7,6 +7,7 @@ layout(location = 3) in vec2 inUv;
 
 layout(set = 0, binding = 0) uniform Frame {
   mat4 viewProj;
+  vec4 cameraPos;
 } frame;
 
 layout(push_constant) uniform Push {

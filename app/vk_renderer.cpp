@@ -105,7 +105,7 @@ struct VkRenderer::Impl {
   VkPipeline meshPipeline{VK_NULL_HANDLE};
   VkPipeline blendPipeline{VK_NULL_HANDLE};
 
-  static constexpr std::size_t kMaxTextures = 32; // matches the shader array
+  static constexpr std::size_t kMaxTextures = 256; // matches the shader array
   // Upload budget per texture side: past this the resample costs more VRAM
   // than detail ("run out of memory after a few models" — one 12288^2 map
   // upscaled to 16384^2 was 1.4 GB alone). 8K is ~2.8x the per-eye target.
@@ -875,6 +875,16 @@ bool VkRenderer::init(Config const& config) {
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(g.physical, &props);
     std::snprintf(g.deviceName, sizeof(g.deviceName), "%s", props.deviceName);
+    // The shader's texture array is fixed at kMaxTextures; a device below
+    // that cannot create the descriptor layout (the spec minimum is far
+    // lower). Fail loudly at init instead of failing mysteriously later.
+    if (props.limits.maxPerStageDescriptorSampledImages <
+        static_cast<std::uint32_t>(Impl::kMaxTextures)) {
+      std::printf("[vk] %s supports %u sampled images per stage, need %zu\n",
+                  props.deviceName, props.limits.maxPerStageDescriptorSampledImages,
+                  Impl::kMaxTextures);
+      return false;
+    }
   }
 
   float queuePriority = 1.0F;
@@ -975,7 +985,9 @@ bool VkRenderer::createCommonResources(char const* shaderDir, VkFormat colourFor
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
-  bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+  // FRAGMENT too: the fragment stage reads frame.cameraPos for the
+  // selection rim — binding it vertex-only made that read a spec violation.
+  bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
   bindings[1].binding = 1;
   bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
   bindings[1].descriptorCount = static_cast<std::uint32_t>(Impl::kMaxTextures);
@@ -1040,7 +1052,7 @@ bool VkRenderer::createCommonResources(char const* shaderDir, VkFormat colourFor
   VkDescriptorBufferInfo bufferInfo{};
   bufferInfo.buffer = g.uniformBuffer;
   bufferInfo.offset = 0;
-  bufferInfo.range = 64;
+  bufferInfo.range = 80; // the Frame block: viewProj (64) + cameraPos (16)
 
   // Texture 0 is the built-in white fallback; every slot starts on it.
   Image white;
@@ -1635,6 +1647,8 @@ bool VkRenderer::draw(Camera const& camera,
   float aspect = static_cast<float>(g.width) / static_cast<float>(g.height);
   Mat4 viewProj = cameraViewProjection(camera, aspect);
   std::memcpy(g.uniformMapped, viewProj.m, sizeof(float) * 16U);
+  float const camPos[4] = {camera.position.x, camera.position.y, camera.position.z, 1.0F};
+  std::memcpy(static_cast<char*>(g.uniformMapped) + sizeof(float) * 16U, camPos, sizeof(camPos));
 
   std::size_t depthCount = depthLines.size();
   if (depthCount > 0U) {
@@ -1710,7 +1724,7 @@ bool VkRenderer::initExternal(Config const& config, VkInstance instance, VkPhysi
 }
 
 bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const& viewProj,
-                            std::vector<DrawItem> const& items,
+                            Vec3 cameraPos, std::vector<DrawItem> const& items,
                             std::vector<RendererVertex> const& depthLines,
                             std::vector<RendererVertex> const& overlayLines) {
   Impl& g = *impl_;
@@ -1725,6 +1739,9 @@ bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const&
 
   VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
   std::memcpy(g.uniformMapped, viewProj.m, sizeof(float) * 16U);
+  float const camPos[4] = {cameraPos.x, cameraPos.y, cameraPos.z, 1.0F};
+  std::memcpy(static_cast<char*>(g.uniformMapped) + sizeof(float) * 16U, camPos,
+              sizeof(camPos));
 
   std::size_t depthCount = depthLines.size();
   if (depthCount > 0U) {

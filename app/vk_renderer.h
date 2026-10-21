@@ -61,7 +61,7 @@ public:
   // conventions (cameraViewProjection, or mul(cameraProjectionFromTangents(...),
   // cameraViewFromPose(...)) for per-eye VR views). The target format must be
   // the `colourFormat` passed to initExternal.
-  bool drawToView(VkImageView target, VkImage targetImage, Mat4 const& viewProj,
+  bool drawToView(VkImageView target, VkImage targetImage, Mat4 const& viewProj, Vec3 cameraPos,
                   std::vector<DrawItem> const& items,
                   std::vector<RendererVertex> const& depthLines,
                   std::vector<RendererVertex> const& overlayLines);

@@ -5,9 +5,14 @@ layout(location = 1) in vec3 vColour;
 layout(location = 2) in vec2 vUv;
 layout(location = 3) in vec3 vWorldPos;
 
-layout(set = 0, binding = 1) uniform sampler2D uTextures[32];
+layout(set = 0, binding = 1) uniform sampler2D uTextures[256];
 
 layout(location = 0) out vec4 outColour;
+
+layout(set = 0, binding = 0) uniform Frame {
+  mat4 viewProj;
+  vec4 cameraPos;
+} frame;
 
 layout(push_constant) uniform Push {
   mat4 model;
@@ -58,19 +63,18 @@ void main() {
   if (mode < 1.5) {
     base.a = 1.0;
   }
-  // State highlight: 1 = selected (warm orange lift that survives textures and
-  // lighting), 2 = hovered (cool blue lift, so the target under the pointer is
-  // unmistakable before the press), 3..4 = delete charge (red ramp: 3.0 means
-  // charge 0, 4.0 means "about to delete").
+  // State highlight: 5 = selected (a THIN warm rim on grazing-angle pixels
+  // — the model's own shading is untouched; the user rejected fill tints as
+  // too heavy), 3..4 = delete charge (red ramp: 3.0 means charge 0, 4.0
+  // means "about to delete").
   float highlight = push.normalParams.w;
-  if (highlight > 2.5) {
+  if (highlight > 4.5) {
+    vec3 toCamera = normalize(frame.cameraPos.xyz - vWorldPos);
+    float rim = pow(1.0 - abs(dot(n, toCamera)), 3.0);
+    base.rgb += vec3(0.95, 0.62, 0.25) * rim * 0.55;
+  } else if (highlight > 2.5) {
     float charge = clamp(highlight - 3.0, 0.0, 1.0);
     base.rgb = mix(base.rgb, vec3(1.0, 0.12, 0.08), 0.30 + 0.45 * charge);
-  } else if (highlight > 1.5) {
-    base.rgb = mix(base.rgb, vec3(0.45, 0.80, 1.0), 0.35) + vec3(0.02, 0.08, 0.16);
-  } else {
-    base.rgb = mix(base.rgb, vec3(1.0, 0.62, 0.22), 0.35 * highlight) +
-               vec3(0.18, 0.10, 0.0) * highlight;
   }
   outColour = base;
 }
