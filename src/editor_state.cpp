@@ -185,6 +185,17 @@ void moveSelectionHorizontal(Scene& scene,
   applyDragStarts(scene, starts, translationMatrix(delta));
 }
 
+void moveSelectionVertical(Scene& scene,
+                           std::vector<NodeId> const& selection,
+                           float worldDeltaY) {
+  if (worldDeltaY == 0.0F) {
+    return;
+  }
+  std::vector<DragStart> starts;
+  captureDragStarts(scene, selection, starts);
+  applyDragStarts(scene, starts, translationMatrix({0.0F, worldDeltaY, 0.0F}));
+}
+
 // The set of nodes a selection's edit actually moves: each selected node plus
 // its whole subtree (a selected child rides along with a selected ancestor
 // rather than receiving the delta twice — but its descendants still move).
@@ -206,6 +217,46 @@ bool movingSetBounds(Scene& scene,
     }
   }
   return nodesBounds(scene, visuals, moving, boundsOut);
+}
+
+bool selectionRotationAxes(Scene& scene,
+                           std::vector<NodeId> const& selection,
+                           Vec3 const& viewRight,
+                           Vec3 const& viewForward,
+                           Vec3& yawAxisOut,
+                           Vec3& tipAxisOut,
+                           Vec3& rollAxisOut) {
+  if (selection.empty() || !scene.valid(selection.front())) {
+    return false;
+  }
+  Mat4 const world = scene.world(selection.front());
+  // Column-major: column 0 = X (right), 1 = Y (up), 2 = Z (forward). The
+  // world matrix may carry (uniform) scale: normalise before use.
+  Vec3 right{world.m[0], world.m[1], world.m[2]};
+  Vec3 up{world.m[4], world.m[5], world.m[6]};
+  Vec3 forward{world.m[8], world.m[9], world.m[10]};
+  if (dot(right, right) < 1e-8F || dot(up, up) < 1e-8F || dot(forward, forward) < 1e-8F) {
+    return false; // degenerate
+  }
+  right = normalized(right);
+  up = normalized(up);
+  forward = normalized(forward);
+  // Sign-align to the viewer at gesture start: stick up must keep meaning
+  // "the top tips away" / "rolls right" whatever way the model is authored.
+  if (dot(up, Vec3{0.0F, 1.0F, 0.0F}) < 0.0F) {
+    up = Vec3{-up.x, -up.y, -up.z};
+  }
+  if (dot(right, viewRight) < 0.0F) {
+    right = Vec3{-right.x, -right.y, -right.z};
+  }
+  if (dot(forward, viewForward) < 0.0F) {
+    forward = Vec3{-forward.x, -forward.y, -forward.z};
+  }
+  yawAxisOut = up;
+  // Pre-signed tip: stick up tips the top AWAY = negative about the right.
+  tipAxisOut = Vec3{-right.x, -right.y, -right.z};
+  rollAxisOut = forward;
+  return true;
 }
 
 void rotateSelectionAxis(Scene& scene,

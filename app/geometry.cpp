@@ -53,66 +53,6 @@ void appendGrid(std::vector<RendererVertex>& out, float extent, float step) {
   }
 }
 
-Vec3 handleColour(GizmoHandle handle) {
-  switch (handle) {
-  case GizmoHandle::AxisX:
-    return {0.90F, 0.22F, 0.22F};
-  case GizmoHandle::AxisY:
-    return {0.25F, 0.85F, 0.30F};
-  case GizmoHandle::AxisZ:
-    return {0.25F, 0.45F, 0.95F};
-  case GizmoHandle::PlaneXY:
-    return {0.25F, 0.75F, 0.85F};
-  case GizmoHandle::PlaneYZ:
-    return {0.85F, 0.55F, 0.25F};
-  case GizmoHandle::PlaneZX:
-    return {0.80F, 0.35F, 0.80F};
-  default:
-    return {0.90F, 0.90F, 0.90F};
-  }
-}
-
-void appendHandleLines(std::vector<RendererVertex>& out,
-                       std::vector<HandleGeom> const& geometry,
-                       std::optional<GizmoHandle> hover) {
-  Vec3 const up{0.0F, 1.0F, 0.0F};
-  for (HandleGeom const& geom : geometry) {
-    Vec3 colour = handleColour(geom.handle);
-    if (hover.has_value() && *hover == geom.handle) {
-      // Hovered handle: brightened so it is obvious they are hitting it.
-      colour = colour + (Vec3{1.0F, 1.0F, 1.0F} - colour) * 0.55F;
-    }
-    std::size_t count = geom.points.size();
-    if (count < 2U) {
-      continue;
-    }
-    for (std::size_t i = 1; i < count; ++i) {
-      out.push_back({geom.points[i - 1U], up, colour, {0.0F, 0.0F}});
-      out.push_back({geom.points[i], up, colour, {0.0F, 0.0F}});
-    }
-    if (geom.loop) {
-      out.push_back({geom.points[count - 1U], up, colour, {0.0F, 0.0F}});
-      out.push_back({geom.points[0], up, colour, {0.0F, 0.0F}});
-    }
-  }
-}
-
-void appendBoundsLines(std::vector<RendererVertex>& out, Aabb const& bounds, Vec3 colour) {
-  Vec3 const up{0.0F, 1.0F, 0.0F};
-  Vec3 c[8];
-  for (int i = 0; i < 8; ++i) {
-    c[i] = {(i & 1) != 0 ? bounds.max.x : bounds.min.x,
-            (i & 2) != 0 ? bounds.max.y : bounds.min.y,
-            (i & 4) != 0 ? bounds.max.z : bounds.min.z};
-  }
-  int const edges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
-                            {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
-  for (auto const& edge : edges) {
-    out.push_back({c[edge[0]], up, colour, {0.0F, 0.0F}});
-    out.push_back({c[edge[1]], up, colour, {0.0F, 0.0F}});
-  }
-}
-
 void appendRayBeam(std::vector<RendererVertex>& out, Ray const& ray, float length, Vec3 colour) {
   Vec3 const up{0.0F, 1.0F, 0.0F};
   Vec3 const dir = normalized(ray.direction);

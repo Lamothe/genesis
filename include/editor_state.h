@@ -100,10 +100,33 @@ void placeOnFloor(Scene& scene,
 void moveSelectionHorizontal(Scene& scene,
                              std::vector<NodeId> const& selection,
                              Vec3 const& worldDelta);
+// Explicit height control (stick mode): moves the selection along the world
+// vertical with NO floor rule — the floor clamp bounds *movement* (walking
+// models around), while lifting is a deliberate, requested operation ("a way
+// to scale and move vertically"). Same ride-along and drift rules.
+void moveSelectionVertical(Scene& scene,
+                           std::vector<NodeId> const& selection,
+                           float worldDeltaY);
 void rotateSelectionYaw(Scene& scene,
                         std::vector<NodeVisual> const& visuals,
                         std::vector<NodeId> const& selection,
                         float radians);
+// The selection's ROTATION AXES for stick editing: the root selected node's
+// own frame (X right, Y up, Z forward), normalised and sign-aligned to the
+// viewer at gesture start. The three are mutually PERPENDICULAR by
+// construction (an orthonormal basis — true while transforms carry rotation
+// and uniform scale only), which the world-up + view-right pair stops being
+// in the model's frame after the first tip: a spin must follow the model's
+// tipped up axis, not the world's. An unrotated model returns exactly the
+// viewer-aligned frame, so approved behaviour is unchanged.
+bool selectionRotationAxes(Scene& scene,
+                           std::vector<NodeId> const& selection,
+                           Vec3 const& viewRight,
+                           Vec3 const& viewForward,
+                           Vec3& yawAxisOut,   // model up (spin)
+                           Vec3& tipAxisOut,   // pre-signed model right (tip)
+                           Vec3& rollAxisOut); // model forward (roll)
+
 // Rotates the selection `radians` around `worldAxis` (need not be unit)
 // through the MOVING SET's bounds centre (the selection's subtrees — see
 // movingSetBounds). The generic form rotateSelectionYaw is built on.

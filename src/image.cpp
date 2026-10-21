@@ -923,6 +923,45 @@ Image downsample(Image const& src) {
 
 } // namespace
 
+static Image resampleBilinear(Image const& base, std::uint32_t outWidth, std::uint32_t outHeight) {
+  Image out;
+  out.width = outWidth;
+  out.height = outHeight;
+  out.rgba.assign(static_cast<std::size_t>(outWidth) * outHeight * 4U, 0U);
+  for (std::uint32_t y = 0; y < outHeight; ++y) {
+    float const sy = (static_cast<float>(y) + 0.5F) * static_cast<float>(base.height) /
+                         static_cast<float>(outHeight) -
+                     0.5F;
+    float const fy = std::fmin(std::fmax(sy, 0.0F), static_cast<float>(base.height - 1U));
+    std::uint32_t const y0 = std::min(static_cast<std::uint32_t>(fy), base.height - 1U);
+    std::uint32_t const y1 = std::min(y0 + 1U, base.height - 1U);
+    float const wy = fy - static_cast<float>(y0);
+    for (std::uint32_t x = 0; x < outWidth; ++x) {
+      float const sx = (static_cast<float>(x) + 0.5F) * static_cast<float>(base.width) /
+                           static_cast<float>(outWidth) -
+                       0.5F;
+      float const fx = std::fmin(std::fmax(sx, 0.0F), static_cast<float>(base.width - 1U));
+      std::uint32_t const x0 = std::min(static_cast<std::uint32_t>(fx), base.width - 1U);
+      std::uint32_t const x1 = std::min(x0 + 1U, base.width - 1U);
+      float const wx = fx - static_cast<float>(x0);
+      std::size_t const p00 = (static_cast<std::size_t>(y0) * base.width + x0) * 4U;
+      std::size_t const p10 = (static_cast<std::size_t>(y0) * base.width + x1) * 4U;
+      std::size_t const p01 = (static_cast<std::size_t>(y1) * base.width + x0) * 4U;
+      std::size_t const p11 = (static_cast<std::size_t>(y1) * base.width + x1) * 4U;
+      std::size_t const dst = (static_cast<std::size_t>(y) * outWidth + x) * 4U;
+      for (std::size_t c = 0; c < 4U; ++c) {
+        float const top = static_cast<float>(base.rgba[p00 + c]) * (1.0F - wx) +
+                          static_cast<float>(base.rgba[p10 + c]) * wx;
+        float const bottom = static_cast<float>(base.rgba[p01 + c]) * (1.0F - wx) +
+                             static_cast<float>(base.rgba[p11 + c]) * wx;
+        float const value = top * (1.0F - wy) + bottom * wy;
+        out.rgba[dst + c] = static_cast<std::uint8_t>(std::fmin(std::fmax(value + 0.5F, 0.0F), 255.0F));
+      }
+    }
+  }
+  return out;
+}
+
 Image upscaleToPot(Image const& base) {
   if (base.width == 0U || base.height == 0U || base.rgba.empty()) {
     return base;
@@ -938,42 +977,58 @@ Image upscaleToPot(Image const& base) {
   if (potWidth == base.width && potHeight == base.height) {
     return base;
   }
-  Image out;
-  out.width = potWidth;
-  out.height = potHeight;
-  out.rgba.assign(static_cast<std::size_t>(potWidth) * potHeight * 4U, 0U);
-  for (std::uint32_t y = 0; y < potHeight; ++y) {
-    float const sy = (static_cast<float>(y) + 0.5F) * static_cast<float>(base.height) /
-                         static_cast<float>(potHeight) -
-                     0.5F;
-    float const fy = std::fmin(std::fmax(sy, 0.0F), static_cast<float>(base.height - 1U));
-    std::uint32_t const y0 = std::min(static_cast<std::uint32_t>(fy), base.height - 1U);
-    std::uint32_t const y1 = std::min(y0 + 1U, base.height - 1U);
-    float const wy = fy - static_cast<float>(y0);
-    for (std::uint32_t x = 0; x < potWidth; ++x) {
-      float const sx = (static_cast<float>(x) + 0.5F) * static_cast<float>(base.width) /
-                           static_cast<float>(potWidth) -
-                       0.5F;
-      float const fx = std::fmin(std::fmax(sx, 0.0F), static_cast<float>(base.width - 1U));
-      std::uint32_t const x0 = std::min(static_cast<std::uint32_t>(fx), base.width - 1U);
-      std::uint32_t const x1 = std::min(x0 + 1U, base.width - 1U);
-      float const wx = fx - static_cast<float>(x0);
-      std::size_t const p00 = (static_cast<std::size_t>(y0) * base.width + x0) * 4U;
-      std::size_t const p10 = (static_cast<std::size_t>(y0) * base.width + x1) * 4U;
-      std::size_t const p01 = (static_cast<std::size_t>(y1) * base.width + x0) * 4U;
-      std::size_t const p11 = (static_cast<std::size_t>(y1) * base.width + x1) * 4U;
-      std::size_t const dst = (static_cast<std::size_t>(y) * potWidth + x) * 4U;
-      for (std::size_t c = 0; c < 4U; ++c) {
-        float const top = static_cast<float>(base.rgba[p00 + c]) * (1.0F - wx) +
-                          static_cast<float>(base.rgba[p10 + c]) * wx;
-        float const bottom = static_cast<float>(base.rgba[p01 + c]) * (1.0F - wx) +
-                             static_cast<float>(base.rgba[p11 + c]) * wx;
-        float const value = top * (1.0F - wy) + bottom * wy;
-        out.rgba[dst + c] = static_cast<std::uint8_t>(std::fmin(std::fmax(value + 0.5F, 0.0F), 255.0F));
-      }
-    }
+  return resampleBilinear(base, potWidth, potHeight);
+}
+
+Image fitToBudget(Image const& base, std::uint32_t maxDim) {
+  if (base.width == 0U || base.height == 0U || base.rgba.empty() || maxDim == 0U) {
+    return base;
   }
-  return out;
+  auto nearestPot = [](std::uint32_t value, std::uint32_t cap) {
+    std::uint32_t lower = 1U;
+    while ((lower << 1U) <= value) {
+      lower <<= 1U;
+    }
+    std::uint32_t const upper = lower << 1U;
+    std::uint32_t result = (value - lower <= upper - value) ? lower : upper;
+    while (result > cap) {
+      result >>= 1U;
+    }
+    return result;
+  };
+  std::uint32_t width = base.width;
+  std::uint32_t height = base.height;
+  // Oversize first (aspect preserved), then POT-ify — but the SHORT side's
+  // POT is derived from the long side's so the aspect survives within the
+  // usual POT rounding error (independent per-dim rounding could squash 3:1
+  // content to 4:1).
+  if (width > maxDim || height > maxDim) {
+    float const scale = static_cast<float>(maxDim) /
+                        static_cast<float>(std::max(width, height));
+    width = std::max(1U, static_cast<std::uint32_t>(static_cast<float>(width) * scale));
+    height = std::max(1U, static_cast<std::uint32_t>(static_cast<float>(height) * scale));
+  }
+  bool const widthLong = width >= height;
+  std::uint32_t const longDim = widthLong ? width : height;
+  std::uint32_t const shortDim = widthLong ? height : width;
+  std::uint32_t const longPot = nearestPot(longDim, maxDim);
+  std::uint32_t const shortPot =
+      nearestPot(std::max(1U, static_cast<std::uint32_t>(
+                                  static_cast<float>(longPot) *
+                                  (static_cast<float>(shortDim) / static_cast<float>(longDim)))),
+                 maxDim);
+  std::uint32_t const outWidth = widthLong ? longPot : shortPot;
+  std::uint32_t const outHeight = widthLong ? shortPot : longPot;
+  if (outWidth == base.width && outHeight == base.height) {
+    return base; // already POT and within budget: zero copy
+  }
+  // Big shrinks go through chained 2x2 box filters first (the mip builder's
+  // downsample): single-tap bilinear would drop texels wholesale and alias.
+  Image current = base;
+  while (current.width >= outWidth * 2U && current.height >= outHeight * 2U) {
+    current = downsample(current);
+  }
+  return resampleBilinear(current, outWidth, outHeight);
 }
 
 std::vector<Image> buildMipLevels(Image const& base) {

@@ -1294,6 +1294,14 @@ void testStickTipAndFloor() {
   vredit::rotateSelectionAxis(scene, visuals, {parent}, {0.0F, 0.0F, -1.0F}, kHalfPi);
   CHECK_NEAR3(scene.worldPosition(parent), afterDrop);
 
+  // Explicit height (Translate mode): moves the selection along the world
+  // vertical with NO floor rule — lifting is deliberate and requested.
+  Vec3 const beforeLift = scene.worldPosition(parent);
+  vredit::moveSelectionVertical(scene, {parent}, 0.25F);
+  CHECK_NEAR3(scene.worldPosition(parent), {beforeLift.x, beforeLift.y + 0.25F, beforeLift.z});
+  vredit::moveSelectionVertical(scene, {parent}, 0.0F); // no-op guard
+  CHECK_NEAR3(scene.worldPosition(parent), {beforeLift.x, beforeLift.y + 0.25F, beforeLift.z});
+
   // A zero axis or zero angle is a no-op.
   Vec3 const beforeNoop = scene.worldPosition(parent);
   vredit::rotateSelectionAxis(scene, visuals, {parent}, {0.0F, 0.0F, 0.0F}, 1.0F);
@@ -1343,6 +1351,66 @@ void testMovingSetAndExplicitPivot() {
   // The child (0,-1,0 local) is offset PARALLEL to the yaw axis: invariant.
   CHECK_NEAR3(scene.worldPosition(child), {2.0F, -1.0F, 0.0F});
   CHECK_NEAR3(scene.local(child).translation, {0.0F, -1.0F, 0.0F});
+}
+
+void testSelectionRotationAxes() {
+  // The user requirement: the stick rotation axes must be PERPENDICULAR.
+  // They come from the selection's own frame (sign-aligned to the viewer),
+  // so they stay perpendicular after the model has been tipped — the old
+  // world-up + view-right pair does not ("a spin must follow the model").
+  vredit::Scene scene;
+  vredit::NodeId root = scene.create();
+  Vec3 yaw{}, tip{}, roll{};
+  CHECK(vredit::selectionRotationAxes(scene, {root}, {1.0F, 0.0F, 0.0F},
+                                      {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
+  // An unrotated model = the viewer-aligned frame (approved behaviour).
+  CHECK_NEAR3(yaw, {0.0F, 1.0F, 0.0F});
+  CHECK_NEAR3(tip, {-1.0F, 0.0F, 0.0F});
+  CHECK_NEAR3(roll, {0.0F, 0.0F, -1.0F});
+
+  // Tip the model 30 deg about X, then spin 40 deg about Z: the returned
+  // axes track the model's frame and stay mutually perpendicular.
+  vredit::Transform t;
+  t.rotation = vredit::quatFromAxisAngle({1.0F, 0.0F, 0.0F}, 0.5235987756F) * // 30 deg
+               vredit::quatFromAxisAngle({0.0F, 0.0F, 1.0F}, 0.6981317008F); // 40 deg
+  scene.setLocal(root, t);
+  CHECK(vredit::selectionRotationAxes(scene, {root}, {1.0F, 0.0F, 0.0F},
+                                      {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
+  // Unit + mutually perpendicular — the invariant under test.
+  CHECK_NEAR(length(yaw), 1.0F, 1e-5F);
+  CHECK_NEAR(length(tip), 1.0F, 1e-5F);
+  CHECK_NEAR(length(roll), 1.0F, 1e-5F);
+  CHECK_NEAR(std::fabs(dot(yaw, tip)), 0.0F, 1e-5F);
+  CHECK_NEAR(std::fabs(dot(yaw, roll)), 0.0F, 1e-5F);
+  CHECK_NEAR(std::fabs(dot(tip, roll)), 0.0F, 1e-5F);
+  // Sign-aligned to the viewer: "up" still points up-ish, "right" toward
+  // the viewer's right-ish, "forward" toward the viewer.
+  CHECK(dot(yaw, Vec3{0.0F, 1.0F, 0.0F}) > 0.0F);
+  CHECK(dot(Vec3{-tip.x, -tip.y, -tip.z}, Vec3{1.0F, 0.0F, 0.0F}) > 0.0F);
+  CHECK(dot(roll, Vec3{0.0F, 0.0F, -1.0F}) > 0.0F);
+
+  // Knife edge: a model tipped exactly 90 deg (its up is horizontal) still
+  // returns a unit, mutually perpendicular, consistently signed frame — the
+  // sign convention is stable at the singularity, not float noise.
+  vredit::Transform quarter;
+  quarter.rotation = vredit::quatFromAxisAngle({1.0F, 0.0F, 0.0F}, kHalfPi);
+  scene.setLocal(root, quarter);
+  CHECK(vredit::selectionRotationAxes(scene, {root}, {1.0F, 0.0F, 0.0F},
+                                      {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
+  CHECK_NEAR(length(yaw), 1.0F, 1e-5F);
+  CHECK_NEAR(std::fabs(dot(yaw, tip)), 0.0F, 1e-5F);
+  CHECK_NEAR(std::fabs(dot(yaw, roll)), 0.0F, 1e-5F);
+  CHECK_NEAR(std::fabs(dot(tip, roll)), 0.0F, 1e-5F);
+
+  // Degenerate frame (zero scale): the call fails cleanly so the app falls
+  // back to its viewer-aligned defaults instead of reusing a previous frame.
+  vredit::Transform flat;
+  flat.scale = {0.0F, 0.0F, 0.0F};
+  scene.setLocal(root, flat);
+  CHECK(!vredit::selectionRotationAxes(scene, {root}, {1.0F, 0.0F, 0.0F},
+                                       {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
+  CHECK(!vredit::selectionRotationAxes(scene, {}, {1.0F, 0.0F, 0.0F},
+                                       {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
 }
 
 void testScaleSelectionUniform() {
@@ -2089,6 +2157,45 @@ void testUpscaleToPot() {
   CHECK(upscaleToPot(empty).rgba.empty());
 }
 
+void testFitToBudget() {
+  auto solid = [](std::uint32_t w, std::uint32_t h, std::uint8_t v) {
+    Image img;
+    img.width = w;
+    img.height = h;
+    img.rgba.assign(static_cast<std::size_t>(w) * h * 4U, v);
+    return img;
+  };
+  // POT within budget: zero-copy passthrough (same dimensions AND content).
+  Image pot = solid(64, 32, 7U);
+  Image keep = fitToBudget(pot, 8192U);
+  CHECK(keep.width == 64U && keep.height == 32U);
+  CHECK(keep.rgba == pot.rgba);
+
+  // Oversize downscales to the budget (12288^2 -> 8192^2, not 16384^2).
+  Image big = solid(16, 16, 200U); // scaled-down stand-in for the 12K maps
+  Image fitted = fitToBudget(big, 8U);
+  CHECK(fitted.width == 8U && fitted.height == 8U);
+  CHECK(fitted.rgba[0] == 200U); // a solid stays solid
+
+  // Aspect: the short side derives from the long side's POT (3:1 content
+  // becomes the nearest POT pair, 4:1 — never squashed to 1:1).
+  Image wide = solid(12, 4, 1U);
+  Image wideFit = fitToBudget(wide, 8U);
+  CHECK(wideFit.width == 8U && wideFit.height == 2U);
+
+  // Midpoint tie rounds DOWN (3 -> 2), consistent with the policy comment.
+  Image tiny = solid(3, 3, 9U);
+  Image tinyFit = fitToBudget(tiny, 8192U);
+  CHECK(tinyFit.width == 2U && tinyFit.height == 2U);
+
+  // Cap clamp: the long side clamps to the cap; the short side derives from
+  // it (6 -> 4 by the tie rule) — never past the cap, never squashed to it.
+  Image tall = solid(16, 20, 5U);
+  Image tallFit = fitToBudget(tall, 8U);
+  CHECK(tallFit.width == 4U && tallFit.height == 8U);
+  CHECK(fitToBudget(Image{}, 8U).rgba.empty()); // empty guard
+}
+
 void testMipChain() {
   // 4x4 checkerboard: the first derived level averages each 2x2 block, then
   // the mean. Level 0 (the base) is not part of the output.
@@ -2324,11 +2431,13 @@ int main() {
   testGravityAlign();
   testXrMath();
   testUpscaleToPot();
+  testFitToBudget();
   testMipChain();
   testSegmentAndPolygonPicking();
   testStickMotion();
   testStickTipAndFloor();
   testMovingSetAndExplicitPivot();
+  testSelectionRotationAxes();
   testScaleSelectionUniform();
   testEditorStateOps();
   testHandlePicking();

@@ -26,25 +26,16 @@ struct DrawItem {
   float alphaCutoff{0.5F};
   AlphaMode alpha{AlphaMode::Opaque};
   bool lit{true};
-  float highlight{0.0F}; // 1 = selected (warm), 2 = hovered (cool),
+  float highlight{0.0F}; // 1 = gallery hover (warm),
                          // 3 + charge = delete ramp (red; charge 0..1)
+                         // 0 = plain (selection shows via the marker)
 };
 
 void appendCube(std::vector<RendererVertex>& out);
 void appendGrid(std::vector<RendererVertex>& out, float extent, float step);
 
-// Adds handle lines as line-list vertices using standard gizmo colours.
-void appendHandleLines(std::vector<RendererVertex>& out,
-                       std::vector<HandleGeom> const& geometry,
-                       std::optional<GizmoHandle> hover = std::nullopt);
-
-// 12 edges of an axis-aligned box (line list), e.g. a selection outline.
-void appendBoundsLines(std::vector<RendererVertex>& out, Aabb const& bounds, Vec3 colour);
-
 // Controller pointer: beam from the aim origin along the ray, with a small
 // cross marking the tip so the aimed point is visible on plain surfaces.
 void appendRayBeam(std::vector<RendererVertex>& out, Ray const& ray, float length, Vec3 colour);
-
-Vec3 handleColour(GizmoHandle handle);
 
 } // namespace vredit

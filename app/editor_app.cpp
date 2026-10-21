@@ -1,6 +1,6 @@
 // vr-editor: desktop shell over the scene-editor core — viewport, camera,
-// selection, gizmo handles. Typed C++ only; the shell is a thin layer over
-// vredit::Scene/GizmoDrag and VkRenderer.
+// selection, stick/arrow editing. Typed C++ only; the shell is a thin layer
+// over vredit::Scene and VkRenderer.
 
 #include <algorithm>
 #include <chrono>
@@ -26,7 +26,6 @@
 #include "editor_state.h"
 #include "gizmo.h"
 #include "gltf.h"
-#include "handles.h"
 #include "mesh.h"
 #include "obj.h"
 #include "picking.h"
@@ -43,7 +42,6 @@ constexpr float kFlySpeed = 1.8F;        // metres/second (boost covers distance
 constexpr float kFlyBoost = 3.0F;
 constexpr float kMinEyeHeight = 0.15F;   // the camera never passes below the grid (y = 0)
 constexpr float kWheelMetres = 1.0F;     // metres per wheel notch
-constexpr float kGizmoPixels = 120.0F;
 constexpr float kPickThresholdPx = 8.0F;
 constexpr float kVrPickThresholdPx = 24.0F; // aim rays jitter: 3x the mouse
 // Stick-driven editing rates (VR): the right stick slides the selection, the
@@ -53,11 +51,10 @@ constexpr float kStickEndZone = 0.06F;  // ...and ENDS below this (hysteresis, s
                                         // physical gesture is one undo step)
 constexpr float kStickMoveMps = 1.5F;    // metres per second at full deflection
 constexpr float kStickTurnRadps = 1.75F; // ~100 degrees per second at full
+constexpr float kStickHeightMps = 1.0F;  // Translate mode: metres/second up/down
+constexpr float kStickScalePerS = 1.0F;  // Scale mode: e-fold growth per second
 // Hold-X delete: the delete fires when the hold reaches full charge.
 constexpr double kDeleteChargeS = 0.6;
-constexpr float kSnapTranslate = 0.25F;
-constexpr float kSnapRotate = 0.2617994F; // 15 degrees
-constexpr float kSnapScale = 0.25F;
 
 // Free-flight movement with the floor constraint: y = 0 is the ground grid and
 // the camera never passes below it (any axis: even forward flight can descend).
@@ -106,18 +103,13 @@ struct App {
   // Backdrop = the ground grid + the tinted clear colour. Toggled off
   // ("show the model without the background"), the scene is a plain void.
   bool showBackdrop{false}; // passthrough/void is the default; B or grip+menu adds the grid
+  // Stick editing mode (menu tap cycles; desktop 1/2/3): what the left
+  // stick's Y drives — Translate = height, Rotate = tip (grip: roll),
+  // Scale = uniform. Right stick = planar move and left X = spin always.
   GizmoMode mode{GizmoMode::Translate};
-  GizmoSpace space{GizmoSpace::World};
-  GizmoDrag drag;
-  bool dragging{false};
-  // Per-frame pointer hover: the hovered gizmo HANDLE brightens (model hover
-  // tints were explicitly rejected: the only model tint is on the selection).
-  std::optional<GizmoHandle> hoverHandle;
   bool looking{false};
   bool panning{false};
   bool running{true};
-  bool snap{false};
-  bool partSelect{false}; // shift/ctrl (desktop) or grip (VR): select one part
   // Model library for spawn-on-the-fly (N on desktop, A in VR): the directory
   // is rescanned on every spawn, so a file dropped in mid-session is spawnable
   // without a restart.
@@ -137,13 +129,19 @@ struct App {
   // toggle mid-gesture must not steer the tip, change its rate, or walk
   // asymmetric models sideways via a re-centred pivot.
   Vec3 stickPivot{};
+  Vec3 stickYawAxis{0.0F, 1.0F, 0.0F};
   Vec3 stickTipAxis{0.0F, 0.0F, -1.0F};
+  Vec3 stickRollAxis{0.0F, 0.0F, -1.0F};
   float stickFineRate{1.0F};
+  // Latched with the frame: whether this gesture's Y roll (grip/Shift held
+  // at start). Read live it would flip tip->roll mid-gesture and interleave
+  // two axes in one undo step.
+  bool stickRollMode{false};
   // Re-arm latch: after an undo/redo the sticks must return to neutral
   // before a new gesture may start, or the same frame's drift would
   // cancel-and-restart and swallow the undo.
   bool stickArmed{true};
-  // Menu tap/hold (VR): tap cycles the gizmo mode (fires on release), hold
+  // Menu tap/hold (VR): tap cycles the stick mode (fires on release), hold
   // toggles the backdrop once at 0.4 s and cancels the tap.
   float menuCharge{0.0F};
   bool menuHoldLatched{false};
@@ -160,6 +158,17 @@ struct App {
   bool flyLeft{false};
   bool flyRight{false};
   bool flyUp{false};
+  // Arrow keys mirror the sticks on desktop (the coloured handles are gone):
+  // left/right spins, up/down drives the mode's Y (height / tip / scale).
+  bool arrowUp{false};
+  bool arrowDown{false};
+  bool arrowLeft{false};
+  bool arrowRight{false};
+  // Frames with no arrow deflected. The session commits only after 2 quiet
+  // frames: X11 auto-repeat delivers a Release+Press pair per repeat, and
+  // when the pair straddles a frame drain an immediate commit would split
+  // one physical hold into many undo steps.
+  int arrowQuietFrames{0};
   bool flyDown{false};
   bool flyBoost{false};
   std::uint8_t panButton{0};
@@ -364,74 +373,10 @@ Ray appRay(App const& app, Vec2 pixel) {
   return cameraRay(app.camera, viewport.x / viewport.y, pixel, viewport);
 }
 
-// Combined world bounds of the selection: visuals contribute their exact
-// transformed bounds, hierarchy-only nodes (no mesh) their origin point.
-bool selectionBounds(App& app, Aabb& boundsOut) {
-  bool any = false;
-  Aabb bounds{};
-  for (NodeId id : app.selection) {
-    if (!app.scene.valid(id)) {
-      continue;
-    }
-    Aabb contribution;
-    bool found = false;
-    for (NodeVisual const& visual : app.visuals) {
-      if (visual.id == id) {
-        contribution = transformAabb(app.scene.world(id), visual.localBounds);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      Vec3 point = app.scene.worldPosition(id);
-      contribution = {point, point};
-    }
-    bounds = any ? unite(bounds, contribution) : contribution;
-    any = true;
-  }
-  boundsOut = bounds;
-  return any;
-}
-
-bool gizmoFrame(App& app, Vec3& pivot, Quat& orientation) {
-  if (app.selection.empty()) {
-    return false;
-  }
-  // Handles sit at the centre of the selection's bounds, not at the node
-  // origin (which is often at the model's feet).
-  Aabb bounds{};
-  pivot = selectionBounds(app, bounds) ? aabbCentre(bounds)
-                                       : app.scene.worldPosition(app.selection[0]);
-  orientation = Quat{};
-  if (app.space == GizmoSpace::Local) {
-    Vec3 t;
-    Vec3 s;
-    decompose(app.scene.world(app.selection[0]), t, orientation, s);
-  }
-  return true;
-}
-
-float gizmoSize(App& app, Vec3 pivot) {
-  float distance = length(app.camera.position - pivot);
-  float worldPerPixel =
-      2.0F * distance * std::tan(app.camera.fovY * 0.5F) / static_cast<float>(app.height);
-  float size = kGizmoPixels * worldPerPixel;
-  // Scale with the selection so the handles stay reachable past the silhouette
-  // of a large model (the gizmo sits at the bounds centre — inside the body),
-  // bounded at 2x so the desktop feel stays familiar.
-  Aabb bounds{};
-  if (selectionBounds(app, bounds)) {
-    float radius = 0.5F * length(bounds.max - bounds.min);
-    size = std::fmax(size, std::fmin(2.0F * size, 0.75F * radius));
-  }
-  return size;
-}
-
 // Body pick for a pointer ray: exact surface only (closest surface still wins
 // through gaps). The bounding box is not a click target — a ray that misses
 // the triangles hits nothing, so empty space never selects a model. Returns
-// the hit with its along-ray distance so callers can depth-order bodies
-// against gizmo handles.
+// the hit with its along-ray distance.
 std::optional<vredit::PickHit> pickNode(App& app, Ray const& ray) {
   std::vector<vredit::PickCandidate> candidates;
   for (NodeVisual const& visual : app.visuals) {
@@ -466,47 +411,18 @@ std::optional<vredit::PickHit> pickNode(App& app, Ray const& ray) {
   return vredit::pickClosestSurface(ray, candidates);
 }
 
-// Cheap bounds-only body pick (per-frame hover feedback).
-// What a press on this ray would act on, resolved by depth: a gizmo handle
-// wins only when it is nearer along the ray than the model body. The handles
-// sit at the selection's bounds centre — inside the body — so without depth
-// ordering every press near a model's middle stole a handle drag instead of
-// the body grab (one axis of movement = "very slowly", and AxisY/Free could
-// lift models off the floor). Hover feedback reports this same resolution,
-// so what lights up is what a press will do.
+// What a press on this ray would act on: the model/part under the pointer
+// (exact surface pick). The handles are gone; a press only ever SELECTS.
 struct PointerTarget {
-  std::optional<GizmoHandle> handle; // set when a handle wins
-  NodeId node{kInvalidNode};         // set when a body wins
+  NodeId node{kInvalidNode}; // the picked model/part (exact surface)
 };
 
-PointerTarget resolvePointerTarget(App& app, Ray const& ray, float thresholdPx) {
+PointerTarget resolvePointerTarget(App& app, Ray const& ray) {
   PointerTarget target;
-  // The body uses the press's own pick (exact surface first, bounds fallback):
-  // hover and press must agree on what is under the pointer, and the exact
-  // pick is what keeps "closest surface through gaps" honest. It costs
-  // milliseconds on a dense model — the price of "what lights up is what a
-  // press grabs".
+  // The press's own pick (exact surface first): the bounding box is not a
+  // click target — pressing empty space selects nothing.
   auto body = pickNode(app, ray);
-  Vec3 pivot;
-  Quat orientation;
-  std::optional<vredit::RayHandleHit> handleHit;
-  if (gizmoFrame(app, pivot, orientation)) {
-    float size = gizmoSize(app, pivot);
-    auto geometry = buildHandleGeometry(app.mode, pivot, orientation, size);
-    handleHit = vredit::pickHandleByRay(geometry, ray, size * (thresholdPx / kGizmoPixels));
-  }
-  // Depth order: a handle wins only when it is in front of the body hit. The
-  // handles sit at the bounds centre — inside the body — so pressing a model's
-  // middle grabs the body (the primary action) and handles are used where they
-  // protrude past the silhouette, which the selection-scaled gizmo makes
-  // generous. When only the bounds fallback hit, the body still wins ties:
-  // pointing into an empty box region should grab the model, not a buried
-  // handle.
-  bool const handleWins =
-      handleHit.has_value() && (!body.has_value() || handleHit->distance < body->t);
-  if (handleWins) {
-    target.handle = handleHit->handle;
-  } else if (body.has_value()) {
+  if (body.has_value()) {
     target.node = body->node;
   }
   return target;
@@ -540,35 +456,8 @@ bool wholeModelSelection(App const& app) {
   return true;
 }
 
-// Refresh the per-frame hover state (the hovered gizmo handle brightens).
-// Suppressed during a live drag so the highlight does not chase the pointer
-// mid-edit. Model hover tints were explicitly rejected.
-void updateHover(App& app, Ray const& ray, float thresholdPx, bool partSelect) {
-  app.hoverHandle.reset();
-  if (app.dragging || app.stickSession || app.galleryActive) {
-    return; // the gallery runs its own preview hover instead
-  }
-  PointerTarget target = resolvePointerTarget(app, ray, thresholdPx);
-  if (target.handle.has_value()) {
-    app.hoverHandle = target.handle;
-  } else {
-    (void)partSelect; // models are not highlighted on hover
-  }
-}
-
-float snapStepFor(App const& app) {
-  if (!app.snap) {
-    return 0.0F;
-  }
-  switch (app.mode) {
-  case GizmoMode::Rotate:
-    return kSnapRotate;
-  case GizmoMode::Scale:
-    return kSnapScale;
-  default:
-    return kSnapTranslate;
-  }
-}
+// Per-frame hover was handle feedback; the handles are gone and model hover
+// tints were explicitly rejected, so there is nothing to update.
 
 // Full editor state for undo/redo: structure + visuals + groups + selection.
 vredit::EditorSnapshot snapshot(App const& app) {
@@ -580,54 +469,27 @@ void applySnapshot(App& app, vredit::EditorSnapshot const& state) {
 }
 
 // Defined below; pointerPress commits any live edit before starting anew.
-bool endDrag(App& app);
 bool endEdits(App& app);
 void galleryClose(App& app);
 bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay);
 
-// Pointer interaction shared by the mouse and the VR controller ray. The
-// caller resolves the handle under the pointer (screen-space for the mouse,
-// ray-space for VR); a handle press starts a drag, anything else SELECTS.
+// Pointer interaction shared by the mouse and the VR controller ray: a
+// press only SELECTS (all editing is the sticks / arrow keys).
 // partSelect (shift/ctrl click, grip+trigger in VR) limits the selection to
 // the single picked part instead of the whole model. A body press never moves
-// anything — movement and rotation are the sticks' job in VR (controller aim
-// is too jittery for accurate placement) and the gizmo's job on desktop.
-void pointerPress(App& app,
-                  Ray const& ray,
-                  Vec3 const& viewDir,
-                  PointerTarget const& target,
-                  bool partSelect) {
+// A press only SELECTS ("I never want to see them again" — the coloured
+// axis handles are gone): movement, rotation, height and scale are all the
+// thumbsticks' job in VR (controller aim is too jittery for accurate
+// placement) and the arrow keys' on desktop.
+void pointerPress(App& app, PointerTarget const& target, bool partSelect) {
   // While the model gallery is open it owns the interaction: previews are
   // transient UI and clicking elsewhere must not touch the world.
   if (app.galleryActive) {
     return;
   }
-  // A press while a live edit is running means its release was never seen
-  // (pointer left the window) or a stick gesture is mid-flight: commit it as
-  // one undo step before starting over. endEdits covers BOTH engines (drag
-  // and stick) — ending only the drag here left the stick session fused with
-  // the drag, clobbering transforms and losing movement from history.
+  // A press while a live stick gesture is running means its release was
+  // never seen: commit it as one undo step before starting over.
   endEdits(app);
-  if (target.handle.has_value()) {
-    Vec3 pivot;
-    Quat orientation;
-    if (gizmoFrame(app, pivot, orientation)) {
-      GizmoSettings settings;
-      settings.mode = app.mode;
-      settings.space = app.space;
-      settings.snapStep = snapStepFor(app);
-      bool started =
-          app.drag.begin(app.scene, app.selection, pivot, orientation, *target.handle, ray, viewDir,
-                         settings);
-      if (started) {
-        // Snapshot after begin() (it captures state, never mutates) and before
-        // the first update() — undo restores exactly this pre-drag state.
-        app.undo.begin(snapshot(app));
-      }
-      app.dragging = started;
-    }
-    return;
-  }
   if (target.node == kInvalidNode) {
     app.selection.clear();
     return;
@@ -635,33 +497,12 @@ void pointerPress(App& app,
   app.selection = vredit::expandSelection(app.modelGroups, target.node, partSelect);
 }
 
-void pointerMove(App& app, Ray const& ray) {
-  if (app.dragging) {
-    app.drag.update(ray);
-  }
-}
-
-// Ends an active drag and records it as one undo step (no-op when it moved
-// nothing). Drag-only: the trigger release path uses this so a release never
-// cuts a stick gesture short (see endEdits for the both-engines version).
-bool endDrag(App& app) { // returns true when an undo step was recorded
-  if (!app.dragging) {
-    return false;
-  }
-  app.drag.end();
-  app.dragging = false;
-  return app.undo.commit(snapshot(app));
-}
-
-// Cancels an active edit (handle drag or stick gesture) without touching the
-// history: restores its pre-edit state and drops the pending undo entry, so
-// both the undo and redo stacks stay exactly as they were. Any undo/redo
-// keypress during a live edit does this and nothing else — going through
-// commit() instead would clear an existing redo branch and make the cancelled
-// edit itself redoable.
+// Cancels a live stick gesture without touching the history: restores its
+// pre-edit state and drops the pending undo entry, so both the undo and redo
+// stacks stay exactly as they were. Any undo/redo keypress during a live
+// edit does this and nothing else — going through commit() instead would
+// clear an existing redo branch and make the cancelled edit itself redoable.
 void cancelLiveEdit(App& app) {
-  app.drag.end();
-  app.dragging = false;
   app.stickSession = false;
   // Disarm the sticks exactly like the apply paths: a held stick would
   // otherwise restart the cancelled gesture in the SAME frame, re-applying
@@ -677,19 +518,14 @@ void cancelLiveEdit(App& app) {
   }
 }
 
-void pointerRelease(App& app) {
-  endDrag(app);
-}
-
-// Commits any live edit — handle drag or stick gesture — as its own undo
-// step. Used where a new action begins (spawn, delete, gizmo-mode switches),
-// as opposed to endDrag (drag-only) which the trigger release path uses so a
-// release never cuts a stick gesture short.
+// Commits a live stick gesture as its own undo step. Used where a new
+// action begins (spawn, delete, mode switches). Also disarms the input: a
+// still-held key/stick must return to neutral before a new gesture starts,
+// or the next frame would split one physical hold into two undo steps.
 bool endEdits(App& app) {
-  bool const wasActive = app.dragging || app.stickSession;
-  app.drag.end();
-  app.dragging = false;
+  bool const wasActive = app.stickSession;
   app.stickSession = false;
+  app.stickArmed = false;
   return wasActive ? app.undo.commit(snapshot(app)) : false;
 }
 
@@ -822,7 +658,7 @@ void galleryOpen(App& app,
   if (app.galleryActive) {
     return;
   }
-  // A live drag or stick gesture must not keep mutating the world behind the
+  // A live stick gesture must not keep mutating the world behind the
   // gallery (and its pending edit would tangle with the pick's): close it as
   // its own undo step first.
   endEdits(app);
@@ -992,7 +828,12 @@ void assembleFrame(App& app,
     return std::find(app.galleryHoverNodes.begin(), app.galleryHoverNodes.end(), id) !=
            app.galleryHoverNodes.end();
   };
-  auto appendItem = [&app, &items, &isSelected, &isGalleryHovered](NodeVisual const& visual) {
+  // The marker's bounds, accumulated while the items are built: one pass
+  // over the visuals (the marker needs the selection's world box anyway).
+  Aabb markerBounds{};
+  bool markerAny = false;
+  auto appendItem = [&app, &items, &isSelected, &isGalleryHovered, &markerBounds,
+                     &markerAny](NodeVisual const& visual) {
     DrawItem item;
     item.mesh = visual.mesh;
     item.texture = visual.texture;
@@ -1005,15 +846,38 @@ void assembleFrame(App& app,
     item.alphaCutoff = visual.alphaCutoff;
     item.alpha = visual.alpha;
     item.lit = true;
-    // 1 = selected (warm) — the only tint the user wants: the selection is
-    // also visible from the gizmo sitting at the selection's centre. While
+    // The selection is marked by the diamond above it (not a tint). While
     // the hold-X delete charges, the selection ramps red (3 + charge). The
-    // gallery's aimed preview gets the same warm tint (the selector's
-    // "you are pointing at THIS one" feedback).
-    if (isSelected(visual.id) && app.deleteCharge > 0.0F) {
-      item.highlight = 3.0F + app.deleteCharge;
+    // gallery's aimed preview keeps its warm tint — that is the selector's
+    // "you are pointing at THIS one" feedback, not a selection.
+    if (isSelected(visual.id)) {
+      if (app.deleteCharge > 0.0F) {
+        item.highlight = 3.0F + app.deleteCharge;
+      } else {
+        item.highlight = isGalleryHovered(visual.id) ? 1.0F : 0.0F;
+      }
+      // Extend the marker bounds with this visual's world box (8 corners:
+      // the node may carry rotation).
+      for (int corner = 0; corner < 8; ++corner) {
+        Vec3 const local{
+            ((corner & 1) != 0) ? visual.localBounds.max.x : visual.localBounds.min.x,
+            ((corner & 2) != 0) ? visual.localBounds.max.y : visual.localBounds.min.y,
+            ((corner & 4) != 0) ? visual.localBounds.max.z : visual.localBounds.min.z};
+        Vec3 const point = transformPoint(item.model, local);
+        if (!markerAny) {
+          markerBounds = {point, point};
+          markerAny = true;
+        } else {
+          markerBounds.min = {std::fmin(markerBounds.min.x, point.x),
+                              std::fmin(markerBounds.min.y, point.y),
+                              std::fmin(markerBounds.min.z, point.z)};
+          markerBounds.max = {std::fmax(markerBounds.max.x, point.x),
+                              std::fmax(markerBounds.max.y, point.y),
+                              std::fmax(markerBounds.max.z, point.z)};
+        }
+      }
     } else {
-      item.highlight = (isSelected(visual.id) || isGalleryHovered(visual.id)) ? 1.0F : 0.0F;
+      item.highlight = isGalleryHovered(visual.id) ? 1.0F : 0.0F;
     }
     items.push_back(item);
   };
@@ -1028,11 +892,37 @@ void assembleFrame(App& app,
       appendItem(visual);
     }
   }
-  Vec3 pivot;
-  Quat orientation;
-  if (gizmoFrame(app, pivot, orientation)) {
-    auto geometry = buildHandleGeometry(app.mode, pivot, orientation, gizmoSize(app, pivot));
-    appendHandleLines(overlayLines, geometry, app.hoverHandle);
+  // The selection marker ("a small indicator above the selected model part"):
+  // a small orange diamond floating over the selection's bounds. Unlit lines,
+  // not a tint — subtle, and it marks exactly what is selected (a part
+  // selection marks the part).
+  if (markerAny) {
+    Aabb const& bounds = markerBounds;
+    Vec3 const centre = aabbCentre(bounds);
+    float const radius = 0.5F * length(bounds.max - bounds.min);
+    float const size = std::fmax(0.03F, 0.10F * radius);
+    Vec3 const tip{centre.x, bounds.max.y + 2.2F * size, centre.z};
+    Vec3 const bottom{centre.x, bounds.max.y + 0.4F * size, centre.z};
+    Vec3 const mid{centre.x, bounds.max.y + 1.3F * size, centre.z};
+    Vec3 const right{mid.x + size, mid.y, mid.z};
+    Vec3 const left{mid.x - size, mid.y, mid.z};
+    Vec3 const front{mid.x, mid.y, mid.z + size};
+    Vec3 const back{mid.x, mid.y, mid.z - size};
+    Vec3 const orange{1.0F, 0.55F, 0.1F};
+    Vec3 const up{0.0F, 1.0F, 0.0F};
+    auto line = [&](Vec3 const& a, Vec3 const& b) {
+      overlayLines.push_back(MeshVertex{a, up, orange, {0.0F, 0.0F}});
+      overlayLines.push_back(MeshVertex{b, up, orange, {0.0F, 0.0F}});
+    };
+    // Octahedron outline: a diamond from any angle.
+    line(tip, right);
+    line(tip, left);
+    line(tip, front);
+    line(tip, back);
+    line(bottom, right);
+    line(bottom, left);
+    line(bottom, front);
+    line(bottom, back);
   }
 }
 
@@ -1048,7 +938,7 @@ bool openWindow(XcbWindow& window, std::uint32_t width, std::uint32_t height, ch
       screen->black_pixel,
       XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
           XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE |
-          XCB_EVENT_MASK_STRUCTURE_NOTIFY};
+          XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_FOCUS_CHANGE};
   xcb_create_window(window.connection, XCB_COPY_FROM_PARENT, window.window, screen->root, 0, 0,
                     width, height, 0, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual,
                     XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK, values);
@@ -1115,8 +1005,6 @@ void handleEvent(App& app,
     auto* press = reinterpret_cast<xcb_button_press_event_t*>(event);
     Vec2 mouse{static_cast<float>(press->event_x), static_cast<float>(press->event_y)};
     app.lastMouse = mouse;
-    app.snap = (press->state & XCB_MOD_MASK_CONTROL) != 0U;
-    app.partSelect = (press->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
     if (app.width == 0U || app.height == 0U) {
       break; // minimised: pointer maths would divide by zero
     }
@@ -1128,8 +1016,8 @@ void handleEvent(App& app,
         break;
       }
       bool const partSelect = (press->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
-      PointerTarget target = resolvePointerTarget(app, mouseRay, kPickThresholdPx);
-      pointerPress(app, mouseRay, cameraForward(app.camera), target, partSelect);
+      PointerTarget target = resolvePointerTarget(app, mouseRay);
+      pointerPress(app, target, partSelect);
     } else if (press->detail == 3U) {
       if ((press->state & XCB_MOD_MASK_SHIFT) != 0U) {
         app.panning = true;
@@ -1147,11 +1035,21 @@ void handleEvent(App& app,
     }
     break;
   }
+  case XCB_FOCUS_OUT: {
+    // Focus lost mid-hold: the release events will go to another window, so
+    // the held-key flags would stay set forever (runaway scene mutation with
+    // the arrows). Clear every held input and commit what was done.
+    app.flyForward = app.flyBack = app.flyLeft = app.flyRight = false;
+    app.flyUp = app.flyDown = app.flyBoost = false;
+    app.arrowUp = app.arrowDown = app.arrowLeft = app.arrowRight = false;
+    app.looking = false;
+    app.panning = false;
+    app.panButton = 0U;
+    endEdits(app);
+    break;
+  }
   case XCB_BUTTON_RELEASE: {
     auto* release = reinterpret_cast<xcb_button_release_event_t*>(event);
-    if (release->detail == 1U) {
-      pointerRelease(app);
-    }
     if (release->detail == 3U) {
       app.looking = false;
     }
@@ -1166,18 +1064,14 @@ void handleEvent(App& app,
     Vec2 mouse{static_cast<float>(motion->event_x), static_cast<float>(motion->event_y)};
     Vec2 delta{mouse.x - app.lastMouse.x, mouse.y - app.lastMouse.y};
     app.lastMouse = mouse;
-    app.snap = (motion->state & XCB_MOD_MASK_CONTROL) != 0U;
-    app.partSelect = (motion->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
     if (app.width == 0U || app.height == 0U) {
-      endDrag(app); // minimised mid-drag: commit what was done, stop tracking
+      endEdits(app); // minimised mid-gesture: commit what was done, stop tracking
       app.looking = false;
       app.panning = false;
       app.panButton = 0U;
       break; // pointer maths would divide by zero
     }
-    if (app.dragging) {
-      pointerMove(app, appRay(app, mouse));
-    } else if (app.looking) {
+    if (app.looking) {
       cameraLook(app.camera, delta.x * kLookSpeed, -delta.y * kLookSpeed);
     } else if (app.panning) {
       panCamera(app.camera, delta.x, delta.y, static_cast<float>(app.height));
@@ -1200,6 +1094,10 @@ void handleEvent(App& app,
     case 'd': case 'D': app.flyRight = pressed; break;
     case 'q': case 'Q': app.flyDown = pressed; break;
     case 'e': case 'E': app.flyUp = pressed; break;
+    case 0xFF52: app.arrowUp = pressed; break;    // Up
+    case 0xFF54: app.arrowDown = pressed; break;  // Down
+    case 0xFF51: app.arrowLeft = pressed; break;  // Left
+    case 0xFF53: app.arrowRight = pressed; break; // Right
     case 0xFFE1: case 0xFFE2: app.flyBoost = pressed; break; // Shift L/R
     default: movementKey = false; break;
     }
@@ -1209,13 +1107,13 @@ void handleEvent(App& app,
     if (!pressed) {
       break;
     }
-    // Only keys that change gizmo state cancel an active drag; modifier presses
+    // Only keys that change editor state cancel a live gesture; modifier presses
     // (e.g. Ctrl for snap) must not.
     bool stateChanged = false;
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
       // Undo/redo during a live edit cancels that edit first and stops there,
       // leaving both stacks untouched (see cancelLiveEdit).
-      if (app.dragging || app.stickSession || app.galleryActive) {
+      if (app.stickSession || app.galleryActive) {
         cancelLiveEdit(app);
         break;
       }
@@ -1227,7 +1125,7 @@ void handleEvent(App& app,
       }
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      if (app.dragging || app.stickSession || app.galleryActive) {
+      if (app.stickSession || app.galleryActive) {
         cancelLiveEdit(app);
         break;
       }
@@ -1260,10 +1158,6 @@ void handleEvent(App& app,
       stateChanged = true;
     } else if (keysym == '3') {
       app.mode = GizmoMode::Scale;
-      stateChanged = true;
-    } else if (keysym == 'l' || keysym == 'L') {
-      app.space = (app.space == GizmoSpace::World) ? GizmoSpace::Local : GizmoSpace::World;
-      std::printf("gizmo space: %s\n", app.space == GizmoSpace::World ? "world" : "local");
       stateChanged = true;
     } else if (keysym == 'b' || keysym == 'B') {
       toggleBackdrop(app, renderer, nullptr);
@@ -1343,7 +1237,7 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   App app;
   if (modelPaths.empty()) {
     buildDemoScene(app);
-    app.selection.push_back(app.visuals[0].id); // exercise the gizmo overlay path
+    app.selection.push_back(app.visuals[0].id); // exercise the selection marker path
   }
 
   VkRenderer renderer;
@@ -1811,14 +1705,13 @@ int runXr(char const* shaderDir,
     // No flight controls: passthrough means you walk in the real world with
     // the models placed in it — the sticks' flight/turn bindings were removed
     // at the user's request ("I can now move in the real world"). Grip is the
-    // gizmo snap modifier.
-    app.snap = input.gripHeld > 0.5F;
+    // fine-control modifier (and selects roll in Rotate mode).
 
     // NO grip chords on face buttons — the grip sensor spikes when squeezing
     // the controller to press one, which made this dispatch silently take the
     // wrong branch (the reported "can only rotate horizontally": the mode
     // cycle was unreachable behind a grip+menu backdrop chord). Tap/hold on
-    // ONE button instead: TAP (< 0.4 s) = gizmo mode cycle (on release),
+    // ONE button instead: TAP (< 0.4 s) = stick mode cycle (on release),
     // HOLD = backdrop toggle (fires once at threshold, the tap is cancelled —
     // the same pattern as hold-X delete).
     if (input.menuPressed || (input.menuHeld && !app.menuPrevHeld)) {
@@ -1847,7 +1740,7 @@ int runXr(char const* shaderDir,
     }
     bool cancelledLiveEdit = false;
     if (input.undoPressed) {
-      if (app.dragging || app.stickSession || app.galleryActive) {
+      if (app.stickSession || app.galleryActive) {
         cancelLiveEdit(app);
         cancelledLiveEdit = true;
       } else {
@@ -1861,7 +1754,7 @@ int runXr(char const* shaderDir,
     // Same guard as the desktop keys: one cancel per frame leaves both stacks
     // untouched even if both arrive together.
     if (input.redoPressed && !cancelledLiveEdit) {
-      if (app.dragging || app.stickSession || app.galleryActive) {
+      if (app.stickSession || app.galleryActive) {
         cancelLiveEdit(app);
       } else {
         vredit::EditorSnapshot state = snapshot(app);
@@ -1887,7 +1780,7 @@ int runXr(char const* shaderDir,
                  normalized(transformVector(rigWorld, input.pointerRay.direction))};
 
     // The right controller's aim ray drives the same state machine as the
-    // mouse; the head pose sizes the gizmo. A body press only SELECTS —
+    // mouse. A body press only SELECTS —
     // movement and rotation are the sticks' job (controller aim is too
     // jittery for accurate placement).
     app.camera.position = headWorld;
@@ -1899,16 +1792,10 @@ int runXr(char const* shaderDir,
       } else {
         // Grip + trigger selects a single part; trigger alone the whole model.
         bool const partSelect = input.gripHeld > 0.5F;
-        PointerTarget target = resolvePointerTarget(app, worldRay, kVrPickThresholdPx);
-        pointerPress(app, worldRay, headForward, target, partSelect);
+        PointerTarget target = resolvePointerTarget(app, worldRay);
+        pointerPress(app, target, partSelect);
       }
-    } else if (input.selectHeld && !app.galleryActive) {
-      pointerMove(app, worldRay);
     }
-    if (input.selectReleased) {
-      pointerRelease(app);
-    }
-    updateHover(app, worldRay, kVrPickThresholdPx, input.gripHeld > 0.5F);
 
     // Stick-driven editing (user request: "right stick to move, left stick to
     // rotate"): the right stick slides the selection across the floor
@@ -1955,25 +1842,40 @@ int runXr(char const* shaderDir,
     if (!sticksActive) {
       app.stickArmed = true;
     }
-    if (sticksActive && !app.stickSession && !app.dragging && !app.galleryActive &&
+    if (sticksActive && !app.stickSession && !app.galleryActive &&
         !app.selection.empty() && app.stickArmed) {
       app.undo.begin(snapshot(app));
       app.stickSession = true;
       app.stickFineRate = input.gripHeld > 0.5F ? 0.25F : 1.0F;
-      // Pre-signed tip axis: stick up tips the top AWAY (negative about the
-      // viewer's right) grip-free; grip + up rolls the top to the viewer's
-      // RIGHT (positive about the view axis).
-      app.stickTipAxis = input.gripHeld > 0.5F
-                             ? headForwardFlat
-                             : Vec3{-headRightFlat.x, -headRightFlat.y, -headRightFlat.z};
+      app.stickRollMode = input.gripHeld > 0.5F; // grip+Y = roll (latched)
+      // The rotation axes are the SELECTION'S OWN frame (perpendicular by
+      // construction — the user requirement): spin about the model's up,
+      // tip about the model's right, roll about the model's forward,
+      // sign-aligned to the viewer at gesture start so "up tips away" keeps
+      // its meaning. An unrotated model behaves exactly as before.
+      Vec3 yawAxis{0.0F, 1.0F, 0.0F};
+      Vec3 tipAxis{0.0F, 0.0F, -1.0F};
+      Vec3 rollAxis{0.0F, 0.0F, -1.0F};
+      if (vredit::selectionRotationAxes(app.scene, app.selection, headRightFlat,
+                                        headForwardFlat, yawAxis, tipAxis, rollAxis)) {
+        app.stickYawAxis = yawAxis;
+        app.stickTipAxis = tipAxis;
+        app.stickRollAxis = rollAxis;
+      } else {
+        // Degenerate selection frame: fall back to the viewer-aligned
+        // defaults rather than silently reusing the PREVIOUS gesture's axes.
+        app.stickYawAxis = yawAxis;
+        app.stickTipAxis = tipAxis;
+        app.stickRollAxis = rollAxis;
+      }
       vredit::Aabb bounds{};
       if (vredit::movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
         app.stickPivot = vredit::aabbCentre(bounds);
-      } else if (!app.selection.empty()) {
+      } else {
         app.stickPivot = app.scene.worldPosition(app.selection.front());
       }
     }
-    if (app.stickSession && !app.dragging && !app.galleryActive) {
+    if (app.stickSession && !app.galleryActive) {
       if (gestureAlive && !app.selection.empty()) {
         Vec3 const moveDelta = (headRightFlat * rightX + headForwardFlat * rightY) *
                                (kStickMoveMps * app.stickFineRate * dt);
@@ -1984,20 +1886,44 @@ int runXr(char const* shaderDir,
           vredit::moveSelectionHorizontal(app.scene, app.selection, moveDelta);
         }
         // Stick right = the model turns to its right: a clockwise turn seen
-        // from above, which is negative around +Y in right-handed maths.
+        // from above, which is negative around the model's up.
         float const yawDelta = -leftX * kStickTurnRadps * app.stickFineRate * dt;
         if (yawDelta != 0.0F) {
           vredit::rotateSelectionAbout(app.scene, app.selection, app.stickPivot,
-                                       Vec3{0.0F, 1.0F, 0.0F}, yawDelta);
+                                       app.stickYawAxis, yawDelta);
         }
+        // The left stick's Y is MODE-driven (the menu button cycles it — the
+        // replacement for the deleted coloured handles): Translate = height,
+        // Rotate = tip/roll, Scale = uniform. X spins in every mode.
         if (std::fabs(leftY) > 1e-4F) {
-          vredit::rotateSelectionAbout(app.scene, app.selection, app.stickPivot, app.stickTipAxis,
-                                       leftY * kStickTurnRadps * app.stickFineRate * dt);
-          // The floor rule is about MODELS ("models stay stuck to the
-          // floor"): tipping a PART must not lift it out of its model by
-          // flooring through the part's own bounds.
-          if (wholeModelSelection(app)) {
-            vredit::dropSelectionToFloor(app.scene, app.visuals, app.selection);
+          switch (app.mode) {
+          case GizmoMode::Translate: {
+            // Explicit height: no floor rule (lifting is deliberate).
+            float const deltaY = leftY * kStickHeightMps * app.stickFineRate * dt;
+            vredit::moveSelectionVertical(app.scene, app.selection, deltaY);
+            break;
+          }
+          case GizmoMode::Scale: {
+            float const factor =
+                std::exp(leftY * kStickScalePerS * app.stickFineRate * dt);
+            vredit::scaleSelectionUniform(app.scene, app.visuals, app.selection, factor);
+            break;
+          }
+          case GizmoMode::Rotate:
+          default: {
+            // Grip selects roll at GESTURE start (latched); the axis follows
+            // the model's frame (perpendicular to the spin axis).
+            float const angle = leftY * kStickTurnRadps * app.stickFineRate * dt;
+            Vec3 const axis = app.stickRollMode ? app.stickRollAxis : app.stickTipAxis;
+            vredit::rotateSelectionAbout(app.scene, app.selection, app.stickPivot, axis, angle);
+            // The floor rule is about MODELS ("models stay stuck to the
+            // floor"): tipping a PART must not lift it out of its model by
+            // flooring through the part's own bounds.
+            if (wholeModelSelection(app)) {
+              vredit::dropSelectionToFloor(app.scene, app.visuals, app.selection);
+            }
+            break;
+          }
           }
         }
       } else {
@@ -2155,6 +2081,98 @@ void updateFlight(App& app, float dt) {
   flyCamera(app.camera, local * speed);
 }
 
+// Applies held arrow keys once per frame: the desktop mirror of the stick
+// editing (the coloured handles are gone). Left/right spins about the
+// selection's own up; up/down drives the mode's Y — height (Translate),
+// tip with Shift = roll (Rotate), uniform scale (Scale). Same one-undo-step-
+// per-gesture lifecycle as the sticks: begun on the first deflection,
+// committed when the arrows settle.
+void updateArrowEdit(App& app, float dt) {
+  float const axisX = app.arrowRight ? 1.0F : (app.arrowLeft ? -1.0F : 0.0F);
+  float const axisY = app.arrowUp ? 1.0F : (app.arrowDown ? -1.0F : 0.0F);
+  if (axisX == 0.0F && axisY == 0.0F) {
+    // Debounced commit (2 quiet frames): X11 auto-repeat's Release+Press
+    // pair must not split one physical hold into many undo steps.
+    if (app.arrowQuietFrames < 2) {
+      ++app.arrowQuietFrames;
+      return;
+    }
+    if (app.stickSession && !app.galleryActive) {
+      app.undo.commit(snapshot(app));
+      app.stickSession = false;
+    }
+    app.stickArmed = true; // arrows re-centred: the next hold may start
+    return;
+  }
+  app.arrowQuietFrames = 0;
+  if (app.galleryActive || app.selection.empty()) {
+    return;
+  }
+  Vec3 forward = cameraForward(app.camera);
+  Vec3 forwardFlat{forward.x, 0.0F, forward.z};
+  forwardFlat = dot(forwardFlat, forwardFlat) > 1e-8F ? normalized(forwardFlat)
+                                                     : Vec3{0.0F, 0.0F, -1.0F};
+  Vec3 const rightFlat = cross(forwardFlat, Vec3{0.0F, 1.0F, 0.0F});
+  if (!app.stickSession) {
+    // Armed latch: a cancelled edit must not restart from still-held keys in
+    // the same frame (it would swallow the undo press that cancelled it).
+    if (!app.stickArmed) {
+      return;
+    }
+    app.undo.begin(snapshot(app));
+    app.stickSession = true;
+    app.stickFineRate = app.flyBoost ? 0.25F : 1.0F; // Shift = fine (latched)
+    app.stickRollMode = app.flyBoost;                // Shift+Y = roll (latched)
+    Vec3 yawAxis{0.0F, 1.0F, 0.0F};
+    Vec3 tipAxis{0.0F, 0.0F, -1.0F};
+    Vec3 rollAxis{0.0F, 0.0F, -1.0F};
+    if (vredit::selectionRotationAxes(app.scene, app.selection, rightFlat, forwardFlat,
+                                      yawAxis, tipAxis, rollAxis)) {
+      app.stickYawAxis = yawAxis;
+      app.stickTipAxis = tipAxis;
+      app.stickRollAxis = rollAxis;
+    } else {
+      // Degenerate selection frame: fall back to the viewer-aligned defaults
+      // rather than silently reusing the PREVIOUS gesture's axes.
+      app.stickYawAxis = yawAxis;
+      app.stickTipAxis = tipAxis;
+      app.stickRollAxis = rollAxis;
+    }
+    vredit::Aabb bounds{};
+    app.stickPivot = vredit::movingSetBounds(app.scene, app.visuals, app.selection, bounds)
+                        ? vredit::aabbCentre(bounds)
+                        : app.scene.worldPosition(app.selection.front());
+  }
+  if (axisX != 0.0F) {
+    float const yawDelta = -axisX * kStickTurnRadps * app.stickFineRate * dt;
+    vredit::rotateSelectionAbout(app.scene, app.selection, app.stickPivot, app.stickYawAxis,
+                                 yawDelta);
+  }
+  if (axisY != 0.0F) {
+    switch (app.mode) {
+    case GizmoMode::Translate:
+      vredit::moveSelectionVertical(app.scene, app.selection,
+                                    axisY * kStickHeightMps * app.stickFineRate * dt);
+      break;
+    case GizmoMode::Scale:
+      vredit::scaleSelectionUniform(
+          app.scene, app.visuals, app.selection,
+          std::exp(axisY * kStickScalePerS * app.stickFineRate * dt));
+      break;
+    case GizmoMode::Rotate:
+    default: {
+      Vec3 const axis = app.stickRollMode ? app.stickRollAxis : app.stickTipAxis;
+      vredit::rotateSelectionAbout(app.scene, app.selection, app.stickPivot, axis,
+                                   axisY * kStickTurnRadps * app.stickFineRate * dt);
+      if (wholeModelSelection(app)) {
+        vredit::dropSelectionToFloor(app.scene, app.visuals, app.selection);
+      }
+      break;
+    }
+    }
+  }
+}
+
 int runInteractive(char const* shaderDir,
                    std::vector<char const*> const& modelPaths,
                    std::string const& libraryDir) {
@@ -2195,8 +2213,9 @@ int runInteractive(char const* shaderDir,
   std::printf(
       "vr-editor on %s\n"
       "  flight: WASD move   Q/E down/up   Shift boost   RMB look   MMB or Shift+RMB pan\n"
-      "  wheel: fly forward/back   LMB: select / drag gizmo\n"
-      "  1 translate   2 rotate   3 scale   L world/local space   Ctrl snap   Esc quit\n",
+      "  wheel: fly forward/back   LMB: select (shift+click a part)\n"
+      "  arrows edit: left/right spin   up/down = mode Y\n"
+      "  1 height   2 tip (shift = roll)   3 scale   N gallery   Esc quit\n",
       renderer.deviceName());
 
   auto previous = std::chrono::steady_clock::now();
@@ -2213,6 +2232,7 @@ int runInteractive(char const* shaderDir,
       dt = 0.1F; // tab stalls must not teleport the camera
     }
     updateFlight(app, dt);
+    updateArrowEdit(app, dt); // arrow keys mirror the sticks (edit the selection)
     // The gallery's preview under the mouse brightens (the same "you are
     // pointing at THIS one" feedback as the controller aim in VR).
     if (app.galleryActive) {
@@ -2222,7 +2242,6 @@ int runInteractive(char const* shaderDir,
       std::this_thread::sleep_for(std::chrono::milliseconds(8)); // minimised: no busy spin
       continue;
     }
-    updateHover(app, appRay(app, app.lastMouse), kPickThresholdPx, app.partSelect);
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;
@@ -2297,13 +2316,15 @@ int main(int argc, char** argv) {
           "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR] [--library DIR]\n"
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
           "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n"
-          "keys: WASD/QE fly (RMB look), 1/2/3 move/rotate/scale, L space,\n"
+          "keys: WASD/QE fly (RMB look), arrows edit: left/right spin, up/down\n"
+          "      = mode Y (1 height, 2 tip, 3 scale), shift = fine / roll,\n"
           "      N model gallery (click preview spawns; N closes), Delete remove,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
           "vr:   trigger select (grip+trigger part), right stick move on the floor,\n"
-          "      left stick rotate (X spin, Y tip; grip+Y roll), grip = fine,\n"
+          "      left stick: X spin, Y = mode (menu tap cycles height/tip/scale),\n"
+          "      grip = fine (and roll in tip mode),\n"
           "      A model gallery (trigger on preview spawns),\n"
-          "      hold X delete, B/Y undo/redo, menu tap = mode, menu hold = backdrop\n");
+          "      hold X delete, B/Y undo/redo, menu hold = backdrop\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);

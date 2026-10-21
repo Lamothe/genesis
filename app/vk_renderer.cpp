@@ -106,6 +106,11 @@ struct VkRenderer::Impl {
   VkPipeline blendPipeline{VK_NULL_HANDLE};
 
   static constexpr std::size_t kMaxTextures = 32; // matches the shader array
+  // Upload budget per texture side: past this the resample costs more VRAM
+  // than detail ("run out of memory after a few models" — one 12288^2 map
+  // upscaled to 16384^2 was 1.4 GB alone). 8K is ~2.8x the per-eye target.
+  static constexpr std::uint32_t kUploadBudget = 8192U;
+  std::size_t textureBytes{0}; // uploaded texture VRAM (mips included)
 
   struct TextureRecord {
     VkImage image{VK_NULL_HANDLE};
@@ -1304,6 +1309,14 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
   return static_cast<MeshHandle>(g.meshes.size() - 1U);
 }
 
+// True when `image` needs the upload-budget resample: oversize or NPOT
+// (NPOT image extents fault the NVIDIA DMA path; see fitToBudget).
+static bool needsUploadFit(Image const& image, std::uint32_t maxDim) {
+  auto const isPot = [](std::uint32_t v) { return (v & (v - 1U)) == 0U; };
+  return image.width > maxDim || image.height > maxDim || !isPot(image.width) ||
+         !isPot(image.height);
+}
+
 TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repeatV) {
   Impl& g = *impl_;
   if (g.device == VK_NULL_HANDLE || image.width == 0U || image.height == 0U ||
@@ -1316,21 +1329,31 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   // Full mip chain: large textures would otherwise lose their detail to
   // minification (sampling a few texels of an 8K skin map looks smooth).
   // Level 0 is `image` itself (not copied); levels 1..N are derived.
-  // NPOT extents are upscaled to power-of-two first: see upscaleToPot — an
-  // NVIDIA driver bug faults the DMA path for NPOT images in some allocation
-  // states. POT images pass through untouched (zero copy).
-  Image upscaled;
+  // fitToBudget: any texture over the upload budget is scaled DOWN (not up),
+  // and NPOT extents become POT — an NVIDIA driver bug faults the DMA path
+  // for NPOT images in some allocation states. POT images within budget pass
+  // through untouched (zero copy).
+  Image fitted;
   Image const* source = &image;
-  bool const needsPot = (image.width & (image.width - 1U)) != 0U ||
-                        (image.height & (image.height - 1U)) != 0U;
-  if (needsPot) {
-    upscaled = upscaleToPot(image);
-    source = &upscaled;
-    std::printf("[vk] texture %ux%u upscaled to %ux%u (NPOT workaround)\n", image.width,
+  if (needsUploadFit(image, Impl::kUploadBudget)) {
+    fitted = fitToBudget(image, Impl::kUploadBudget);
+    source = &fitted;
+    std::printf("[vk] texture %ux%u -> %ux%u (upload budget, NPOT/oversize)\n", image.width,
                 image.height, source->width, source->height);
   }
   std::vector<Image> levels = buildMipLevels(*source);
   std::uint32_t const mipLevels = static_cast<std::uint32_t>(levels.size() + 1U);
+  // VRAM accounting ("we run out of memory after a few models"): every
+  // upload reports its footprint and the running total.
+  {
+    std::size_t bytes = static_cast<std::size_t>(source->width) * source->height * 4U;
+    for (Image const& level : levels) {
+      bytes += static_cast<std::size_t>(level.width) * level.height * 4U;
+    }
+    g.textureBytes += bytes;
+    std::printf("[vk] texture VRAM: +%zu MB, total %zu MB\n", bytes / (1024U * 1024U),
+                g.textureBytes / (1024U * 1024U));
+  }
 
   Impl::TextureRecord record{};
   VkImageCreateInfo imageInfo = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);

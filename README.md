@@ -53,34 +53,36 @@ Free-flight, first-person (desktop debugging): **WASD** move, **Q/E** down/up,
 **Shift** boost, **RMB** mouse-look, **MMB** or **Shift+RMB** pan, **wheel** fly
 forward/back.
 
-**LMB** selects and drags the gizmo: a click selects the whole model under the
-cursor, **Shift+LMB** or **Ctrl+LMB** selects a single part. **1**/**G**
-translate, **2**/**R** rotate, **3** scale, **L** world/local space, **Ctrl**
-snap, **Ctrl-Z** undo (cancels a live edit), **Ctrl-Y** / **Ctrl-Shift-Z**
-redo, **N** opens the model gallery (small previews of every model in the
-library folder arranged in an arc; the pointed-at one brightens and a click
-spawns that model at the mouse aim point as one undo step; **N** closes
+**LMB** selects: a click selects the whole model under the cursor,
+**Shift+LMB** or **Ctrl+LMB** selects a single part. There is no gizmo — the
+coloured axis handles were removed; all editing is the **arrow keys** (the
+desktop mirror of the sticks): **left/right** spins the selection about its
+own up, **up/down** drives the mode's Y — **1** height (lift/lower, no floor
+rule), **2** tip (stick up tips the top away; **Shift** = roll), **3** uniform
+scale (per-axis scaling does not exist). **Shift** runs the arrows at quarter
+speed (fine). Each arrow gesture is one undo step. **Ctrl-Z** undo (cancels a
+live edit), **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model gallery
+(small previews of every model in the library folder arranged in an arc; the
+pointed-at one brightens and a click spawns that model at the mouse aim point
+as one undo step; **N** closes
 without spawning), **Delete** removes the selection (model or part),
-**Esc** quits. Scale is UNIFORM only — every scale handle drives one factor on
-all three axes; per-axis scaling does not exist. The gizmo sits at the centre
-of the selection's bounds; the selection is tinted.
+**Esc** quits. The selection is marked by a small orange diamond floating over
+its bounds (a part selection marks the part).
 
 In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
 Movement and rotation are the **sticks** (controller aim is too jittery for
 accurate placement): the **right stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
-off the floor), the **left stick** rotates on all three axes — X spins the
-model on the floor, Y tips it: grip-free is pitch (stick up tips the top away
-from you), **grip + Y** is roll (stick up rolls the top to your right). Whole
-models always re-rest on the floor after a tip; part selections tip in place.
-The tip axis and rate are latched per gesture (turning your head or toggling
-grip mid-gesture does not steer a gesture in flight). To make the model bigger
-or smaller: scale mode (menu button cycles translate → rotate → scale; desktop
-key **3**) and the scale handles (uniform), or walk closer. **Grip** held
-runs both sticks at quarter speed for fine control (it selects roll on Y).
-Each stick gesture is one undo step. Aim at a gizmo handle for precise
-axis/rotate/uniform-scale work —
-a handle wins only where it is nearer than the model surface. The bounding box
+off the floor), the **left stick**'s X spins the model about its own up, and
+its **Y is mode-driven** — the **menu button taps** cycle: **height**
+(lift/lower), **tip** (up tips the top away; grip+Y = roll), **scale**
+(uniform). The rotation axes come from the model's own frame and are mutually
+perpendicular (a spin follows the model's tipped up axis); the axes and rate
+are latched per gesture (turning your head or toggling grip mid-gesture does
+not steer a gesture in flight). Whole models re-rest on the floor after a tip;
+part selections tip in place. **Grip** held
+runs both sticks at quarter speed for fine control (and selects roll on Y in
+tip mode). Each stick gesture is one undo step. The bounding box
 is not a click target: pressing empty space next to a model selects nothing.
 Handles brighten when hovered; the selection is shown by the warm tint and the
 gizmo at the selection's centre. **A** is the model gallery: small previews of
