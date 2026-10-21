@@ -69,13 +69,17 @@ In VR the trigger only *selects* — whole model, or a single part with grip+tri
 Movement and rotation are the **sticks** (controller aim is too jittery for
 accurate placement): the **right stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
-off the floor), the **left stick** turns it around vertical — turntable-style,
-never tipping it over. Left stick up/down does *nothing* (it briefly zoomed;
-that ruined rotation and was removed). To make the model bigger or smaller:
-scale mode (menu button cycles translate → rotate → scale; desktop key **3**)
-and the scale handles (uniform), or walk closer. **Grip** held
-runs both sticks at quarter speed for fine control. Each stick gesture is one
-undo step. Aim at a gizmo handle for precise axis/rotate/uniform-scale work —
+off the floor), the **left stick** rotates on all three axes — X spins the
+model on the floor, Y tips it: grip-free is pitch (stick up tips the top away
+from you), **grip + Y** is roll (stick up rolls the top to your right). Whole
+models always re-rest on the floor after a tip; part selections tip in place.
+The tip axis and rate are latched per gesture (turning your head or toggling
+grip mid-gesture does not steer a gesture in flight). To make the model bigger
+or smaller: scale mode (menu button cycles translate → rotate → scale; desktop
+key **3**) and the scale handles (uniform), or walk closer. **Grip** held
+runs both sticks at quarter speed for fine control (it selects roll on Y).
+Each stick gesture is one undo step. Aim at a gizmo handle for precise
+axis/rotate/uniform-scale work —
 a handle wins only where it is nearer than the model surface. The bounding box
 is not a click target: pressing empty space next to a model selects nothing.
 Handles brighten when hovered; the selection is shown by the warm tint and the

@@ -78,6 +78,8 @@ public:
 
   bool valid(NodeId id) const;
   NodeId parent(NodeId id) const;
+  // Every descendant of `id` (its subtree minus itself), depth-first.
+  std::vector<NodeId> descendants(NodeId id) const;
 
   Transform const& local(NodeId id) const;
   void setLocal(NodeId id, Transform const& t); // no-op when exactly unchanged

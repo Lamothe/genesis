@@ -131,6 +131,18 @@ struct App {
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
   // first deflection past the dead zone, committed when the sticks settle.
   bool stickSession{false};
+  // The stick gesture's frame, latched at gesture start: the pivot (the
+  // moving set's bounds centre), the pre-signed tip axis and the fine rate.
+  // Latching keeps one gesture one coherent step — a live head pose or grip
+  // toggle mid-gesture must not steer the tip, change its rate, or walk
+  // asymmetric models sideways via a re-centred pivot.
+  Vec3 stickPivot{};
+  Vec3 stickTipAxis{0.0F, 0.0F, -1.0F};
+  float stickFineRate{1.0F};
+  // Re-arm latch: after an undo/redo the sticks must return to neutral
+  // before a new gesture may start, or the same frame's drift would
+  // cancel-and-restart and swallow the undo.
+  bool stickArmed{true};
   // Menu tap/hold (VR): tap cycles the gizmo mode (fires on release), hold
   // toggles the backdrop once at 0.4 s and cancels the tap.
   float menuCharge{0.0F};
@@ -500,6 +512,34 @@ PointerTarget resolvePointerTarget(App& app, Ray const& ray, float thresholdPx) 
   return target;
 }
 
+// The floor rule ("models stay stuck to the floor") applies to whole models:
+// tipping a PART must not lift it out of its model by flooring through the
+// part's own bounds. True when every model group touched by the selection is
+// FULLY selected (a part selection is false; an empty selection is false).
+bool wholeModelSelection(App const& app) {
+  if (app.selection.empty()) {
+    return false;
+  }
+  for (auto const& [node, group] : app.modelGroups) {
+    if (group == 0U) {
+      continue; // group 0 = ungrouped loose nodes: each is its own "model"
+    }
+    if (std::find(app.selection.begin(), app.selection.end(), node) == app.selection.end()) {
+      continue;
+    }
+    // A selected node: its whole group must be selected.
+    for (auto const& [other, otherGroup] : app.modelGroups) {
+      if (otherGroup != group) {
+        continue;
+      }
+      if (std::find(app.selection.begin(), app.selection.end(), other) == app.selection.end()) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 // Refresh the per-frame hover state (the hovered gizmo handle brightens).
 // Suppressed during a live drag so the highlight does not chase the pointer
 // mid-edit. Model hover tints were explicitly rejected.
@@ -623,6 +663,10 @@ void cancelLiveEdit(App& app) {
   app.drag.end();
   app.dragging = false;
   app.stickSession = false;
+  // Disarm the sticks exactly like the apply paths: a held stick would
+  // otherwise restart the cancelled gesture in the SAME frame, re-applying
+  // the drift and swallowing the undo/redo press that cancelled it.
+  app.stickArmed = false;
   if (app.galleryActive) {
     galleryClose(app); // previews leave; no history was taken for them
     return;
@@ -1179,6 +1223,7 @@ void handleEvent(App& app,
       vredit::EditorSnapshot state = snapshot(app);
       if (redo ? app.undo.redo(state) : app.undo.undo(state)) {
         applySnapshot(app, state);
+        app.stickArmed = false; // sticks must re-centre before a new gesture
       }
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
@@ -1189,6 +1234,7 @@ void handleEvent(App& app,
       vredit::EditorSnapshot state = snapshot(app);
       if (app.undo.redo(state)) {
         applySnapshot(app, state);
+        app.stickArmed = false; // sticks must re-centre before a new gesture
       }
     } else if (keysym == 0xFF1BU) {
       app.running = false;
@@ -1709,11 +1755,12 @@ int runXr(char const* shaderDir,
       return 2;
     }
     frameScene(app);
-  } else {
+  } else if (smoke) {
+    // The demo cubes are a SMOKE fixture ("get rid of those stupid boxes at
+    // the start"): interactive VR starts with an empty world — the model
+    // gallery (A) is how models get in.
     buildDemoScene(app);
-    if (smoke) {
-      app.selection.push_back(app.visuals[0].id);
-    }
+    app.selection.push_back(app.visuals[0].id);
   }
 
   // The headset drives the eye views; locomotion is a rig transform composed
@@ -1807,6 +1854,7 @@ int runXr(char const* shaderDir,
         vredit::EditorSnapshot state = snapshot(app);
         if (app.undo.undo(state)) {
           applySnapshot(app, state);
+          app.stickArmed = false; // sticks must re-centre before a new gesture
         }
       }
     }
@@ -1819,6 +1867,7 @@ int runXr(char const* shaderDir,
         vredit::EditorSnapshot state = snapshot(app);
         if (app.undo.redo(state)) {
           applySnapshot(app, state);
+          app.stickArmed = false; // sticks must re-centre before a new gesture
         }
       }
     }
@@ -1864,44 +1913,92 @@ int runXr(char const* shaderDir,
     // Stick-driven editing (user request: "right stick to move, left stick to
     // rotate"): the right stick slides the selection across the floor
     // relative to the head's yaw (pushing forward walks it away from you),
-    // the left stick turns it around vertical — turntable-style, never
-    // tipping it over. Grip held = quarter speed (fine control). One undo
-    // step per gesture: begun on the first deflection, committed at neutral.
-    float const stickFine = input.gripHeld > 0.5F ? 0.25F : 1.0F;
+    // the left stick rotates on all three axes (spin on X, tip/roll on Y —
+    // grip selects roll). One undo step per gesture.
+    //
+    // The gesture's frame is latched at start (pivot, pre-signed tip axis,
+    // fine rate): turning your head or toggling grip mid-gesture must not
+    // steer the tip plane, change its rate mid-step, or walk asymmetric
+    // models sideways through a per-frame re-centred pivot.
     Vec3 headForwardFlat{headForward.x, 0.0F, headForward.z};
     headForwardFlat = dot(headForwardFlat, headForwardFlat) > 1e-8F
                           ? normalized(headForwardFlat)
                           : Vec3{0.0F, 0.0F, -1.0F};
     Vec3 const headRightFlat = cross(headForwardFlat, Vec3{0.0F, 1.0F, 0.0F});
     float const stickThreshold = app.stickSession ? kStickEndZone : kStickDeadZone;
-    // The left stick rotates (X) and the right stick moves (X/Z); left stick
-    // Y deliberately does NOTHING (it used to zoom and that ruined rotation —
-    // any vertical drift while turning scaled the model).
+    // Dead-zoned stick VALUES (the gate alone is not enough): sub-threshold
+    // drift must never edit — a move gesture used to keep the session open
+    // while left-Y drift silently tipped the model at degrees per second.
+    auto stickValue = [](float v) {
+      float const a = std::fabs(v);
+      if (a <= kStickDeadZone) {
+        return 0.0F;
+      }
+      return (v > 0.0F ? 1.0F : -1.0F) * (a - kStickDeadZone) / (1.0F - kStickDeadZone);
+    };
+    float const rightX = stickValue(input.rightStick.x);
+    float const rightY = stickValue(input.rightStick.y);
+    float const leftX = stickValue(input.leftStick.x);
+    float const leftY = stickValue(input.leftStick.y);
+    // The right stick moves (X/Z). The left stick rotates on ALL THREE axes
+    // ("I still can't rotate other than horizontally"): X spins the model on
+    // the floor, Y tips it — grip free: pitch (stick up tips the top away),
+    // grip held: roll (stick up rolls the top to your right).
     bool const sticksActive = std::fabs(input.rightStick.x) > stickThreshold ||
                               std::fabs(input.rightStick.y) > stickThreshold ||
-                              std::fabs(input.leftStick.x) > stickThreshold;
-    // A Y-deflected left stick keeps an OPEN gesture alive (so an arcing
-    // rotation whose X dips momentarily stays ONE undo step) but never starts
-    // a gesture on its own — Y applies no edit.
-    bool const gestureAlive =
-        sticksActive ||
-        (app.stickSession && std::fabs(input.leftStick.y) > stickThreshold);
+                              std::fabs(input.leftStick.x) > stickThreshold ||
+                              std::fabs(input.leftStick.y) > stickThreshold;
+    bool const gestureAlive = sticksActive;
+    // After an undo/redo the sticks must return to neutral before a new
+    // gesture may start, or the same frame's drift cancels-and-restarts and
+    // swallows the undo.
+    if (!sticksActive) {
+      app.stickArmed = true;
+    }
     if (sticksActive && !app.stickSession && !app.dragging && !app.galleryActive &&
-        !app.selection.empty()) {
+        !app.selection.empty() && app.stickArmed) {
       app.undo.begin(snapshot(app));
       app.stickSession = true;
+      app.stickFineRate = input.gripHeld > 0.5F ? 0.25F : 1.0F;
+      // Pre-signed tip axis: stick up tips the top AWAY (negative about the
+      // viewer's right) grip-free; grip + up rolls the top to the viewer's
+      // RIGHT (positive about the view axis).
+      app.stickTipAxis = input.gripHeld > 0.5F
+                             ? headForwardFlat
+                             : Vec3{-headRightFlat.x, -headRightFlat.y, -headRightFlat.z};
+      vredit::Aabb bounds{};
+      if (vredit::movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
+        app.stickPivot = vredit::aabbCentre(bounds);
+      } else if (!app.selection.empty()) {
+        app.stickPivot = app.scene.worldPosition(app.selection.front());
+      }
     }
     if (app.stickSession && !app.dragging && !app.galleryActive) {
       if (gestureAlive && !app.selection.empty()) {
-        Vec3 const moveDelta =
-            (headRightFlat * input.rightStick.x + headForwardFlat * input.rightStick.y) *
-            (kStickMoveMps * stickFine * dt);
-        vredit::moveSelectionHorizontal(app.scene, app.selection, moveDelta);
+        Vec3 const moveDelta = (headRightFlat * rightX + headForwardFlat * rightY) *
+                               (kStickMoveMps * app.stickFineRate * dt);
+        // Guard the call, not just the maths: a zero delta would still
+        // round-trip every local transform through matrix decompose (float
+        // noise, epoch churn, junk in the undo snapshot).
+        if (moveDelta.x != 0.0F || moveDelta.y != 0.0F || moveDelta.z != 0.0F) {
+          vredit::moveSelectionHorizontal(app.scene, app.selection, moveDelta);
+        }
         // Stick right = the model turns to its right: a clockwise turn seen
         // from above, which is negative around +Y in right-handed maths.
-        float const yawDelta = -input.leftStick.x * kStickTurnRadps * stickFine * dt;
+        float const yawDelta = -leftX * kStickTurnRadps * app.stickFineRate * dt;
         if (yawDelta != 0.0F) {
-          vredit::rotateSelectionYaw(app.scene, app.visuals, app.selection, yawDelta);
+          vredit::rotateSelectionAbout(app.scene, app.selection, app.stickPivot,
+                                       Vec3{0.0F, 1.0F, 0.0F}, yawDelta);
+        }
+        if (std::fabs(leftY) > 1e-4F) {
+          vredit::rotateSelectionAbout(app.scene, app.selection, app.stickPivot, app.stickTipAxis,
+                                       leftY * kStickTurnRadps * app.stickFineRate * dt);
+          // The floor rule is about MODELS ("models stay stuck to the
+          // floor"): tipping a PART must not lift it out of its model by
+          // flooring through the part's own bounds.
+          if (wholeModelSelection(app)) {
+            vredit::dropSelectionToFloor(app.scene, app.visuals, app.selection);
+          }
         }
       } else {
         app.undo.commit(snapshot(app));
@@ -2063,9 +2160,10 @@ int runInteractive(char const* shaderDir,
                    std::string const& libraryDir) {
   App app;
   app.libraryDir = libraryDir;
-  if (modelPaths.empty()) {
-    buildDemoScene(app);
-  }
+  // No demo scene in the interactive editor ("get rid of those stupid boxes
+  // at the start"): an empty world is the correct start — the model gallery
+  // (A/N) is how models get in. The smoke modes keep the cubes as their
+  // pixel-assertion fixture.
   XcbWindow window;
   if (!openWindow(window, app.width, app.height, "vr-editor")) {
     return 1;
@@ -2203,7 +2301,7 @@ int main(int argc, char** argv) {
           "      N model gallery (click preview spawns; N closes), Delete remove,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
           "vr:   trigger select (grip+trigger part), right stick move on the floor,\n"
-          "      left stick rotate (Y does nothing), grip = fine,\n"
+          "      left stick rotate (X spin, Y tip; grip+Y roll), grip = fine,\n"
           "      A model gallery (trigger on preview spawns),\n"
           "      hold X delete, B/Y undo/redo, menu tap = mode, menu hold = backdrop\n");
       return 0;

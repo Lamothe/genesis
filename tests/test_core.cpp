@@ -1260,6 +1260,91 @@ void testStickMotion() {
   CHECK_NEAR3(scene.local(child).translation, {1.0F, 0.0F, 0.0F});
 }
 
+void testStickTipAndFloor() {
+  // Tipping (pitch/roll about a horizontal axis through the bounds centre)
+  // and the re-rest: a tip swings the bounding box below the floor; the drop
+  // puts the model back "stuck to the floor" at exactly y = 0.
+  vredit::Scene scene;
+  vredit::NodeId parent = scene.create();
+  vredit::NodeVisual vp;
+  vp.id = parent;
+  std::vector<vredit::NodeVisual> visuals{vp};
+  vredit::Transform t;
+  t.translation = {0.0F, 0.5F, 0.0F}; // unit cube resting on the floor
+  scene.setLocal(parent, t);
+
+  // Pitch 45 degrees about world X through the cube centre: the centre is
+  // invariant, the box tips below the floor.
+  vredit::rotateSelectionAxis(scene, visuals, {parent}, {1.0F, 0.0F, 0.0F}, kHalfPi * 0.5F);
+  CHECK_NEAR3(scene.worldPosition(parent), {0.0F, 0.5F, 0.0F});
+  vredit::Aabb bounds{};
+  CHECK(vredit::nodesBounds(scene, visuals, {parent}, bounds));
+  CHECK(bounds.min.y < -0.05F); // a 45-degree tip of a unit cube dips ~0.2
+
+  // The drop lifts it back to rest; a second drop is a no-op.
+  vredit::dropSelectionToFloor(scene, visuals, {parent});
+  CHECK(vredit::nodesBounds(scene, visuals, {parent}, bounds));
+  CHECK_NEAR(bounds.min.y, 0.0F, 1e-5F);
+  CHECK_NEAR(scene.worldPosition(parent).y, 0.5F * (std::sqrt(2.0F)), 1e-4F);
+  Vec3 const afterDrop = scene.worldPosition(parent);
+  vredit::dropSelectionToFloor(scene, visuals, {parent});
+  CHECK_NEAR3(scene.worldPosition(parent), afterDrop);
+
+  // Roll about the view axis (0,0,-1): same centre-invariant maths.
+  vredit::rotateSelectionAxis(scene, visuals, {parent}, {0.0F, 0.0F, -1.0F}, kHalfPi);
+  CHECK_NEAR3(scene.worldPosition(parent), afterDrop);
+
+  // A zero axis or zero angle is a no-op.
+  Vec3 const beforeNoop = scene.worldPosition(parent);
+  vredit::rotateSelectionAxis(scene, visuals, {parent}, {0.0F, 0.0F, 0.0F}, 1.0F);
+  vredit::rotateSelectionAxis(scene, visuals, {parent}, {1.0F, 0.0F, 0.0F}, 0.0F);
+  CHECK_NEAR3(scene.worldPosition(parent), beforeNoop);
+}
+
+void testMovingSetAndExplicitPivot() {
+  // The moving set is the selection's SUBTREES: a part selection whose child
+  // hangs below its own box must still see the child for the floor rule
+  // (review defect: the drop was a no-op while the child swung below ground).
+  vredit::Scene scene;
+  vredit::NodeId parent = scene.create();
+  vredit::NodeId child = scene.create(parent);
+  vredit::NodeVisual vp;
+  vp.id = parent;
+  vredit::NodeVisual vc;
+  vc.id = child;
+  vc.localBounds.min = {-0.5F, -0.5F, -0.5F};
+  vc.localBounds.max = {0.5F, 0.5F, 0.5F};
+  std::vector<vredit::NodeVisual> visuals{vp, vc};
+  vredit::Transform t;
+  t.translation = {0.0F, 1.0F, 0.0F}; // parent cube: y 0.5..1.5
+  scene.setLocal(parent, t);
+  vredit::Transform ct;
+  ct.translation = {0.0F, -1.0F, 0.0F}; // child cube: y -0.5..0.5 (below!)
+  scene.setLocal(child, ct);
+
+  // Parent-only bounds stop at y = 0.5 (no drop needed); the moving set sees
+  // the child at -0.5 and the drop lifts BOTH so the child rests on y = 0.
+  vredit::Aabb bounds{};
+  CHECK(vredit::movingSetBounds(scene, visuals, {parent}, bounds));
+  CHECK_NEAR(bounds.min.y, -0.5F, 1e-5F);
+  vredit::dropSelectionToFloor(scene, visuals, {parent});
+  CHECK(vredit::movingSetBounds(scene, visuals, {parent}, bounds));
+  CHECK_NEAR(bounds.min.y, 0.0F, 1e-5F);
+  CHECK_NEAR3(scene.local(child).translation, {0.0F, -1.0F, 0.0F}); // rides once
+
+  // rotateSelectionAbout: an explicit pivot is exactly invariant (the
+  // stick gestures latch their pivot at gesture start and use this).
+  Vec3 const pivot{2.0F, 0.0F, 0.0F};
+  vredit::Transform pt;
+  pt.translation = pivot;
+  scene.setLocal(parent, pt);
+  vredit::rotateSelectionAbout(scene, {parent}, pivot, {0.0F, 1.0F, 0.0F}, kHalfPi);
+  CHECK_NEAR3(scene.worldPosition(parent), pivot);
+  // The child (0,-1,0 local) is offset PARALLEL to the yaw axis: invariant.
+  CHECK_NEAR3(scene.worldPosition(child), {2.0F, -1.0F, 0.0F});
+  CHECK_NEAR3(scene.local(child).translation, {0.0F, -1.0F, 0.0F});
+}
+
 void testScaleSelectionUniform() {
   // Uniform scale primitive: grow/shrink a model about its bounds centre.
   // Points at (2,0,0) and (2,0,-1) give a known centre (2,0,-0.5).
@@ -2242,6 +2327,8 @@ int main() {
   testMipChain();
   testSegmentAndPolygonPicking();
   testStickMotion();
+  testStickTipAndFloor();
+  testMovingSetAndExplicitPivot();
   testScaleSelectionUniform();
   testEditorStateOps();
   testHandlePicking();

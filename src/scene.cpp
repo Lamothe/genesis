@@ -92,6 +92,27 @@ NodeId Scene::parent(NodeId id) const {
   return valid(id) ? slots_[id].parent : kInvalidNode;
 }
 
+std::vector<NodeId> Scene::descendants(NodeId id) const {
+  std::vector<NodeId> out;
+  if (!valid(id)) {
+    return out;
+  }
+  // Iterative depth-first over the private children links.
+  std::vector<NodeId> stack = slots_[id].children;
+  while (!stack.empty()) {
+    NodeId const n = stack.back();
+    stack.pop_back();
+    if (!valid(n)) {
+      continue;
+    }
+    out.push_back(n);
+    for (NodeId const c : slots_[n].children) {
+      stack.push_back(c);
+    }
+  }
+  return out;
+}
+
 Transform const& Scene::local(NodeId id) const {
   if (!valid(id)) {
     return emptyTransform();

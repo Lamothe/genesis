@@ -185,22 +185,81 @@ void moveSelectionHorizontal(Scene& scene,
   applyDragStarts(scene, starts, translationMatrix(delta));
 }
 
+// The set of nodes a selection's edit actually moves: each selected node plus
+// its whole subtree (a selected child rides along with a selected ancestor
+// rather than receiving the delta twice — but its descendants still move).
+// Pivot and floor bounds MUST cover this whole set: a part selection with a
+// large child below it otherwise tips through the floor undetected (the
+// drop's bounds covered only the selected node's own box).
+bool movingSetBounds(Scene& scene,
+                     std::vector<NodeVisual> const& visuals,
+                     std::vector<NodeId> const& selection,
+                     Aabb& boundsOut) {
+  std::vector<NodeId> moving;
+  for (NodeId id : selection) {
+    if (!scene.valid(id)) {
+      continue;
+    }
+    moving.push_back(id);
+    for (NodeId const d : scene.descendants(id)) {
+      moving.push_back(d);
+    }
+  }
+  return nodesBounds(scene, visuals, moving, boundsOut);
+}
+
+void rotateSelectionAxis(Scene& scene,
+                         std::vector<NodeVisual> const& visuals,
+                         std::vector<NodeId> const& selection,
+                         Vec3 const& worldAxis,
+                         float radians) {
+  Aabb bounds{};
+  if (!movingSetBounds(scene, visuals, selection, bounds)) {
+    return;
+  }
+  rotateSelectionAbout(scene, selection, aabbCentre(bounds), worldAxis, radians);
+}
+
+void rotateSelectionAbout(Scene& scene,
+                          std::vector<NodeId> const& selection,
+                          Vec3 const& pivot,
+                          Vec3 const& worldAxis,
+                          float radians) {
+  if (length(worldAxis) < 1e-6F || radians == 0.0F) {
+    return;
+  }
+  Vec3 const axis = normalized(worldAxis);
+  float const half = radians * 0.5F;
+  float const s = std::sin(half);
+  Quat const q{axis.x * s, axis.y * s, axis.z * s, std::cos(half)};
+  std::vector<DragStart> starts;
+  captureDragStarts(scene, selection, starts);
+  Mat4 const delta =
+      mul(translationMatrix(pivot), mul(rotationMatrix(q), translationMatrix(-pivot)));
+  applyDragStarts(scene, starts, delta);
+}
+
 void rotateSelectionYaw(Scene& scene,
                         std::vector<NodeVisual> const& visuals,
                         std::vector<NodeId> const& selection,
                         float radians) {
+  rotateSelectionAxis(scene, visuals, selection, Vec3{0.0F, 1.0F, 0.0F}, radians);
+}
+
+void dropSelectionToFloor(Scene& scene,
+                          std::vector<NodeVisual> const& visuals,
+                          std::vector<NodeId> const& selection) {
   Aabb bounds{};
-  if (!nodesBounds(scene, visuals, selection, bounds)) {
+  if (!movingSetBounds(scene, visuals, selection, bounds)) {
     return;
   }
-  Vec3 const pivot = aabbCentre(bounds);
-  // Yaw around world up: q = (0, sin(t/2), 0, cos(t/2)).
-  Quat const yaw{0.0F, std::sin(radians * 0.5F), 0.0F, std::cos(radians * 0.5F)};
+  float const lift = -bounds.min.y;
+  if (std::fabs(lift) < 1e-6F) {
+    return;
+  }
   std::vector<DragStart> starts;
   captureDragStarts(scene, selection, starts);
-  Mat4 const delta =
-      mul(translationMatrix(pivot), mul(rotationMatrix(yaw), translationMatrix(-pivot)));
-  applyDragStarts(scene, starts, delta);
+  applyDragStarts(scene, starts, translationMatrix(Vec3{0.0F, lift, 0.0F}));
 }
 
 bool scaleSelectionUniform(Scene& scene,
