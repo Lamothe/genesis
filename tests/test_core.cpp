@@ -1354,64 +1354,60 @@ void testMovingSetAndExplicitPivot() {
   CHECK_NEAR3(scene.local(child).translation, {0.0F, -1.0F, 0.0F});
 }
 
-void testSelectionRotationAxes() {
-  // The user requirement: the stick rotation axes must be PERPENDICULAR.
-  // They come from the selection's own frame (sign-aligned to the viewer),
-  // so they stay perpendicular after the model has been tipped — the old
-  // world-up + view-right pair does not ("a spin must follow the model").
+void testViewerRotationAxes() {
+  // The user rule: STRICTLY viewer-relative axes, rotating "in the direction
+  // of the stick" (trackball). These directions are the whole user-facing
+  // behaviour of rotate mode, so they are asserted PHYSICALLY: a model's
+  // face (its +Z, pointing at the viewer) must follow the stick.
+  Vec3 yaw{}, tip{};
+  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, yaw, tip);
+  CHECK_NEAR3(yaw, {0.0F, 1.0F, 0.0F});   // the viewer's level vertical
+  CHECK_NEAR3(tip, {-1.0F, 0.0F, 0.0F});  // pre-signed viewer's right
+  CHECK_NEAR(dot(yaw, tip), 0.0F, 1e-6F); // always perpendicular (level)
+  // Horizontally right of a leaning viewer still gives level axes.
+  vredit::viewerRotationAxes({0.6F, 0.0F, 0.8F}, yaw, tip);
+  CHECK_NEAR3(yaw, {0.0F, 1.0F, 0.0F});
+  CHECK_NEAR(dot(yaw, tip), 0.0F, 1e-6F);
+
+  // Physical direction: a model at the origin facing the viewer (+Z face,
+  // the viewer looking -Z with right = +X). The app drives the seams with
+  // POSITIVE stick deflections; the seams carry the signs.
   vredit::Scene scene;
   vredit::NodeId root = scene.create();
-  Vec3 yaw{}, tip{}, roll{};
-  CHECK(vredit::selectionRotationAxes(scene, {root}, {1.0F, 0.0F, 0.0F},
-                                      {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
-  // An unrotated model = the viewer-aligned frame (approved behaviour).
-  CHECK_NEAR3(yaw, {0.0F, 1.0F, 0.0F});
-  CHECK_NEAR3(tip, {-1.0F, 0.0F, 0.0F});
-  CHECK_NEAR3(roll, {0.0F, 0.0F, -1.0F});
+  vredit::NodeId face = scene.create();
+  vredit::Transform childLocal;
+  childLocal.translation = {0.0F, 0.0F, 1.0F};
+  scene.setLocal(face, childLocal);
+  scene.setParent(face, root);
+  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, yaw, tip);
+  // Stick UP (positive Y) must lift the face toward +Y — the face rotates
+  // upward to look at the viewer; its top edge leans back (the same
+  // rotation seen from the other end).
+  CHECK(vredit::stickRotateTip(scene, {root}, {0.0F, 0.0F, 0.0F}, tip,
+                               /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
+  CHECK(scene.worldPosition(face).y > 0.0F);
+  // Reset; stick RIGHT (positive X) must sweep the face toward +X (the
+  // viewer's right) — the OLD -axisX sign did the opposite.
+  scene.setLocal(face, childLocal);
+  vredit::Transform ident;
+  scene.setLocal(root, ident);
+  CHECK(vredit::stickRotateYaw(scene, {root}, {0.0F, 0.0F, 0.0F}, yaw,
+                               /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
+  CHECK(scene.worldPosition(face).x > 0.0F);
 
-  // Tip the model 30 deg about X, then spin 40 deg about Z: the returned
-  // axes track the model's frame and stay mutually perpendicular.
-  vredit::Transform t;
-  t.rotation = vredit::quatFromAxisAngle({1.0F, 0.0F, 0.0F}, 0.5235987756F) * // 30 deg
-               vredit::quatFromAxisAngle({0.0F, 0.0F, 1.0F}, 0.6981317008F); // 40 deg
-  scene.setLocal(root, t);
-  CHECK(vredit::selectionRotationAxes(scene, {root}, {1.0F, 0.0F, 0.0F},
-                                      {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
-  // Unit + mutually perpendicular — the invariant under test.
-  CHECK_NEAR(length(yaw), 1.0F, 1e-5F);
-  CHECK_NEAR(length(tip), 1.0F, 1e-5F);
-  CHECK_NEAR(length(roll), 1.0F, 1e-5F);
-  CHECK_NEAR(std::fabs(dot(yaw, tip)), 0.0F, 1e-5F);
-  CHECK_NEAR(std::fabs(dot(yaw, roll)), 0.0F, 1e-5F);
-  CHECK_NEAR(std::fabs(dot(tip, roll)), 0.0F, 1e-5F);
-  // Sign-aligned to the viewer: "up" still points up-ish, "right" toward
-  // the viewer's right-ish, "forward" toward the viewer.
-  CHECK(dot(yaw, Vec3{0.0F, 1.0F, 0.0F}) > 0.0F);
-  CHECK(dot(Vec3{-tip.x, -tip.y, -tip.z}, Vec3{1.0F, 0.0F, 0.0F}) > 0.0F);
-  CHECK(dot(roll, Vec3{0.0F, 0.0F, -1.0F}) > 0.0F);
-
-  // Knife edge: a model tipped exactly 90 deg (its up is horizontal) still
-  // returns a unit, mutually perpendicular, consistently signed frame — the
-  // sign convention is stable at the singularity, not float noise.
-  vredit::Transform quarter;
-  quarter.rotation = vredit::quatFromAxisAngle({1.0F, 0.0F, 0.0F}, kHalfPi);
-  scene.setLocal(root, quarter);
-  CHECK(vredit::selectionRotationAxes(scene, {root}, {1.0F, 0.0F, 0.0F},
-                                      {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
-  CHECK_NEAR(length(yaw), 1.0F, 1e-5F);
-  CHECK_NEAR(std::fabs(dot(yaw, tip)), 0.0F, 1e-5F);
-  CHECK_NEAR(std::fabs(dot(yaw, roll)), 0.0F, 1e-5F);
-  CHECK_NEAR(std::fabs(dot(tip, roll)), 0.0F, 1e-5F);
-
-  // Degenerate frame (zero scale): the call fails cleanly so the app falls
-  // back to its viewer-aligned defaults instead of reusing a previous frame.
-  vredit::Transform flat;
-  flat.scale = {0.0F, 0.0F, 0.0F};
-  scene.setLocal(root, flat);
-  CHECK(!vredit::selectionRotationAxes(scene, {root}, {1.0F, 0.0F, 0.0F},
-                                       {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
-  CHECK(!vredit::selectionRotationAxes(scene, {}, {1.0F, 0.0F, 0.0F},
-                                       {0.0F, 0.0F, -1.0F}, yaw, tip, roll));
+  // DISCRIMINATING case (a pre-tipped model, where "the model's own right"
+  // is NOT the viewer's right — the old model-relative axes yawed here
+  // instead of tipping): rotate the root 90 deg about Z so its own right
+  // points UP. Stick up must STILL lift the face toward +Y in the VIEWER's
+  // frame.
+  vredit::Transform tipped;
+  tipped.rotation = vredit::quatFromAxisAngle({0.0F, 0.0F, 1.0F}, kHalfPi);
+  scene.setLocal(root, tipped);
+  scene.setLocal(face, childLocal);
+  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, yaw, tip);
+  CHECK(vredit::stickRotateTip(scene, {root}, {0.0F, 0.0F, 0.0F}, tip,
+                               /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
+  CHECK(scene.worldPosition(face).y > 0.0F);
 }
 
 void testScaleSelectionUniform() {
@@ -2513,7 +2509,7 @@ int main() {
   testStickMotion();
   testStickTipAndFloor();
   testMovingSetAndExplicitPivot();
-  testSelectionRotationAxes();
+  testViewerRotationAxes();
   testScaleSelectionUniform();
   testEditorStateOps();
   testHandlePicking();

@@ -58,8 +58,9 @@ forward/back.
 coloured axis handles were removed; all editing is the **arrow keys** (the
 desktop mirror of the sticks) and it is **mode-driven** with two modes:
 **1** = move (**left/right** uniform scale — per-axis scaling does not exist;
-**up/down** height, no floor rule), **2** = rotate (**left/right** spins about
-the selection's own up; **up/down** tip, **Shift** = roll). **Shift** runs
+**up/down** height, no floor rule), **2** = rotate (**left/right** sweeps the
+model's face toward your right, **up/down** lifts/lowers the face — a
+trackball, strictly around the viewer's axes). **Shift** runs
 the arrows at quarter speed (fine). Nothing rotates outside rotate mode. Each
 arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
 **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (the
@@ -77,12 +78,13 @@ accurate placement): the **right stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
 off the floor) in **both** modes, and the **left stick is mode-driven** — the
 **menu button taps** toggle the two modes: **MOVE** (X = uniform scale,
-right = bigger; Y = height, up = lift) and **ROTATE** (X = spin about the
-model's own up; Y = tip, up tips the top away; grip+Y = roll). Nothing
-rotates outside ROTATE. The rotation axes come from the model's own frame and
-are mutually perpendicular (a spin follows the model's tipped up axis); the
-axes, rate and grip mode are latched per gesture (turning your head or
-toggling grip mid-gesture does not steer a gesture in flight). Whole models
+right = bigger; Y = height, up = lift) and **ROTATE** (X sweeps the model's
+face toward your right, Y lifts/lowers the face — "the model rotates in the
+direction of the stick", a trackball). Nothing
+rotates outside ROTATE. The rotation axes are strictly the VIEWER's — the
+level vertical and the level right axis, always perpendicular to each other
+and to the horizon; they, the rate and the pivot are latched per gesture
+(turning your head mid-gesture does not steer it). Whole models
 re-rest on the floor after a tip; part selections tip in place. **Grip** held
 runs both sticks at quarter speed for fine control. Each stick gesture is one
 undo step. The bounding box is not a click target: pressing empty space next
