@@ -12,7 +12,8 @@ namespace vredit {
 // models are visible at the sides the whole time, including across the
 // wrap-around (target/angle are continuous accumulators, never re-wrapped,
 // so the last->first step goes one slot forward, not the long way round).
-// The ring FOLLOWS the viewer (position and level heading) every frame.
+// The ring is placed in a CALLER-SUPPLIED frame — the app latches it at open
+// (stationary in the world; it does not follow the viewer).
 //
 // Pure maths: the app supplies the viewer frame and translates SlotPose into
 // nodes. `step()` advances the target; `tick()` eases `angle` toward it, so

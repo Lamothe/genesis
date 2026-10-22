@@ -78,10 +78,10 @@ CarouselRing::SlotPose CarouselRing::slotPose(int i, Vec3 const& eye, Vec3 const
   float const s = std::sin(offset);
   float const c = std::cos(offset);
   Vec3 const position = eye + right * (s * kRadius) + fwd * (c * kRadius);
-  // Facing the viewer: the world yaw whose forward points from the slot back
-  // at the eye (yaw measured like the app's rig: atan2(x, -z) of forward).
+  // Facing the viewer: the model's art faces its own +Z (glTF convention),
+  // so the yaw rotates +Z onto the direction from the slot back at the eye.
   Vec3 const back = normalized(eye - position);
-  float const yaw = std::atan2(back.x, -back.z);
+  float const yaw = std::atan2(back.x, back.z);
   return SlotPose{position, yaw};
 }
 

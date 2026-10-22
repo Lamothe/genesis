@@ -1988,13 +1988,23 @@ void testCarouselRing() {
   CHECK_NEAR(c0.position.x, 0.0F, 1e-4F);
   CHECK_NEAR(c0.position.z, -vredit::CarouselRing::kRadius, 1e-4F);
   CHECK_NEAR(c0.position.y, 1.6F, 1e-4F);
-  Vec3 const faceFwd{std::sin(c0.yaw), 0.0F, -std::cos(c0.yaw)};
-  CHECK_NEAR(faceFwd.z, 1.0F, 1e-4F);
+  // The model's ART faces its own +Z (glTF convention): rotating +Z by the
+  // slot's yaw must point back at the viewer (+Z here).
+  Vec3 const artFwd{std::sin(c0.yaw), 0.0F, std::cos(c0.yaw)};
+  CHECK_NEAR(artFwd.z, 1.0F, 1e-4F);
   vredit::CarouselRing::SlotPose const c1 = ring.slotPose(1, eye, fwd);
   float const r1 = std::sqrt(c1.position.x * c1.position.x +
                              c1.position.z * c1.position.z);
   CHECK_NEAR(r1, vredit::CarouselRing::kRadius, 1e-4F);
   CHECK(c1.position.x > 0.2F);
+  // The facing must hold for a SIDE slot too (a sign slip off the dead-ahead
+  // case would only show up here): its +Z points back at the viewer from its
+  // own position.
+  Vec3 toEye1 = Vec3{eye.x - c1.position.x, 0.0F, eye.z - c1.position.z};
+  toEye1 = vredit::normalized(toEye1);
+  Vec3 const art1{std::sin(c1.yaw), 0.0F, std::cos(c1.yaw)};
+  CHECK_NEAR(art1.x, toEye1.x, 1e-3F);
+  CHECK_NEAR(art1.z, toEye1.z, 1e-3F);
   // The WRAPPED previous model (index 4 while centred on 0) must sit right
   // beside its neighbour on the LEFT — the minimal wrapped distance, not
   // almost a full circle away (the review's finding #1).

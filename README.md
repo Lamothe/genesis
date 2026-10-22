@@ -87,11 +87,12 @@ re-rest on the floor after a tip; part selections tip in place. **Grip** held
 runs both sticks at quarter speed for fine control. Each stick gesture is one
 undo step. The bounding box is not a click target: pressing empty space next
 to a model selects nothing. The selection is shown by a thin warm rim; the
-current mode (and the staged model's name) shows as line-font text floating
-in front of your head. **A** is the model carousel: a RING of library
-models around you — the centred model is staged at eye height in front of
-you (textured when the ring settles on it) and the previous/next models sit
-visible at the sides as cheap geometry-only previews. **stick X** rotates
+current mode shows as line-font text floating in front of your head. **A**
+is the model carousel: a STATIONARY RING of library models around you — the
+centred model is staged at eye height in front of you and the previous/next
+models sit visible at the sides as cheap geometry-only previews (all
+previews stay untextured; textures load when a model is placed). **stick X**
+rotates
 the ring in and out of view INSTANTLY (decoding runs on a worker thread, so
 a huge model never blocks the switch; no filenames are shown), and the
 trigger places the centred model at natural size on the floor where your aim

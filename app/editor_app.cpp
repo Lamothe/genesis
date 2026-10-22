@@ -121,9 +121,7 @@ struct CarouselSlot {
   int index{-1}; // library index, or -1 when empty
   std::uint64_t gen{0}; // load generation (stale results are dropped)
   bool hasModel{false};
-  bool textured{false}; // textures uploaded (centre/placed copies only)
   bool failed{false};       // terminal: this file will not load (never retried)
-  bool promoteFailed{false}; // texture promotion failed (do not loop on it)
   Model model;
   vredit::NodeId wrapper{vredit::kInvalidNode};
   float fit{1.0F};
@@ -134,11 +132,11 @@ constexpr std::size_t kSlotCount = 5; // centre ± 2
 constexpr float kPreviewExtent = 0.6F;
 
 // ---- GPU mesh cache (content-keyed) ----
-// The renderer has no removal API, so re-staging the same model (preview ->
-// textured promotion -> placement) would register its buffers three times.
-// Every registration goes through here instead: identical mesh content maps
-// to one GPU mesh for the process lifetime (bounded by the library's unique
-// models, like the texture registry's content dedupe).
+// The renderer has no removal API, so re-staging the same model (preview and
+// placement) would register its buffers twice. Every registration goes
+// through here instead: identical mesh content maps to one GPU mesh for the
+// process lifetime (bounded by the library's unique models, like the texture
+// registry's content dedupe).
 inline std::uint64_t hashBytes(std::uint64_t hash, void const* data, std::size_t size) {
   auto const* p = static_cast<unsigned char const*>(data);
   for (std::size_t i = 0; i < size; ++i) {
@@ -197,6 +195,13 @@ struct App {
   std::uint64_t carouselGen{1};           // load generation (stale = dropped)
   AsyncLoad worker{};                     // decode thread (started with the app)
   std::map<std::uint64_t, MeshHandle> meshCache; // content hash -> GPU mesh
+  // The ring is STATIONARY in the world: latched at open (eye position and
+  // level heading) so turning your head does not spin the carousel around
+  // you. "The carousel turns with the users head which is disorientating.
+  // It should be stationary."
+  bool ringLatched{false};
+  Vec3 ringOrigin{0.0F, 0.0F, 0.0F};
+  Vec3 ringForward{0.0F, 0.0F, -1.0F};
   vredit::EditorSnapshot galleryBefore{}; // undo "before" for the placement
   double galleryCycleCooldown{0.0}; // stick-held cycling: one step per 0.25 s
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
@@ -721,11 +726,12 @@ bool loadModelFile(std::string const& path,
 // height; the neighbours sit visible at the sides as GEOMETRY-ONLY previews
 // ("could be lower poly"). Switching is instant — the ring animates on the
 // frame of the step while the model behind it decodes on a worker thread
-// (switching must never block on a 3 GB decode); a slot's textures upload
-// when the ring settles on it. The trigger (click) places the centred model
-// at NATURAL size on the floor at the aim point as one undo step (undo
-// removes it entirely — the pre-open state is the "before"); the spawn key
-// or undo (B) closes without placing.
+// (switching must never block on a 3 GB decode). Previews stay geometry-only
+// for the whole time the carousel is open; textures load exactly once, when
+// the trigger (click) places the centred model at NATURAL size on the floor
+// at the aim point as one undo step (undo removes it entirely — the
+// pre-open state is the "before"); the spawn key or undo (B) closes without
+// placing.
 
 // ---- asynchronous model loading (decode OFF the render thread) ----
 // One request at a time (the nearest not-yet-loaded ring slot wants a file);
@@ -752,7 +758,11 @@ void asyncStart(AsyncLoad& a) {
       }
       Model model;
       std::string error;
-      if (!loadModelFile(path, model, error, /*withImages=*/true)) {
+      // GEOMETRY ONLY: previews are staged untextured and the model is
+      // dropped after staging, so decoding images here was pure RAM/CPU
+      // waste (the exact transient spike the release-after-staging fix is
+      // about). Placement re-decodes the one chosen file WITH images.
+      if (!loadModelFile(path, model, error, /*withImages=*/false)) {
         model = Model{}; // never stage a partial decode from an exception
         if (error.empty()) {
           error = "could not load";
@@ -841,7 +851,6 @@ bool slotAttach(App& app, VkRenderer& renderer, CarouselSlot& slot, Model const&
     slot.centre = (bounds.min + bounds.max) * 0.5F;
   }
   slot.hasModel = true;
-  slot.textured = withTextures;
   return true;
 }
 
@@ -948,15 +957,27 @@ void galleryRequestMissing(App& app) {
 }
 
 // The per-frame ring driver: drains the worker (attaches finished loads as
-// geometry-only previews), promotes the CENTRE slot to textured when the
-// ring settles on it, requests what is missing, and writes every slot's
-// absolute ring pose. `dt` eases the ring; the poses follow the viewer.
+// geometry-only previews), requests what is missing, and writes every slot's
+// absolute ring pose in the LATCHED world frame (the ring is stationary —
+// it does not follow the viewer). `dt` eases the ring.
 void galleryTick(App& app, VkRenderer& renderer, float dt, Vec3 const& eye,
                  Vec3 const& forward) {
   if (!app.galleryActive) {
     return;
   }
   app.ring.tick(dt);
+  // The ring is world-stationary: latch the viewer's eye and level heading
+  // on the first tick after open; every pose uses the latched frame.
+  if (!app.ringLatched) {
+    app.ringLatched = true;
+    app.ringOrigin = eye;
+    Vec3 f = forward;
+    if (f.x == 0.0F && f.z == 0.0F) {
+      f = {0.0F, 0.0F, -1.0F};
+    }
+    app.ringForward = normalized(Vec3{f.x, 0.0F, f.z});
+    std::printf("[gallery] ring latched (stationary)\n");
+  }
   // Evict slots that fell outside the visible window (centre ± 2), using the
   // MINIMAL wrapped distance — a slot 15 is adjacent to 0 in a 16-library.
   int const librarySize = static_cast<int>(app.galleryFiles.size());
@@ -998,12 +1019,15 @@ void galleryTick(App& app, VkRenderer& renderer, float dt, Vec3 const& eye,
         }
       }
       if (target != nullptr) {
-        // KEEP the decoded model in the slot: the promotion path re-stages
-        // it with textures, and placement re-stages it at natural size.
+        // Stage the geometry-only preview, then RELEASE the decoded model:
+        // holding five decoded models (with their image buffers) is what ran
+        // the process out of memory. Placement re-decodes the one chosen
+        // file with images — exactly one decode at a time.
         target->model = std::move(model);
         if (slotAttach(app, renderer, *target, target->model, /*withTextures=*/false)) {
           std::printf("[gallery] staged %s\n",
                       app.galleryFiles[static_cast<std::size_t>(target->index)].c_str());
+          target->model = Model{}; // RAM released — previews stay low-poly
         } else {
           std::printf("[gallery] cannot show %s: %s\n",
                       app.galleryFiles[static_cast<std::size_t>(target->index)].c_str(),
@@ -1020,41 +1044,16 @@ void galleryTick(App& app, VkRenderer& renderer, float dt, Vec3 const& eye,
       }
     }
   }
-  // The centre slot's textures upload when the ring settles on it (the one
-  // hitch per switch — decode is already done, this is the VRAM copy). The
-  // slot's identity (index/gen) and its decoded model survive the re-stage;
-  // on failure the model falls back to the geometry-only preview instead of
-  // looping (promoteFailed is terminal for this staging).
-  if (app.ring.atRest()) {
-    for (CarouselSlot& slot : app.carousel) {
-      if (slot.hasModel && !slot.textured && !slot.promoteFailed &&
-          slot.index == app.ring.index) {
-        Model model = std::move(slot.model);
-        int const keepIndex = slot.index;
-        std::uint64_t const keepGen = slot.gen;
-        slotEvict(app, slot);
-        slot.index = keepIndex;
-        slot.gen = keepGen;
-        bool const promoted = slotAttach(app, renderer, slot, model, /*withTextures=*/true);
-        if (!promoted) {
-          std::printf("[gallery] textures unavailable for %s (preview untextured)\n",
-                      app.galleryFiles[static_cast<std::size_t>(keepIndex)].c_str());
-          (void)slotAttach(app, renderer, slot, model, /*withTextures=*/false);
-          slot.promoteFailed = true;
-          if (!slot.hasModel) {
-            slot.failed = true; // geometry fallback failed too — terminal
-          }
-        }
-        // Keep the decoded model in the slot (placement re-stages it later).
-        slot.model = std::move(model);
-        break;
-      }
-    }
-  }
+  // Previews stay GEOMETRY-ONLY for the whole time the carousel is open
+  // ("Leave the models as low poly in the carousel, I don't need the
+  // high-def version"): no textured promotion and no per-switch hitch.
+  // Textures load exactly once, when a model is PLACED — galleryPick
+  // re-decodes the one chosen file with images.
   galleryRequestMissing(app);
-  // Absolute ring poses (the ring follows the viewer every frame).
+  // Absolute ring poses in the LATCHED world frame (stationary: the ring
+  // does not follow the viewer's head or feet).
   for (CarouselSlot& slot : app.carousel) {
-    slotPose(app, slot, app.ring, eye, forward);
+    slotPose(app, slot, app.ring, app.ringOrigin, app.ringForward);
   }
 }
 
@@ -1077,6 +1076,7 @@ void galleryOpen(App& app, VkRenderer& renderer) {
   }
   app.ring = vredit::CarouselRing{};
   app.ring.setCount(static_cast<int>(app.galleryFiles.size()));
+  app.ringLatched = false; // latched on the first tick (stationary ring)
   // The pre-open state is the undo "before" for the eventual placement:
   // undoing a placement restores the world WITHOUT the model (never a
   // floating preview). Nothing else mutates while the carousel is open.
@@ -1127,9 +1127,18 @@ bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
   endEdits(app);
   std::string const file = app.galleryFiles[static_cast<std::size_t>(index)];
   // Place a NATURAL-SIZE, TEXTURED copy (the preview's wrapper never leaks
-  // into it): stage it fresh with textures and drop it on the floor. The
-  // model MOVED out of the slot — copying it would move gigabytes.
-  Model model = std::move(centre->model);
+  // into it): decode the one chosen file WITH images and stage it fresh —
+  // the slots hold only geometry (RAM), so this is the single texture load.
+  Model model;
+  std::string loadError;
+  if (!loadModelFile(file, model, loadError, /*withImages=*/true)) {
+    model = Model{};
+    if (loadError.empty()) {
+      loadError = "could not load";
+    }
+    std::printf("[gallery] cannot place %s: %s\n", file.c_str(), loadError.c_str());
+    return false; // nothing mutated — the carousel stays open to try again
+  }
   app.undo.begin(app.galleryBefore);
   galleryEvict(app);
   std::vector<vredit::NodeId> roots;
@@ -1228,13 +1237,17 @@ void assembleFrame(App& app,
   // filenames: the user said "I really don't need the file name in the
   // carousel".
   std::string hudText = app.mode == EditMode::move ? "MOVE" : "ROTATE";
-  Vec3 const hudEye = hudPos != nullptr ? *hudPos : app.camera.position;
-  Quat const hudFace = hudOrient != nullptr ? *hudOrient : cameraOrientation(app.camera);
-  Vec3 const hudFwd = rotate(hudFace, Vec3{0.0F, 0.0F, -1.0F});
-  Vec3 const hudUp = rotate(hudFace, Vec3{0.0F, 1.0F, 0.0F});
-  Vec3 const hudAt = hudEye + hudFwd * 0.55F + hudUp * 0.17F;
-  appendTextLines(overlayLines, hudText, trs(hudAt, hudFace, Vec3{1.0F, 1.0F, 1.0F}),
-                  0.028F, Vec3{1.0F, 0.85F, 0.4F});
+  // No HUD over the carousel ("You still have the words MOVE in the
+  // carousel"): the mode text is only for normal editing.
+  if (!app.galleryActive) {
+    Vec3 const hudEye = hudPos != nullptr ? *hudPos : app.camera.position;
+    Quat const hudFace = hudOrient != nullptr ? *hudOrient : cameraOrientation(app.camera);
+    Vec3 const hudFwd = rotate(hudFace, Vec3{0.0F, 0.0F, -1.0F});
+    Vec3 const hudUp = rotate(hudFace, Vec3{0.0F, 1.0F, 0.0F});
+    Vec3 const hudAt = hudEye + hudFwd * 0.55F + hudUp * 0.17F;
+    appendTextLines(overlayLines, hudText, trs(hudAt, hudFace, Vec3{1.0F, 1.0F, 1.0F}),
+                    0.028F, Vec3{1.0F, 0.85F, 0.4F});
+  }
 }
 
 bool openWindow(XcbWindow& window, std::uint32_t width, std::uint32_t height, char const* title) {
@@ -2216,11 +2229,9 @@ int runXr(char const* shaderDir,
                               std::fabs(input.leftStick.y) > stickThreshold;
     bool const gestureAlive = sticksActive;
     // While the carousel is open the sticks are ITS: the left stick's X
-    // The ring follows the viewer; loads drain here (one hitch per switch
-    // when the centre slot's textures upload).
-    galleryTick(app, renderer, dt, headWorld, headForward);
     // cycles the staged model (a flick = one step; held = one step per
     // 0.25 s). All editing stays blocked (the session gates below).
+    galleryTick(app, renderer, dt, headWorld, headForward);
     if (app.galleryActive) {
       app.galleryCycleCooldown -= dt;
       if (std::fabs(input.leftStick.x) > 0.5F && app.galleryCycleCooldown <= 0.0) {
