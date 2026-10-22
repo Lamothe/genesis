@@ -42,7 +42,7 @@ public:
   MeshHandle addMesh(MeshData const& data);
 
   // Registers an RGBA8 texture and returns a handle (0 is the built-in white
-  // fallback). Up to 32 textures; safe to call at any time.
+  // fallback). Up to 256 textures; safe to call at any time.
   TextureHandle addTexture(Image const& image, bool repeatU, bool repeatV);
 
   // Clear colour for the next frames (the backdrop void colour).

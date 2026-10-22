@@ -29,7 +29,7 @@ else
 fi
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
   src/scene.cpp src/picking.cpp src/gizmo.cpp src/camera.cpp src/handles.cpp \
-  src/editor_state.cpp \
+  src/editor_state.cpp src/carousel.cpp \
   src/mesh.cpp src/json.cpp src/gltf.cpp src/obj.cpp src/image.cpp \
   tests/test_core.cpp \
   -lz -o .build/test-core

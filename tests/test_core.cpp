@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "camera.h"
+#include "carousel.h"
 #include "editor_state.h"
 #include "gizmo.h"
 #include "gltf.h"
@@ -1973,6 +1974,71 @@ void testGlbSizeWrapRejected() {
   CHECK(!loadGlb(buildGlb(negativeCount, bin), model, error));
 }
 
+// The model carousel's ring: slots around the viewer, eased rotation,
+// models facing the viewer.
+void testCarouselRing() {
+  vredit::CarouselRing ring;
+  ring.setCount(5);
+  CHECK(ring.count == 5 && ring.index == 0);
+  CHECK(ring.atRest());
+
+  Vec3 const eye{0.0F, 1.6F, 0.0F};
+  Vec3 const fwd{0.0F, 0.0F, -1.0F};
+  vredit::CarouselRing::SlotPose const c0 = ring.slotPose(0, eye, fwd);
+  CHECK_NEAR(c0.position.x, 0.0F, 1e-4F);
+  CHECK_NEAR(c0.position.z, -vredit::CarouselRing::kRadius, 1e-4F);
+  CHECK_NEAR(c0.position.y, 1.6F, 1e-4F);
+  Vec3 const faceFwd{std::sin(c0.yaw), 0.0F, -std::cos(c0.yaw)};
+  CHECK_NEAR(faceFwd.z, 1.0F, 1e-4F);
+  vredit::CarouselRing::SlotPose const c1 = ring.slotPose(1, eye, fwd);
+  float const r1 = std::sqrt(c1.position.x * c1.position.x +
+                             c1.position.z * c1.position.z);
+  CHECK_NEAR(r1, vredit::CarouselRing::kRadius, 1e-4F);
+  CHECK(c1.position.x > 0.2F);
+  // The WRAPPED previous model (index 4 while centred on 0) must sit right
+  // beside its neighbour on the LEFT — the minimal wrapped distance, not
+  // almost a full circle away (the review's finding #1).
+  vredit::CarouselRing::SlotPose const cprev = ring.slotPose(4, eye, fwd);
+  CHECK(cprev.position.x < -0.2F);
+  CHECK(cprev.position.z < -0.2F); // still in FRONT of the viewer
+  // Stepping eases toward the target without overshoot.
+  ring.step(1);
+  CHECK(ring.index == 1 && !ring.atRest());
+  float prev = ring.angle;
+  for (int i = 0; i < 240; ++i) {
+    ring.tick(1.0F / 60.0F);
+    CHECK(std::fabs(ring.angle - ring.target) <= std::fabs(prev - ring.target) + 1e-6F ||
+              i == 0);
+    prev = ring.angle;
+  }
+  CHECK(ring.atRest());
+  // The wrap step advances the CONTINUOUS target by exactly one slot: from
+  // the last model to the first the ring moves one slot forward, never the
+  // long way round the circle (the review's finding #2).
+  ring.setCount(3);
+  ring.step(-1);
+  CHECK(ring.index == 0);
+  ring.step(-1); // to the last model (index 2)
+  CHECK(ring.index == 2);
+  for (int s = 0; s < 100; ++s) { ring.tick(1.0F / 60.0F); }
+  CHECK(ring.atRest());
+  float const beforeWrap = ring.target;
+  ring.step(1); // last -> first: one slot forward
+  CHECK(ring.index == 0);
+  CHECK_NEAR(ring.target - beforeWrap, vredit::CarouselRing::kSlotStep, 1e-5F);
+  for (int s = 0; s < 100; ++s) { ring.tick(1.0F / 60.0F); }
+  CHECK(ring.atRest());
+  // Wrapping in both directions keeps index in range.
+  ring.step(-2);
+  CHECK(ring.index == 1);
+  ring.step(3);
+  CHECK(ring.index == 1);
+  ring.setCount(2);
+  CHECK(ring.index == 1 && ring.atRest());
+  vredit::CarouselRing::SlotPose const cv = ring.slotPose(1, eye, Vec3{0.0F, 1.0F, 0.0F});
+  CHECK(std::isfinite(cv.position.x) && std::isfinite(cv.yaw));
+}
+
 void testObjLoader() {
   MtlMaterials materials;
   CHECK(parseMtl("newmtl Red\nKd 1 0 0\nmap_Kd red.png\nnewmtl Blue\nKd 0 0 1\nd 0.5\n",
@@ -2451,6 +2517,7 @@ int main() {
   testGlbInterleavedAccessors();
   testGlbTextureAndUv();
   testGlbSizeWrapRejected();
+  testCarouselRing();
   testObjLoader();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);

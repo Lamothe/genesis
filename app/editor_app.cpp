@@ -13,16 +13,21 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <map>
+#include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+#include <array>
 
 #include <xcb/xcb.h>
 
 #include "xr_shell.h"
 
 #include "camera.h"
+#include "carousel.h"
 #include "editor_state.h"
 #include "gizmo.h"
 #include "gltf.h"
@@ -81,6 +86,78 @@ void panCamera(Camera& camera, float dx, float dy, float viewportHeight) {
 // state is unit-testable; the app uses it directly.
 using vredit::NodeVisual;
 
+// Carousel load state (see the carousel section below for the worker loop).
+struct AsyncLoad {
+  std::thread thread;
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool quit{false};
+  bool busy{false}; // a request is outstanding (main thread only)
+  std::uint64_t reqGen{0};
+  std::string reqPath;
+  bool reqPending{false};
+  std::uint64_t doneGen{0};
+  Model doneModel;
+  std::string doneError;
+  bool doneReady{false};
+
+  // Self-stopping: a joinable std::thread at destruction is std::terminate,
+  // and every exit path must leave the worker clean.
+  ~AsyncLoad() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      quit = true;
+    }
+    cv.notify_all();
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+};
+
+// A carousel ring slot: one library model staged under a WRAPPER node whose
+// transform is the ring pose (set absolutely every frame — no delta drift).
+struct CarouselSlot {
+  int index{-1}; // library index, or -1 when empty
+  std::uint64_t gen{0}; // load generation (stale results are dropped)
+  bool hasModel{false};
+  bool textured{false}; // textures uploaded (centre/placed copies only)
+  bool failed{false};       // terminal: this file will not load (never retried)
+  bool promoteFailed{false}; // texture promotion failed (do not loop on it)
+  Model model;
+  vredit::NodeId wrapper{vredit::kInvalidNode};
+  float fit{1.0F};
+  Vec3 centre{0.0F, 0.0F, 0.0F}; // model bounds centre before fitting
+};
+
+constexpr std::size_t kSlotCount = 5; // centre ± 2
+constexpr float kPreviewExtent = 0.6F;
+
+// ---- GPU mesh cache (content-keyed) ----
+// The renderer has no removal API, so re-staging the same model (preview ->
+// textured promotion -> placement) would register its buffers three times.
+// Every registration goes through here instead: identical mesh content maps
+// to one GPU mesh for the process lifetime (bounded by the library's unique
+// models, like the texture registry's content dedupe).
+inline std::uint64_t hashBytes(std::uint64_t hash, void const* data, std::size_t size) {
+  auto const* p = static_cast<unsigned char const*>(data);
+  for (std::size_t i = 0; i < size; ++i) {
+    hash ^= p[i];
+    hash *= 1099511628211ULL; // FNV-1a
+  }
+  return hash;
+}
+
+inline std::uint64_t meshContentHash(MeshData const& data) {
+  std::uint64_t h = 1469598103934665603ULL;
+  h = hashBytes(h, data.vertices.data(), data.vertices.size() * sizeof(MeshVertex));
+  h = hashBytes(h, data.indices.data(), data.indices.size() * sizeof(std::uint32_t));
+  return h;
+}
+
+struct App;
+inline MeshHandle cachedMesh(App& app, VkRenderer& renderer, MeshData const& data);
+
 struct App {
   Scene scene;
   std::vector<NodeVisual> visuals;
@@ -108,15 +185,20 @@ struct App {
   // is rescanned on every spawn, so a file dropped in mid-session is spawnable
   // without a restart.
   std::string libraryDir;
-  // The model carousel: ONE staged preview at a time ("that way you don't
-  // need to load them all at once").
+  // The model carousel: a RING of library models around the viewer (see
+  // carousel.h) — the next/previous models are visible at the sides and
+  // switching rotates the ring instantly; decoding happens on a worker
+  // thread so a huge model never blocks the switch. The centred model is
+  // placed at the aim point (one undo step).
   bool galleryActive{false};
   std::vector<std::string> galleryFiles; // the library (rescanned on open)
-  std::size_t galleryIndex{0};
-  std::vector<vredit::NodeId> galleryRoots; // staged preview's top-level nodes
-  float galleryNaturalScale{1.0F};          // preview->natural size (spawn)
-  vredit::EditorSnapshot galleryBefore{};   // undo "before" for the placement
-  double galleryCycleCooldown{0.0};         // stick-held cycling: one step per 0.35 s
+  vredit::CarouselRing ring;
+  std::array<CarouselSlot, 5> carousel{}; // centre ± 2 ring slots
+  std::uint64_t carouselGen{1};           // load generation (stale = dropped)
+  AsyncLoad worker{};                     // decode thread (started with the app)
+  std::map<std::uint64_t, MeshHandle> meshCache; // content hash -> GPU mesh
+  vredit::EditorSnapshot galleryBefore{}; // undo "before" for the placement
+  double galleryCycleCooldown{0.0}; // stick-held cycling: one step per 0.25 s
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
   // first deflection past the dead zone, committed when the sticks settle.
   bool stickSession{false};
@@ -173,6 +255,19 @@ struct App {
   std::uint32_t width{1280};
   std::uint32_t height{800};
 };
+
+inline MeshHandle cachedMesh(App& app, VkRenderer& renderer, MeshData const& data) {
+  std::uint64_t const key = meshContentHash(data);
+  auto const it = app.meshCache.find(key);
+  if (it != app.meshCache.end()) {
+    return it->second;
+  }
+  MeshHandle const handle = renderer.addMesh(data);
+  if (handle != kInvalidMesh) {
+    app.meshCache.emplace(key, handle);
+  }
+  return handle;
+}
 
 struct XcbWindow {
   xcb_connection_t* connection{nullptr};
@@ -251,11 +346,12 @@ std::shared_ptr<const vredit::PickGeometry> makePickGeometry(MeshData const& dat
 bool addModelToSceneImpl(App& app,
                          VkRenderer& renderer,
                          Model const& model,
-                         std::vector<NodeId>* rootsOut = nullptr) {
+                         std::vector<NodeId>* rootsOut = nullptr,
+                         bool withTextures = true) {
   std::vector<MeshHandle> meshHandles(model.meshes.size(), 0U);
   std::vector<std::shared_ptr<const vredit::PickGeometry>> pickGeometries(model.meshes.size());
   for (std::size_t m = 0; m < model.meshes.size(); ++m) {
-    meshHandles[m] = renderer.addMesh(model.meshes[m].data);
+    meshHandles[m] = cachedMesh(app, renderer, model.meshes[m].data);
     if (meshHandles[m] == kInvalidMesh) {
       std::printf("mesh registration failed for mesh %zu\n", m);
       return false;
@@ -263,7 +359,7 @@ bool addModelToSceneImpl(App& app,
     pickGeometries[m] = makePickGeometry(model.meshes[m].data);
   }
   std::vector<TextureHandle> textureHandles(model.textures.size(), 0U);
-  for (std::size_t t = 0; t < model.textures.size(); ++t) {
+  for (std::size_t t = 0; withTextures && t < model.textures.size(); ++t) {
     Image const& image = model.textures[t].image;
     if (image.width == 0 || image.height == 0) {
       // An empty image (a skipped or failed decode) means UNTEXTURED —
@@ -280,6 +376,8 @@ bool addModelToSceneImpl(App& app,
   }
   std::vector<NodeId> handles(model.nodes.size(), kInvalidNode);
   std::uint32_t const modelGroup = app.nextModelGroup++;
+  std::vector<NodeId> createdRoots; // top-level nodes created so far (rollback)
+  try {
   for (std::size_t n = 0; n < model.nodes.size(); ++n) {
     ModelNode const& node = model.nodes[n];
     NodeId parent = node.parent >= 0 ? handles[static_cast<std::size_t>(node.parent)] : kInvalidNode;
@@ -288,6 +386,9 @@ bool addModelToSceneImpl(App& app,
     handles[n] = id;
     if (rootsOut != nullptr && node.parent < 0) {
       rootsOut->push_back(id); // top-level nodes: the spawn placement roots
+    }
+    if (node.parent < 0) {
+      createdRoots.push_back(id);
     }
     app.modelGroups.push_back({id, modelGroup}); // one file = one model
     if (node.mesh >= 0 && static_cast<std::size_t>(node.mesh) < model.meshes.size()) {
@@ -316,15 +417,27 @@ bool addModelToSceneImpl(App& app,
       app.visuals.push_back(visual);
     }
   }
+  } catch (...) {
+    // A hostile model can throw MID-insert: the nodes created so far must
+    // not linger as floating geometry (and must not pollute undo snapshots).
+    vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection,
+                           createdRoots);
+    if (rootsOut != nullptr) {
+      rootsOut->clear();
+    }
+    std::printf("model insertion failed mid-way — rolled back\n");
+    return false;
+  }
   return true;
 }
 
 bool addModelToScene(App& app,
                      VkRenderer& renderer,
                      Model const& model,
-                     std::vector<NodeId>* rootsOut = nullptr) {
+                     std::vector<NodeId>* rootsOut = nullptr,
+                     bool withTextures = true) {
   try {
-    return addModelToSceneImpl(app, renderer, model, rootsOut);
+    return addModelToSceneImpl(app, renderer, model, rootsOut, withTextures);
   } catch (std::exception const& e) {
     std::printf("model insertion failed (%s) — model not added\n", e.what());
     return false;
@@ -602,39 +715,167 @@ bool loadModelFile(std::string const& path,
   }
 }
 
-// The model carousel ("I was expecting a carousel with the model preview
-// appearing in front of me. That way you don't need to load them all at
-// once"). The spawn key opens it with ONE model staged: loaded — textures
-// and all, since only one exists at a time and the placement then costs
-// nothing — scaled to fit and floating at eye height in front of the
-// viewer. The left stick's X (or [ ] on desktop) cycles the library and the
-// staged model's name shows in the HUD. The trigger (click) places the
-// staged model on the floor at the aim point at NATURAL size as one undo
-// step (undo removes it entirely — the pre-stage state is the "before");
-// the spawn key or undo (B) closes without placing.
+// The model carousel: a RING of library models around the viewer ("I
+// expected that the models would rotate in/out of view with a preview of the
+// next/previous model visible"). The centred slot is dead ahead at eye
+// height; the neighbours sit visible at the sides as GEOMETRY-ONLY previews
+// ("could be lower poly"). Switching is instant — the ring animates on the
+// frame of the step while the model behind it decodes on a worker thread
+// (switching must never block on a 3 GB decode); a slot's textures upload
+// when the ring settles on it. The trigger (click) places the centred model
+// at NATURAL size on the floor at the aim point as one undo step (undo
+// removes it entirely — the pre-open state is the "before"); the spawn key
+// or undo (B) closes without placing.
 
-// The file's stem, uppercased, for the HUD ("MOVE THE GIRL 5.2").
-std::string stemUpper(std::string const& path) {
-  std::size_t const slash = path.find_last_of("/\\");
-  std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
-  std::size_t const dot = name.find_last_of('.');
-  if (dot != std::string::npos && dot > 0) {
-    name = name.substr(0, dot);
-  }
-  for (char& c : name) {
-    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  }
-  return name;
+// ---- asynchronous model loading (decode OFF the render thread) ----
+// One request at a time (the nearest not-yet-loaded ring slot wants a file);
+// newer requests supersede older ones by generation, and stale results are
+// dropped on arrival. Decode (the slow part) runs on the worker; every
+// Vulkan operation stays on the main thread. (AsyncLoad is declared above
+// App; the worker functions live here.)
+
+void asyncStart(AsyncLoad& a) {
+  a.thread = std::thread([&a] {
+    for (;;) {
+      std::uint64_t gen = 0;
+      std::string path;
+      {
+        std::unique_lock<std::mutex> lock(a.mutex);
+        a.cv.wait(lock, [&a] { return a.quit || a.reqPending; });
+        if (a.quit) {
+          return; // drop any pending request: decoding it at shutdown is
+                  // pure wasted work (and can block exit for seconds)
+        }
+        a.reqPending = false;
+        gen = a.reqGen;
+        path = a.reqPath;
+      }
+      Model model;
+      std::string error;
+      if (!loadModelFile(path, model, error, /*withImages=*/true)) {
+        model = Model{}; // never stage a partial decode from an exception
+        if (error.empty()) {
+          error = "could not load";
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lock(a.mutex);
+        if (gen >= a.doneGen) {
+          a.doneGen = gen;
+          a.doneModel = std::move(model);
+          a.doneError = error;
+          a.doneReady = true;
+        }
+      }
+    }
+  });
 }
 
-// Removes the staged preview from the scene (never from history: previews
-// are transient UI and leave before any undo step is taken).
-void galleryEvict(App& app) {
-  if (!app.galleryRoots.empty()) {
-    vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection,
-                           app.galleryRoots);
-    app.galleryRoots.clear();
+void asyncRequest(AsyncLoad& a, std::uint64_t gen, std::string const& path) {
+  {
+    std::lock_guard<std::mutex> lock(a.mutex);
+    a.reqGen = gen;
+    a.reqPath = path;
+    a.reqPending = true;
   }
+  a.busy = true;
+  a.cv.notify_all();
+}
+
+// ---- ring slots ----
+// A slot holds one library model staged under a WRAPPER node (CarouselSlot
+// is declared above App). `slotAttach` stages a model, `slotPose` writes the
+// absolute ring pose every frame. The preview is scaled to fit 0.6 m about
+// its bounds centre; placement re-adds the model at natural size, so the
+// wrapper's scale never leaks into the placed instance.
+
+void slotEvict(App& app, CarouselSlot& slot) {
+  if (slot.wrapper != vredit::kInvalidNode) {
+    std::vector<vredit::NodeId> const roots{slot.wrapper};
+    vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection, roots);
+    slot.wrapper = vredit::kInvalidNode;
+  }
+  slot = CarouselSlot{};
+}
+
+// Stages `model` in `slot` under a fresh wrapper. Geometry always; textures
+// only when asked (neighbours stay geometry-only — the ring shows them at
+// the sides as cheap previews). The fit scale and bounds centre come from
+// the WHOLE model (meshless wrapper roots make root-only bounds degenerate).
+bool slotAttach(App& app, VkRenderer& renderer, CarouselSlot& slot, Model const& model,
+                bool withTextures) {
+  slot.wrapper = app.scene.create();
+  std::vector<vredit::NodeId> roots;
+  if (slot.wrapper == vredit::kInvalidNode) {
+    std::printf("[gallery] slotAttach: wrapper create failed\n");
+    return false;
+  }
+  if (!addModelToScene(app, renderer, model, &roots, withTextures)) {
+    std::printf("[gallery] slotAttach: addModelToScene failed (textures=%d)\n",
+                withTextures ? 1 : 0);
+    app.scene.destroy(slot.wrapper);
+    slot.wrapper = vredit::kInvalidNode;
+    return false;
+  }
+  if (roots.empty()) {
+    std::printf("[gallery] slotAttach: no roots (textures=%d)\n", withTextures ? 1 : 0);
+    app.scene.destroy(slot.wrapper);
+    slot.wrapper = vredit::kInvalidNode;
+    return false;
+  }
+  for (vredit::NodeId const root : roots) {
+    app.scene.setParent(root, slot.wrapper);
+  }
+  std::vector<vredit::NodeId> allNodes;
+  for (vredit::NodeId const root : roots) {
+    std::vector<vredit::NodeId> nodes = vredit::expandSelection(app.modelGroups, root, false);
+    allNodes.insert(allNodes.end(), nodes.begin(), nodes.end());
+  }
+  vredit::Aabb bounds{};
+  if (vredit::nodesBounds(app.scene, app.visuals, allNodes, bounds)) {
+    Vec3 const size = bounds.max - bounds.min;
+    float const extent = std::fmax(size.x, std::fmax(size.y, size.z));
+    if (extent > 1e-4F) {
+      slot.fit = kPreviewExtent / extent;
+    }
+    slot.centre = (bounds.min + bounds.max) * 0.5F;
+  }
+  slot.hasModel = true;
+  slot.textured = withTextures;
+  return true;
+}
+
+// The absolute ring pose for a slot: T(slotPos) * R(yaw) * S(fit) * T(-centre),
+// i.e. the model's bounds centre lands at slotPos at fit scale, facing the
+// viewer. Composed exactly (translation = slotPos - R*(centre*fit)).
+void slotPose(App& app, CarouselSlot& slot, vredit::CarouselRing const& ring, Vec3 const& eye,
+              Vec3 const& forward) {
+  if (slot.wrapper == vredit::kInvalidNode) {
+    return;
+  }
+  vredit::CarouselRing::SlotPose const pose = ring.slotPose(slot.index, eye, forward);
+  Quat const yaw = quatFromAxisAngle(Vec3{0.0F, 1.0F, 0.0F}, pose.yaw);
+  Vec3 const rotatedCentre = rotate(yaw, slot.centre * slot.fit);
+  vredit::Transform t;
+  t.translation = pose.position - rotatedCentre;
+  t.rotation = yaw;
+  t.scale = Vec3{slot.fit, slot.fit, slot.fit};
+  app.scene.setLocal(slot.wrapper, t);
+}
+
+void galleryClose(App& app);
+
+// Removes every staged preview (never from history: previews are transient
+// UI and leave before any undo step is taken) and cancels any in-flight load.
+void galleryEvict(App& app) {
+  for (std::size_t i = 0; i < kSlotCount; ++i) {
+    slotEvict(app, app.carousel[i]);
+  }
+  // Bump the request generation: a load in flight is now stale and its
+  // result is dropped on arrival. `busy` is deliberately NOT cleared here —
+  // a decode genuinely in progress must finish before the next request (its
+  // result clears busy when the drain consumes it).
+  app.carouselGen += 2;
 }
 
 void galleryClose(App& app) {
@@ -646,88 +887,182 @@ void galleryClose(App& app) {
   std::printf("[gallery] closed\n");
 }
 
-// Where a staged preview floats: 1.35 m ahead of the viewer on the level at
-// eye height ("appearing in front of me"). Placed ONCE per stage — the
-// preview does not track the head; the user turns to look at it.
-Vec3 galleryAnchor(Vec3 const& viewPos, Vec3 const& viewForward) {
-  Vec3 fwd{viewForward.x, 0.0F, viewForward.z};
-  if (dot(fwd, fwd) < 1e-6F) {
-    fwd = {0.0F, 0.0F, -1.0F};
+// The ring offset -> library index, wrapped.
+int galleryWrapIndex(App const& app, int offset) {
+  int const count = static_cast<int>(app.galleryFiles.size());
+  if (count <= 0) {
+    return -1;
   }
-  fwd = normalized(fwd);
-  return viewPos + fwd * 1.35F + Vec3{0.0F, -0.1F, 0.0F};
+  return ((app.ring.index + offset) % count + count) % count;
 }
 
-// Stages the current library entry in front of the viewer. The PREVIOUS
-// preview is evicted first, so exactly one model is ever loaded. A failed
-// file is reported and the staged slot stays empty — cycling continues past
-// it ("one bad file cannot block others").
-void galleryStage(App& app, VkRenderer& renderer, Vec3 const& viewPos, Vec3 const& viewForward) {
-  galleryEvict(app);
-  if (app.galleryFiles.empty()) {
-    galleryClose(app);
+// Asks the worker for the CLOSEST ring slot with no model yet (centre first,
+// then the visible neighbours). One decode runs at a time; a newer request
+// supersedes the old (stale results are dropped by generation), so cycling
+// quickly just re-targets the worker.
+void galleryRequestMissing(App& app) {
+  if (!app.galleryActive || app.galleryFiles.empty()) {
     return;
   }
-  app.galleryIndex = app.galleryIndex % app.galleryFiles.size();
-  std::string const& file = app.galleryFiles[app.galleryIndex];
-  Model model;
-  std::string error;
-  std::vector<vredit::NodeId> roots;
-  // The pre-stage state is the undo "before" for the eventual placement:
-  // undoing a spawn restores the world WITHOUT the model (never the staged
-  // preview). Nothing else mutates while the carousel is open, so it stays
-  // valid across cycling.
-  vredit::EditorSnapshot const before = snapshot(app);
-  if (!loadModelFile(file, model, error, /*withImages=*/true) ||
-      !addModelToScene(app, renderer, model, &roots) || roots.empty()) {
-    // A hostile model can throw MID-insert (addModelToScene catches), and a
-    // scene with no top-level nodes loads "successfully" with zero roots:
-    // both can leave junk (nodes, groups) even with no visuals. Roll back
-    // unconditionally — the snapshot is cheap and correctness beats the
-    // micro-optimisation of skipping it.
-    applySnapshot(app, before);
-    std::printf("[gallery] cannot show %s: %s\n", file.c_str(),
-                error.empty() ? "could not add to scene" : error.c_str());
+  if (app.worker.busy) {
+    return; // strictly one decode at a time — overwriting the pending job
+            // would strand its slot "in flight" forever
+  }
+  for (int offset : {0, 1, -1, 2, -2}) {
+    int const index = galleryWrapIndex(app, offset);
+    bool have = false;
+    for (CarouselSlot const& slot : app.carousel) {
+      if (slot.index == index && (slot.hasModel || slot.failed)) {
+        have = true; // loaded, or terminally failed ("never retried")
+        break;
+      }
+    }
+    if (have) {
+      continue;
+    }
+    // Nothing is decoding, so a slot claiming this index with no model is
+    // STALE (its job was dropped) — clear it and start fresh. Slots that
+    // hold a decoded model are never stale and must not be destroyed.
+    CarouselSlot* target = nullptr;
+    for (CarouselSlot& slot : app.carousel) {
+      if (slot.index == index && !slot.hasModel && !slot.failed &&
+          slot.model.nodes.empty()) {
+        slotEvict(app, slot);
+        break;
+      }
+    }
+    for (CarouselSlot& slot : app.carousel) {
+      if (!slot.hasModel && slot.wrapper == vredit::kInvalidNode && slot.index < 0) {
+        target = &slot;
+        break;
+      }
+    }
+    if (target == nullptr) {
+      return; // all slots busy
+    }
+    target->index = index;
+    target->gen = ++app.carouselGen;
+    asyncRequest(app.worker, target->gen, app.galleryFiles[static_cast<std::size_t>(index)]);
     return;
   }
-  app.galleryRoots = roots;
-  app.galleryBefore = before;
-  // Scale-to-fit must see the WHOLE model (meshless wrapper roots make
-  // root-only bounds degenerate — the preview would stay full size).
-  std::vector<vredit::NodeId> allNodes;
-  for (vredit::NodeId const root : roots) {
-    std::vector<vredit::NodeId> nodes =
-        vredit::expandSelection(app.modelGroups, root, false);
-    allNodes.insert(allNodes.end(), nodes.begin(), nodes.end());
+}
+
+// The per-frame ring driver: drains the worker (attaches finished loads as
+// geometry-only previews), promotes the CENTRE slot to textured when the
+// ring settles on it, requests what is missing, and writes every slot's
+// absolute ring pose. `dt` eases the ring; the poses follow the viewer.
+void galleryTick(App& app, VkRenderer& renderer, float dt, Vec3 const& eye,
+                 Vec3 const& forward) {
+  if (!app.galleryActive) {
+    return;
   }
-  vredit::Aabb bounds{};
-  if (vredit::nodesBounds(app.scene, app.visuals, allNodes, bounds)) {
-    float const extent =
-        std::fmax(bounds.max.x - bounds.min.x,
-                  std::fmax(bounds.max.y - bounds.min.y, bounds.max.z - bounds.min.z));
-    if (extent > 1e-4F) {
-      vredit::scaleSelectionUniform(app.scene, app.visuals, roots, 0.6F / extent);
-      app.galleryNaturalScale = extent / 0.6F;
-    } else {
-      app.galleryNaturalScale = 1.0F;
+  app.ring.tick(dt);
+  // Evict slots that fell outside the visible window (centre ± 2), using the
+  // MINIMAL wrapped distance — a slot 15 is adjacent to 0 in a 16-library.
+  int const librarySize = static_cast<int>(app.galleryFiles.size());
+  for (CarouselSlot& slot : app.carousel) {
+    if (slot.index < 0 || librarySize <= 0) {
+      continue;
+    }
+    int d = ((slot.index - app.ring.index) % librarySize + librarySize) % librarySize;
+    if (d > librarySize / 2) {
+      d -= librarySize;
+    }
+    if (std::abs(d) > 2) {
+      slotEvict(app, slot);
     }
   }
-  // Centre the scaled preview at the anchor (eye height in front).
-  vredit::Aabb placed{};
-  if (vredit::nodesBounds(app.scene, app.visuals, allNodes, placed)) {
-    Vec3 const centre = (placed.min + placed.max) * 0.5F;
-    Vec3 const at = galleryAnchor(viewPos, viewForward);
-    vredit::moveSelectionHorizontal(app.scene, roots,
-                                    Vec3{at.x - centre.x, 0.0F, at.z - centre.z});
-    vredit::moveSelectionVertical(app.scene, roots, at.y - centre.y);
+  // Drain finished loads (decode done on the worker; GPU work here).
+  {
+    bool ready = false;
+    std::uint64_t gen = 0;
+    Model model;
+    std::string error;
+    {
+      std::lock_guard<std::mutex> lock(app.worker.mutex);
+      if (app.worker.doneReady) {
+        ready = true;
+        gen = app.worker.doneGen;
+        model = std::move(app.worker.doneModel);
+        error = app.worker.doneError;
+        app.worker.doneReady = false;
+        app.worker.busy = false; // the job is consumed; the next may start
+      }
+    }
+    if (ready) {
+      CarouselSlot* target = nullptr;
+      for (CarouselSlot& slot : app.carousel) {
+        if (slot.gen == gen && !slot.hasModel) {
+          target = &slot;
+          break;
+        }
+      }
+      if (target != nullptr) {
+        // KEEP the decoded model in the slot: the promotion path re-stages
+        // it with textures, and placement re-stages it at natural size.
+        target->model = std::move(model);
+        if (slotAttach(app, renderer, *target, target->model, /*withTextures=*/false)) {
+          std::printf("[gallery] staged %s\n",
+                      app.galleryFiles[static_cast<std::size_t>(target->index)].c_str());
+        } else {
+          std::printf("[gallery] cannot show %s: %s\n",
+                      app.galleryFiles[static_cast<std::size_t>(target->index)].c_str(),
+                      error.empty() ? "could not add to scene" : error.c_str());
+          // TERMINAL: mark the slot failed instead of evicting it — evicting
+          // would make requestMissing re-decode this file in an endless loop.
+          target->failed = true;
+          target->model = Model{};
+          if (target->wrapper != vredit::kInvalidNode) {
+            app.scene.destroy(target->wrapper);
+            target->wrapper = vredit::kInvalidNode;
+          }
+        }
+      }
+    }
   }
-  std::printf("[gallery] staged %s\n", file.c_str());
+  // The centre slot's textures upload when the ring settles on it (the one
+  // hitch per switch — decode is already done, this is the VRAM copy). The
+  // slot's identity (index/gen) and its decoded model survive the re-stage;
+  // on failure the model falls back to the geometry-only preview instead of
+  // looping (promoteFailed is terminal for this staging).
+  if (app.ring.atRest()) {
+    for (CarouselSlot& slot : app.carousel) {
+      if (slot.hasModel && !slot.textured && !slot.promoteFailed &&
+          slot.index == app.ring.index) {
+        Model model = std::move(slot.model);
+        int const keepIndex = slot.index;
+        std::uint64_t const keepGen = slot.gen;
+        slotEvict(app, slot);
+        slot.index = keepIndex;
+        slot.gen = keepGen;
+        bool const promoted = slotAttach(app, renderer, slot, model, /*withTextures=*/true);
+        if (!promoted) {
+          std::printf("[gallery] textures unavailable for %s (preview untextured)\n",
+                      app.galleryFiles[static_cast<std::size_t>(keepIndex)].c_str());
+          (void)slotAttach(app, renderer, slot, model, /*withTextures=*/false);
+          slot.promoteFailed = true;
+          if (!slot.hasModel) {
+            slot.failed = true; // geometry fallback failed too — terminal
+          }
+        }
+        // Keep the decoded model in the slot (placement re-stages it later).
+        slot.model = std::move(model);
+        break;
+      }
+    }
+  }
+  galleryRequestMissing(app);
+  // Absolute ring poses (the ring follows the viewer every frame).
+  for (CarouselSlot& slot : app.carousel) {
+    slotPose(app, slot, app.ring, eye, forward);
+  }
 }
 
 // Opens the carousel over the whole library (rescanned every open: drop a
-// file in and it is there). The first stageable model is shown; the rest
-// are one stick flick away.
-void galleryOpen(App& app, VkRenderer& renderer, Vec3 const& viewPos, Vec3 const& viewForward) {
+// file in and it is there). The centre slot decodes first; the neighbours
+// fill in behind it.
+void galleryOpen(App& app, VkRenderer& renderer) {
+  (void)renderer; // loads attach in galleryTick (GPU work stays on the frame)
   if (app.galleryActive) {
     return;
   }
@@ -740,62 +1075,75 @@ void galleryOpen(App& app, VkRenderer& renderer, Vec3 const& viewPos, Vec3 const
     std::printf("[gallery] library folder is empty: %s\n", app.libraryDir.c_str());
     return;
   }
-  // Set before any load: a failed load still leaves a closeable carousel.
+  app.ring = vredit::CarouselRing{};
+  app.ring.setCount(static_cast<int>(app.galleryFiles.size()));
+  // The pre-open state is the undo "before" for the eventual placement:
+  // undoing a placement restores the world WITHOUT the model (never a
+  // floating preview). Nothing else mutates while the carousel is open.
+  app.galleryBefore = snapshot(app);
   app.galleryActive = true;
-  for (std::size_t i = 0; i < app.galleryFiles.size(); ++i) {
-    app.galleryIndex = i;
-    galleryStage(app, renderer, viewPos, viewForward);
-    if (!app.galleryRoots.empty()) {
-      break;
-    }
+  if (!app.worker.thread.joinable()) {
+    asyncStart(app.worker); // decode thread, lazily started (no-op after)
   }
-  if (app.galleryRoots.empty()) {
-    std::printf("[gallery] no loadable model in %s\n", app.libraryDir.c_str());
-    galleryClose(app);
-    return;
-  }
-  std::printf("[gallery] %zu models — stick X or [ ] cycles, the trigger (click) places\n",
+  galleryRequestMissing(app);
+  std::printf("[gallery] %zu models — stick X or [ ] rotates the ring, "
+              "the trigger (click) places\n",
               app.galleryFiles.size());
 }
 
-// Cycles the carousel (stick X in VR, [ ] on desktop).
-void galleryCycle(App& app, VkRenderer& renderer, int dir, Vec3 const& viewPos,
-                  Vec3 const& viewForward) {
+// Rotates the ring (stick X in VR, [ ] on desktop). Instant: the ring
+// animates this frame; the model behind the slot decodes on the worker.
+void galleryCycle(App& app, VkRenderer& renderer, int dir) {
+  (void)renderer;
   if (!app.galleryActive || app.galleryFiles.empty()) {
     return;
   }
-  long const count = static_cast<long>(app.galleryFiles.size());
-  long next = (static_cast<long>(app.galleryIndex) + dir) % count;
-  if (next < 0) {
-    next += count;
-  }
-  app.galleryIndex = static_cast<std::size_t>(next);
-  galleryStage(app, renderer, viewPos, viewForward);
+  app.ring.step(dir);
+  galleryRequestMissing(app);
 }
 
-// The trigger (click) while the carousel is open: place the STAGED model on
-// the floor at the aim point at natural size as one undo step. The undo
-// "before" is the PRE-STAGE state, so undoing removes the model entirely —
-// it never returns as a floating preview. The placement closes the carousel.
+// The trigger (click) while the carousel is open: place the CENTRED model on
+// the floor at the aim point at NATURAL size as one undo step. The undo
+// "before" is the PRE-OPEN state, so undoing removes the model entirely — it
+// never returns as a floating preview. The placement closes the carousel.
 bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
-  (void)renderer;
-  if (!app.galleryActive || app.galleryRoots.empty()) {
+  if (!app.galleryActive || app.galleryFiles.empty()) {
+    return false;
+  }
+  int const index = app.ring.index;
+  CarouselSlot* centre = nullptr;
+  for (CarouselSlot& slot : app.carousel) {
+    if (slot.index == index && slot.hasModel) {
+      centre = &slot;
+      break;
+    }
+  }
+  if (centre == nullptr) {
+    std::printf("[gallery] still loading — try again in a moment\n");
     return false;
   }
   // Belt and braces: no live edit should exist while the carousel is open,
   // but if one does, commit it as its own step before the placement's.
   endEdits(app);
-  std::string const file = app.galleryFiles[app.galleryIndex];
+  std::string const file = app.galleryFiles[static_cast<std::size_t>(index)];
+  // Place a NATURAL-SIZE, TEXTURED copy (the preview's wrapper never leaks
+  // into it): stage it fresh with textures and drop it on the floor. The
+  // model MOVED out of the slot — copying it would move gigabytes.
+  Model model = std::move(centre->model);
   app.undo.begin(app.galleryBefore);
-  vredit::scaleSelectionUniform(app.scene, app.visuals, app.galleryRoots,
-                                app.galleryNaturalScale);
-  vredit::placeOnFloor(app.scene, app.visuals, app.galleryRoots,
-                       vredit::floorAimPoint(aimRay));
+  galleryEvict(app);
+  std::vector<vredit::NodeId> roots;
+  if (!addModelToScene(app, renderer, model, &roots, /*withTextures=*/true) || roots.empty()) {
+    // Roll back to the pre-open state; identical snapshots record no step.
+    applySnapshot(app, app.galleryBefore);
+    (void)app.undo.commit(snapshot(app));
+    std::printf("[gallery] cannot place %s\n", file.c_str());
+    return false;
+  }
+  vredit::placeOnFloor(app.scene, app.visuals, roots, vredit::floorAimPoint(aimRay));
   app.selection =
-      vredit::expandSelection(app.modelGroups, app.galleryRoots[0], /*partSelect=*/false);
+      vredit::expandSelection(app.modelGroups, roots[0], /*partSelect=*/false);
   app.undo.commit(snapshot(app));
-  // The staged preview is a real scene model now: detach WITHOUT evicting.
-  app.galleryRoots.clear();
   galleryClose(app);
   std::printf("[gallery] placed %s\n", file.c_str());
   return true;
@@ -876,13 +1224,10 @@ void assembleFrame(App& app,
   }
   // The mode HUD: the current mode's name in the line font, view-locked in
   // front of the camera/head (XR passes the head pose; desktop uses the
-  // camera). The model carousel shows the staged model's name too, so
-  // "which one is this" is readable in the headset.
+  // camera), so "which mode is this" is readable in the headset. No
+  // filenames: the user said "I really don't need the file name in the
+  // carousel".
   std::string hudText = app.mode == EditMode::move ? "MOVE" : "ROTATE";
-  if (app.galleryActive && app.galleryIndex < app.galleryFiles.size()) {
-    hudText += " ";
-    hudText += stemUpper(app.galleryFiles[app.galleryIndex]);
-  }
   Vec3 const hudEye = hudPos != nullptr ? *hudPos : app.camera.position;
   Quat const hudFace = hudOrient != nullptr ? *hudOrient : cameraOrientation(app.camera);
   Vec3 const hudFwd = rotate(hudFace, Vec3{0.0F, 0.0F, -1.0F});
@@ -1114,11 +1459,10 @@ void handleEvent(App& app,
       if (app.galleryActive) {
         galleryClose(app);
       } else {
-        galleryOpen(app, renderer, app.camera.position, cameraForward(app.camera));
+        galleryOpen(app, renderer);
       }
     } else if (keysym == '[' || keysym == ']') {
-      galleryCycle(app, renderer, keysym == ']' ? 1 : -1, app.camera.position,
-                   cameraForward(app.camera));
+      galleryCycle(app, renderer, keysym == ']' ? 1 : -1);
     } else if (keysym == '1' || keysym == 'g' || keysym == 'G') {
       app.mode = EditMode::move;
       stateChanged = true;
@@ -1432,42 +1776,56 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     return 1;
   }
   // The model carousel end-to-end (its interactive paths are otherwise
-  // unreachable in a smoke): stage from a library, cycle, place, undo, redo.
-  // .build holds the fixture models (.glb + .obj), so cycling meets at least
-  // two distinct files and wraps. AFTER the tint-sensitive checks on purpose.
+  // unreachable in a smoke): open a RING over a library, rotate, place,
+  // undo, redo. .build holds the fixture models (.glb + .obj). Loads decode
+  // on a worker thread now, so the smoke pumps galleryTick until the slots
+  // arrive (bounded). AFTER the tint-sensitive checks on purpose.
   std::size_t const baseVisuals = app.visuals.size();
   app.libraryDir = ".build";
   Vec3 const hudPos{0.0F, 1.5F, 4.0F};
   Vec3 const hudFwd{0.0F, 0.0F, -1.0F};
-  galleryOpen(app, renderer, hudPos, hudFwd);
-  if (!app.galleryActive || app.galleryRoots.empty() ||
-      app.visuals.size() <= baseVisuals) {
+  auto pump = [&]() {
+    for (int i = 0; i < 600; ++i) {
+      galleryTick(app, renderer, 1.0F / 60.0F, hudPos, hudFwd);
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  };
+  auto staged = [&]() {
+    int n = 0;
+    for (CarouselSlot const& slot : app.carousel) {
+      if (slot.hasModel) {
+        ++n;
+      }
+    }
+    return n;
+  };
+  galleryOpen(app, renderer);
+  pump();
+  if (!app.galleryActive || staged() == 0 || app.visuals.size() <= baseVisuals) {
     std::printf("SMOKE FAIL: carousel staged nothing\n");
     return 1;
   }
-  // "Only one model ever loaded": the cycle must EVICT the staged preview
-  // (none of its nodes survive) and restage a different one.
-  std::vector<vredit::NodeId> const stagedNodes =
-      vredit::expandSelection(app.modelGroups, app.galleryRoots[0], /*partSelect=*/false);
-  galleryCycle(app, renderer, 1, hudPos, hudFwd);
-  if (!app.galleryActive || app.galleryRoots.empty() ||
-      app.visuals.size() <= baseVisuals) {
-    std::printf("SMOKE FAIL: carousel cycle left nothing staged\n");
+  int const centredBefore = app.ring.index;
+  galleryCycle(app, renderer, 1);
+  pump();
+  if (app.ring.index == centredBefore || staged() == 0) {
+    std::printf("SMOKE FAIL: carousel cycle did not rotate the ring\n");
     return 1;
   }
-  for (NodeVisual const& visual : app.visuals) {
-    if (std::find(stagedNodes.begin(), stagedNodes.end(), visual.id) != stagedNodes.end()) {
-      std::printf("SMOKE FAIL: cycling did not evict the previous preview\n");
-      return 1;
-    }
+  // Wrapping: cycling back lands on the original slot.
+  galleryCycle(app, renderer, -1);
+  pump();
+  if (app.ring.index != centredBefore) {
+    std::printf("SMOKE FAIL: carousel ring did not wrap back\n");
+    return 1;
   }
   Ray const placeAim{hudPos, normalized(Vec3{0.0F, -1.0F, -0.2F})};
   if (!galleryPick(app, renderer, placeAim) || app.galleryActive) {
     std::printf("SMOKE FAIL: carousel placement\n");
     return 1;
   }
-  // Undo removes the placed model entirely (the pre-stage "before" — never
-  // the floating preview), and redo brings it back.
+  // Undo removes the placed model entirely (the pre-open "before" — never
+  // a floating preview), and redo brings it back.
   vredit::EditorSnapshot carouselState = snapshot(app);
   if (!app.undo.undo(carouselState)) {
     std::printf("SMOKE FAIL: undo after placement\n");
@@ -1487,7 +1845,7 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     std::printf("SMOKE FAIL: redo did not restore the placed model\n");
     return 1;
   }
-  std::printf("SMOKE carousel: stage -> cycle -> place -> undo -> redo OK\n");
+  std::printf("SMOKE carousel: ring open -> rotate -> place -> undo -> redo OK\n");
   std::printf("SMOKE PASS (offscreen) on %s\n", renderer.deviceName());
   renderer.shutdown();
   return 0;
@@ -1858,13 +2216,16 @@ int runXr(char const* shaderDir,
                               std::fabs(input.leftStick.y) > stickThreshold;
     bool const gestureAlive = sticksActive;
     // While the carousel is open the sticks are ITS: the left stick's X
+    // The ring follows the viewer; loads drain here (one hitch per switch
+    // when the centre slot's textures upload).
+    galleryTick(app, renderer, dt, headWorld, headForward);
     // cycles the staged model (a flick = one step; held = one step per
-    // 0.35 s). All editing stays blocked (the session gates below).
+    // 0.25 s). All editing stays blocked (the session gates below).
     if (app.galleryActive) {
       app.galleryCycleCooldown -= dt;
       if (std::fabs(input.leftStick.x) > 0.5F && app.galleryCycleCooldown <= 0.0) {
-        galleryCycle(app, renderer, input.leftStick.x > 0.0F ? 1 : -1, headWorld, headForward);
-        app.galleryCycleCooldown = 0.35;
+        galleryCycle(app, renderer, input.leftStick.x > 0.0F ? 1 : -1);
+        app.galleryCycleCooldown = 0.25;
       }
     }
     // After an undo/redo the sticks must return to neutral before a new
@@ -1996,7 +2357,7 @@ int runXr(char const* shaderDir,
       if (app.galleryActive) {
         galleryClose(app);
       } else {
-        galleryOpen(app, renderer, headWorld, headForward);
+        galleryOpen(app, renderer);
       }
     }
     if (app.galleryActive) {
@@ -2271,6 +2632,7 @@ int runInteractive(char const* shaderDir,
     }
     updateFlight(app, dt);
     updateArrowEdit(app, dt); // arrow keys mirror the sticks (edit the selection)
+    galleryTick(app, renderer, dt, app.camera.position, cameraForward(app.camera));
     if (app.width == 0U || app.height == 0U) {
       std::this_thread::sleep_for(std::chrono::milliseconds(8)); // minimised: no busy spin
       continue;

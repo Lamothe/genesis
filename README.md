@@ -33,7 +33,7 @@ renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash run-tests.sh        # core tests (603 checks; image fixtures via ImageMagick)
+bash run-tests.sh        # core tests (858 checks; image fixtures via ImageMagick)
 bash run-editor.sh       # build + interactive editor
 bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
@@ -62,8 +62,8 @@ desktop mirror of the sticks) and it is **mode-driven** with two modes:
 the selection's own up; **up/down** tip, **Shift** = roll). **Shift** runs
 the arrows at quarter speed (fine). Nothing rotates outside rotate mode. Each
 arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
-**Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (one
-staged model appears at eye height in front of the camera; **[** **]** cycle
+**Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (the
+ring of models rotates in/out of view around the camera; **[** **]** cycle
 the library, a click places the
 staged model at the floor point under the cursor as one undo step; **N**
 closes without placing), **Delete** removes the selection (model or part),
@@ -88,10 +88,14 @@ runs both sticks at quarter speed for fine control. Each stick gesture is one
 undo step. The bounding box is not a click target: pressing empty space next
 to a model selects nothing. The selection is shown by a thin warm rim; the
 current mode (and the staged model's name) shows as line-font text floating
-in front of your head. **A** is the model carousel: one library model is
-staged at eye height in front of you (loaded and textured), **stick X**
-cycles the library (only one model is ever loaded at a time), and the trigger
-places the staged model at natural size on the floor where your aim beam
+in front of your head. **A** is the model carousel: a RING of library
+models around you — the centred model is staged at eye height in front of
+you (textured when the ring settles on it) and the previous/next models sit
+visible at the sides as cheap geometry-only previews. **stick X** rotates
+the ring in and out of view INSTANTLY (decoding runs on a worker thread, so
+a huge model never blocks the switch; no filenames are shown), and the
+trigger places the centred model at natural size on the floor where your aim
+beam
 meets it — one undo step (undo removes it entirely), and the carousel
 closes. **A** or undo (B) closes without placing. The library folder
 (`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
