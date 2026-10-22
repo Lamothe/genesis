@@ -171,10 +171,10 @@ struct App {
   Camera camera;
   // Backdrop = the ground grid + the tinted clear colour. Toggled off
   // ("show the model without the background"), the scene is a plain void.
-  bool showBackdrop{false}; // passthrough/void is the default; B or grip+menu adds the grid
-  // Editing mode (menu tap toggles; desktop 1/2). move = left stick X
-  // scales, Y = height; rotate = X sweeps the face right, Y lifts/lowers it
-  // (trackball about the viewer's axes). The right stick is planar
+  bool showBackdrop{false}; // passthrough/void is the default; B or menu-hold adds the grid
+  // Editing mode (left stick click toggles; desktop 1/2). move = left stick X
+  // scales, Y = height; rotate = X rolls the top with the stick (grip+X =
+  // spin), Y lifts/lowers the face. The right stick is planar
   // floor-move in BOTH modes; nothing rotates in move.
   EditMode mode{EditMode::move};
   bool looking{false};
@@ -214,18 +214,19 @@ struct App {
   // toggle mid-gesture must not steer the tip, change its rate, or walk
   // asymmetric models sideways via a re-centred pivot.
   Vec3 stickPivot{};
-  Vec3 stickYawAxis{0.0F, 1.0F, 0.0F};
-  Vec3 stickTipAxis{0.0F, 0.0F, -1.0F};
+  Vec3 stickRollAxis{0.0F, 0.0F, -1.0F}; // the toward/away-from-viewer line (X roll)
+  Vec3 stickTipAxis{0.0F, 0.0F, -1.0F};  // the viewer's left-right line (Y tip)
   float stickFineRate{1.0F};
   // Re-arm latch: after an undo/redo the sticks must return to neutral
   // before a new gesture may start, or the same frame's drift would
   // cancel-and-restart and swallow the undo.
   bool stickArmed{true};
-  // Menu tap/hold (VR): tap cycles the stick mode (fires on release), hold
-  // toggles the backdrop once at 0.4 s and cancels the tap.
+  // Menu tap/hold (VR): hold toggles the backdrop once at 0.4 s (cancelling
+  // the tap); a tap cycles the stick mode ONLY on profiles without the left
+  // stick click (Vive/simple) — on Quest the stick click is the toggle.
   float menuCharge{0.0F};
   bool menuHoldLatched{false};
-  bool menuTapped{false};
+  bool menuTapped{false}; // tap = mode fallback on profiles without the stick click
   bool menuPrevHeld{false};
   // Hold-X delete (VR): the selection's tint ramps red over kDeleteChargeS
   // and the delete fires at full charge; release before that cancels.
@@ -2097,18 +2098,18 @@ int runXr(char const* shaderDir,
     // at the user's request ("I can now move in the real world"). Grip is the
     // fine-control modifier.
 
-    // NO grip chords on face buttons — the grip sensor spikes when squeezing
-    // the controller to press one, which made this dispatch silently take the
-    // wrong branch (the reported "can only rotate horizontally": the mode
-    // cycle was unreachable behind a grip+menu backdrop chord). Tap/hold on
-    // ONE button instead: TAP (< 0.4 s) = stick mode cycle (on release),
-    // HOLD = backdrop toggle (fires once at threshold, the tap is cancelled —
-    // the same pattern as hold-X delete).
+    // Mode switching is the LEFT STICK CLICK (the user's binding). The click
+    // is ignored while the stick is deflected — clicking mid-edit-gesture is
+    // a natural accident and must not swap the mode under your thumb. The
+    // menu button is HOLD (0.4 s) = backdrop toggle; a menu TAP switches
+    // modes ONLY on profiles without a stick click (Vive/simple).
+    bool modeSwitch =
+        input.leftStickClickPressed && std::fabs(input.leftStick.x) <= kStickDeadZone &&
+        std::fabs(input.leftStick.y) <= kStickDeadZone;
     if (input.menuPressed || (input.menuHeld && !app.menuPrevHeld)) {
       // The app-side rising edge backs up the shell's edge: a press swallowed
       // by a skipped frame must still initialise the tap/hold state, or a
-      // later hold resumes from a stale charge (and can fire the backdrop
-      // instead of the mode cycle).
+      // later hold resumes from a stale charge.
       app.menuCharge = 0.0F;
       app.menuHoldLatched = false;
       app.menuTapped = true;
@@ -2123,6 +2124,11 @@ int runXr(char const* shaderDir,
       }
     } else if (app.menuTapped) {
       app.menuTapped = false;
+      if (!input.modeClickAvailable) {
+        modeSwitch = true;
+      }
+    }
+    if (modeSwitch) {
       app.mode = app.mode == EditMode::move ? EditMode::rotate : EditMode::move;
       endEdits(app);
     }
@@ -2188,8 +2194,8 @@ int runXr(char const* shaderDir,
     // Stick-driven editing (the coloured handles are gone): the right stick
     // slides the selection across the floor relative to the head's yaw
     // (pushing forward walks it away from you) in BOTH modes; the left stick
-    // is mode-driven (move: X scale, Y height; rotate: X sweeps the face
-    // right, Y lifts/lowers it — trackball). One undo step per gesture.
+    // is mode-driven (move: X scale, Y height; rotate: X rolls the top with
+    // the stick, Y tips — trackball). One undo step per gesture.
     //
     // The gesture's frame is latched at start (pivot and the pre-signed
     // viewer axes),
@@ -2217,9 +2223,10 @@ int runXr(char const* shaderDir,
     float const leftX = stickValue(input.leftStick.x);
     float const leftY = stickValue(input.leftStick.y);
     // The right stick moves (X/Z) in both modes. The left stick is
-    // mode-driven (menu tap toggles): MOVE = X uniform scale, Y height;
-    // ROTATE = X sweeps the model's face toward your right, Y lifts/lowers
-    // the face ("the model should rotate in the direction of the stick").
+    // mode-driven (left stick click toggles): MOVE = X uniform scale, Y height;
+    // ROTATE = X rolls the model's top toward your right (grip+X = spin),
+    // Y tips the top away ("the model should rotate in the direction of the
+    // stick").
     bool const sticksActive = std::fabs(input.rightStick.x) > stickThreshold ||
                               std::fabs(input.rightStick.y) > stickThreshold ||
                               std::fabs(input.leftStick.x) > stickThreshold ||
@@ -2247,12 +2254,14 @@ int runXr(char const* shaderDir,
       app.undo.begin(snapshot(app));
       app.stickSession = true;
       app.stickFineRate = input.gripHeld > 0.5F ? 0.25F : 1.0F;
-      // VIEWER-RELATIVE axes only ("only ever rotate the model around the
-      // axis that stretches to the left and right of the viewer"), latched
-      // at gesture start so a live head pose cannot steer a step. No roll:
-      // the two axes are the viewer's vertical and right — always
-      // perpendicular to each other and level with the horizon.
-      vredit::viewerRotationAxes(headRightFlat, app.stickYawAxis, app.stickTipAxis);
+      // VIEWER-RELATIVE lines only ("the y-axis (up/down) should only ever
+      // rotate the model around the axis that stretches to the left and
+      // right of the viewer" = tip; "the x-axis ... on the other axis" =
+      // roll about the toward/away line), latched at gesture start so a
+      // live head pose cannot steer a step. The two lines are perpendicular
+      // through the viewer's eye.
+      vredit::viewerRotationAxes(headRightFlat, headForward, app.stickRollAxis,
+                                 app.stickTipAxis);
       vredit::Aabb bounds{};
       if (vredit::movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
         app.stickPivot = vredit::aabbCentre(bounds);
@@ -2271,9 +2280,9 @@ int runXr(char const* shaderDir,
           vredit::moveSelectionHorizontal(app.scene, app.selection, moveDelta);
         }
         // ROTATE MODE: "the model should rotate in the direction of the
-        // stick" — a trackball: stick right sweeps the model's face to the
-        // viewer's right (positive about the viewer's vertical), stick up
-        // lifts the face toward the viewer (the pre-signed tip axis).
+        // stick" — a trackball: stick right rolls the model's TOP toward the
+        // viewer's right (about the toward/away line), stick up tips the top
+        // away / lifts the face (about the viewer's left-right line).
         // ROTATE MODE ONLY — nothing rotates outside it (approved rule).
         // Move mode: left stick X = uniform scale (right = bigger), Y =
         // height (up = lift).
@@ -2293,12 +2302,27 @@ int runXr(char const* shaderDir,
         }
         case EditMode::rotate:
         default: {
-          // TRACKBALL (the signs live in the core seam): stick right sweeps
-          // the face to the viewer's right, stick up lifts the face (its top
-          // edge leans back). ROTATE MODE ONLY (approved rule).
-          vredit::stickRotateYaw(app.scene, app.selection, app.stickPivot,
-                                 app.stickYawAxis, leftX, kStickTurnRadps,
-                                 app.stickFineRate * dt);
+          // TRACKBALL (the signs live in the core seams): stick X rolls the
+          // model's top toward the viewer's right ("the model should rotate
+          // in the direction of the stick"); grip+X instead SPINS about the
+          // vertical — the axis the two tilt lines don't cover. Stick Y
+          // tips the top away / lifts the face (grip = fine). ROTATE MODE
+          // ONLY (approved rule).
+          if (input.gripHeld > 0.5F) {
+            vredit::stickRotateYaw(app.scene, app.selection, app.stickPivot,
+                                   Vec3{0.0F, 1.0F, 0.0F}, leftX, kStickTurnRadps,
+                                   app.stickFineRate * dt);
+          } else if (vredit::stickRotateRoll(app.scene, app.selection, app.stickPivot,
+                                             app.stickRollAxis, leftX, kStickTurnRadps,
+                                             app.stickFineRate * dt)) {
+            // The floor rule is about MODELS ("models stay stuck to the
+            // floor") — a roll is a tilt about a horizontal line and digs a
+            // resting model's corners below the floor; re-rest it. (Yaw
+            // about the vertical never breaks floor contact.)
+            if (wholeModelSelection(app)) {
+              vredit::dropSelectionToFloor(app.scene, app.visuals, app.selection);
+            }
+          }
           if (vredit::stickRotateTip(app.scene, app.selection, app.stickPivot,
                                      app.stickTipAxis, leftY, kStickTurnRadps,
                                      app.stickFineRate * dt)) {
@@ -2472,8 +2496,8 @@ void updateFlight(App& app, float dt) {
 
 // Applies held arrow keys once per frame: the desktop mirror of the stick
 // editing (the coloured handles are gone). Mode-driven like the sticks:
-// move = X uniform scale, Y height; rotate = X sweeps the face right, Y
-// lifts/lowers it (trackball about the viewer's axes). Same
+// move = X uniform scale, Y height; rotate = X rolls the top with the stick
+// (Shift+X = spin), Y tips (trackball about the viewer's lines). Same
 // one-undo-step-per-gesture lifecycle as the sticks: begun on the first
 // deflection, committed when the arrows settle.
 void updateArrowEdit(App& app, float dt) {
@@ -2511,20 +2535,30 @@ void updateArrowEdit(App& app, float dt) {
     app.undo.begin(snapshot(app));
     app.stickSession = true;
     app.stickFineRate = app.flyBoost ? 0.25F : 1.0F; // Shift = fine (latched)
-    // VIEWER-RELATIVE axes (same rule as VR): the viewer's vertical and
-    // pre-signed right — always perpendicular, no roll.
-    vredit::viewerRotationAxes(rightFlat, app.stickYawAxis, app.stickTipAxis);
+    // VIEWER-RELATIVE lines (same rule as VR): the toward/away line (roll)
+    // and the viewer's left-right line (tip) — perpendicular through the
+    // eye, latched per gesture.
+    vredit::viewerRotationAxes(rightFlat, forward, app.stickRollAxis, app.stickTipAxis);
     vredit::Aabb bounds{};
     app.stickPivot = vredit::movingSetBounds(app.scene, app.visuals, app.selection, bounds)
                         ? vredit::aabbCentre(bounds)
                         : app.scene.worldPosition(app.selection.front());
   }
-  // Same rules as the VR sticks: X scales in move mode (spins in rotate),
-  // Y = height in move (tips in rotate) — the model rotates in the
-  // direction of the stick (trackball).
+  // Same rules as the VR sticks: X rolls in rotate mode (Shift+X = spin
+  // about the vertical), Y = height in move (tips in rotate) — the model
+  // rotates in the direction of the stick (trackball).
   if (axisX != 0.0F && app.mode == EditMode::rotate) {
-    vredit::stickRotateYaw(app.scene, app.selection, app.stickPivot, app.stickYawAxis,
-                           axisX, kStickTurnRadps, app.stickFineRate * dt);
+    if (app.flyBoost) {
+      vredit::stickRotateYaw(app.scene, app.selection, app.stickPivot,
+                             Vec3{0.0F, 1.0F, 0.0F}, axisX, kStickTurnRadps,
+                             app.stickFineRate * dt);
+    } else if (vredit::stickRotateRoll(app.scene, app.selection, app.stickPivot,
+                                       app.stickRollAxis, axisX, kStickTurnRadps,
+                                       app.stickFineRate * dt)) {
+      if (wholeModelSelection(app)) {
+        vredit::dropSelectionToFloor(app.scene, app.visuals, app.selection);
+      }
+    }
   }
   if (axisX != 0.0F && app.mode == EditMode::move) {
     vredit::scaleSelectionUniform(
@@ -2593,7 +2627,7 @@ int runInteractive(char const* shaderDir,
       "vr-editor on %s\n"
       "  flight: WASD move   Q/E down/up   Shift boost   RMB look   MMB or Shift+RMB pan\n"
       "  wheel: fly forward/back   LMB: select (shift+click a part)\n"
-      "  arrows edit (mode-driven): X = scale / spin   Y = height / tip (shift: fine)\n"
+      "  arrows edit (mode-driven): X = scale / roll   Y = height / tip (shift: fine / X spin)\n"
       "  1 move   2 rotate   N model carousel ([ ] cycle, click places)   Esc quit\n",
       renderer.deviceName());
 
@@ -2692,13 +2726,14 @@ int main(int argc, char** argv) {
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
           "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n"
           "keys: WASD/QE fly (RMB look), arrows edit: left/right = X (scale in\n"
-          "      move mode, spin in rotate), up/down = Y (height / tip), shift =\n"
-          "      fine, 1 move / 2 rotate (menu toggle),\n"
+          "      move mode, roll in rotate; shift+X = spin), up/down = Y (height /\n"
+          "      tip), shift = fine, 1 move / 2 rotate,\n"
           "      N model carousel ([ ] cycle, click places), Delete remove,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
           "vr:   trigger select (grip+trigger part), right stick move on the floor,\n"
-          "      left stick: X/Y = the mode (menu tap toggles MOVE scale+height /\n"
-          "      ROTATE sweep+lift, trackball; grip = fine),\n"
+          "      left stick: X/Y = the mode (left stick click toggles MOVE\n"
+          "      scale+height / ROTATE roll+tip, trackball; grip+X = spin,\n"
+          "      grip = fine),\n"
           "      A model carousel (stick X cycles, trigger places),\n"
           "      hold X delete, B/Y undo/redo, menu hold = backdrop\n");
       return 0;

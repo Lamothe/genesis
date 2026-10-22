@@ -60,6 +60,7 @@ struct XrShell::ImplData {
   XrAction leftStickAction{XR_NULL_HANDLE};
   XrAction rightStickAction{XR_NULL_HANDLE};
   XrAction menuAction{XR_NULL_HANDLE};
+  XrAction modeAction{XR_NULL_HANDLE}; // left stick click: MOVE/ROTATE toggle
   XrAction undoAction{XR_NULL_HANDLE}; // B on Touch
   XrAction redoAction{XR_NULL_HANDLE}; // Y on Touch
   XrAction spawnAction{XR_NULL_HANDLE}; // A on Touch: model chooser (stage/place)
@@ -87,9 +88,11 @@ struct XrShell::ImplData {
   bool undoPrev{false};
   bool redoPrev{false};
   bool spawnPrev{false};
+  bool modePrev{false};
   bool undoPending{false}; // latched until a frame renders and consumes it
   bool redoPending{false};
   bool spawnPending{false};
+  bool modePending{false}; // left stick click: mode toggle
 
   // XR_KHR_vulkan_enable2 entry points.
   PFN_xrCreateVulkanInstanceKHR pfnCreateVulkanInstance{nullptr};
@@ -402,6 +405,7 @@ bool XrShell::createActions() {
 
   if (!makeFloat("trigger", &xr_->triggerAction) || !makeVec2("leftstick", &xr_->leftStickAction) ||
       !makeVec2("rightstick", &xr_->rightStickAction) || !makeBool("menu", &xr_->menuAction) ||
+      !makeBool("mode", &xr_->modeAction) ||
       !makeBool("undo", &xr_->undoAction) || !makeBool("redo", &xr_->redoAction) ||
       !makeBool("spawn", &xr_->spawnAction) || !makeBool("delete", &xr_->deleteAction) ||
       !makeFloat("grip", &xr_->gripAction) || !makePose("aim", &xr_->aimAction)) {
@@ -427,14 +431,17 @@ bool XrShell::createActions() {
         {"/user/hand/left/input/trigger/value", xr_->triggerAction},
         {"/user/hand/left/input/thumbstick", xr_->leftStickAction},
         {"/user/hand/right/input/thumbstick", xr_->rightStickAction},
+        {"/user/hand/left/input/thumbstick/click", xr_->modeAction}, // mode toggle
         {"/user/hand/left/input/menu/click", xr_->menuAction},
         {"/user/hand/right/input/squeeze/value", xr_->gripAction},
         {"/user/hand/left/input/squeeze/value", xr_->gripAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
         {"/user/hand/left/input/aim/pose", xr_->aimAction},
-        // Undo/redo/spawn on the face buttons, NOT the stick clicks: the
-        // sticks are the editing controls now and clicking one mid-gesture is
-        // a natural accident. A = spawn, X (held) = delete.
+        // Undo/redo/spawn on the face buttons. The LEFT stick click is the
+        // mode toggle (the user's binding; the app ignores it while the
+        // stick is deflected so a click mid-edit-gesture cannot swap modes).
+        // The right stick click is unused — clicking it mid-move is a
+        // natural accident. A = spawn, X (held) = delete.
         {"/user/hand/right/input/b/click", xr_->undoAction},
         {"/user/hand/left/input/y/click", xr_->redoAction},
         {"/user/hand/right/input/a/click", xr_->spawnAction},
@@ -723,6 +730,22 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   input.undoPressed = xr_->undoPending;
   input.redoPressed = xr_->redoPending;
 
+  // Left stick click = mode toggle (same latch as undo: a skipped frame
+  // must not swallow the press).
+  XrActionStateBoolean modeState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
+  getInfo.action = xr_->modeAction;
+  getInfo.subactionPath = leftPath;
+  xrGetActionStateBoolean(xr_->session, &getInfo, &modeState);
+  bool modeNow = modeState.isActive ? modeState.currentState : xr_->modePrev;
+  xr_->modePending = xr_->modePending || (modeNow && !xr_->modePrev);
+  xr_->modePrev = modeNow;
+  input.leftStickClickPressed = xr_->modePending;
+  // Profiles without a left stick click (Vive, simple) fall back to a MENU
+  // TAP for the mode toggle; the app sees the flag and only takes the tap
+  // when the stick click is genuinely unavailable (never on Quest, where a
+  // stray menu tap must not change modes).
+  input.modeClickAvailable = modeState.isActive;
+
   // Spawn (A on Touch): latched like undo/redo so a skipped frame cannot
   // swallow it. Delete (X on Touch) is a HELD state — the app turns the hold
   // into a charge ramp and fires at full charge.
@@ -914,6 +937,7 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   xr_->undoPending = false;
   xr_->redoPending = false;
   xr_->spawnPending = false;
+  xr_->modePending = false;
   return FrameStatus::Render;
 }
 

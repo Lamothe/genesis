@@ -58,9 +58,10 @@ forward/back.
 coloured axis handles were removed; all editing is the **arrow keys** (the
 desktop mirror of the sticks) and it is **mode-driven** with two modes:
 **1** = move (**left/right** uniform scale — per-axis scaling does not exist;
-**up/down** height, no floor rule), **2** = rotate (**left/right** sweeps the
-model's face toward your right, **up/down** lifts/lowers the face — a
-trackball, strictly around the viewer's axes). **Shift** runs
+**up/down** height, no floor rule), **2** = rotate (**left/right** rolls the
+model's top toward your right, **up/down** tips the top away / lifts the face
+— a trackball, strictly around the viewer's axes; **Shift+left/right** spins
+about the vertical). **Shift** runs
 the arrows at quarter speed (fine). Nothing rotates outside rotate mode. Each
 arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
 **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (the
@@ -77,14 +78,16 @@ Movement and rotation are the **sticks** (controller aim is too jittery for
 accurate placement): the **right stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
 off the floor) in **both** modes, and the **left stick is mode-driven** — the
-**menu button taps** toggle the two modes: **MOVE** (X = uniform scale,
-right = bigger; Y = height, up = lift) and **ROTATE** (X sweeps the model's
-face toward your right, Y lifts/lowers the face — "the model rotates in the
-direction of the stick", a trackball). Nothing
-rotates outside ROTATE. The rotation axes are strictly the VIEWER's — the
-level vertical and the level right axis, always perpendicular to each other
-and to the horizon; they, the rate and the pivot are latched per gesture
-(turning your head mid-gesture does not steer it). Whole models
+**left stick click** toggles the two modes: **MOVE** (X = uniform scale,
+right = bigger; Y = height, up = lift) and **ROTATE** (X rolls the model's
+top toward your right, Y tips the top away / lifts the face — "the model
+rotates in the direction of the stick", a trackball; **grip+X** spins about
+the vertical). Nothing
+rotates outside ROTATE. The rotation lines are strictly the VIEWER's — the
+toward/away line and the left-right line through your eye, always
+perpendicular to each other; they, the rate and the pivot are latched per
+gesture (turning your head mid-gesture does not steer it), and a stick click
+mid-gesture is ignored (it is an accident, not a mode change). Whole models
 re-rest on the floor after a tip; part selections tip in place. **Grip** held
 runs both sticks at quarter speed for fine control. Each stick gesture is one
 undo step. The bounding box is not a click target: pressing empty space next
@@ -107,7 +110,7 @@ delete: the selection ramps red and the delete fires at full charge (0.6 s);
 release
 before that to cancel. **B** (right) / **Y** (left) on Touch undo/redo,
 trackpad click on Vive. Passthrough is the DEFAULT view: the real world with
-the models drawn over it (grip + menu, or desktop B, toggles the grid backdrop
+the models drawn over it (hold the menu button, or desktop B, toggles the grid backdrop
 back). There are no flight controls in VR by design: passthrough means you
 walk around the real world with the
 models placed in it, so locomotion is physical — you walk, turn and crouch.

@@ -29,7 +29,9 @@ struct XrFrameInput {
   bool selectPressed{false};
   bool selectReleased{false};
   bool menuPressed{false};
-  bool menuHeld{false};    // held state for tap/hold (tap = mode, hold = backdrop)
+  bool menuHeld{false};    // held state for the backdrop toggle (hold = backdrop)
+  bool leftStickClickPressed{false}; // left stick CLICK = mode toggle
+  bool modeClickAvailable{false}; // this profile has the stick click (else menu-tap)
   bool undoPressed{false};  // latched: Face button on Touch, trackpad on Vive
   bool redoPressed{false};
   bool spawnPressed{false}; // latched: A on Touch (model gallery open/close)

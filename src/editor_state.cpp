@@ -219,15 +219,34 @@ bool movingSetBounds(Scene& scene,
   return nodesBounds(scene, visuals, moving, boundsOut);
 }
 
-void viewerRotationAxes(Vec3 const& viewRightFlat, Vec3& yawAxisOut, Vec3& tipAxisOut) {
-  // Spin: the viewer's level vertical (the world up — the views are horizon
-  // locked, so this is "up" to the viewer however they lean).
-  yawAxisOut = Vec3{0.0F, 1.0F, 0.0F};
-  // Tip: the viewer's level right axis, PRE-SIGNED for the stickRotate*
-  // seams: a positive Y deflection lifts the model's face upward (its top
-  // edge leans back — one rotation, seen from each end): "the model should
-  // rotate in the direction of the stick".
+void viewerRotationAxes(Vec3 const& viewRightFlat, Vec3 const& viewForward,
+                        Vec3& rollAxisOut, Vec3& tipAxisOut) {
+  // Roll (X): the line stretching toward/away from the viewer = the view
+  // forward ("the x-axis ... on the other axis"). PRE-SIGNED: a positive X
+  // deflection rolls the model's TOP toward the viewer's right — the model
+  // rotates in the direction of the stick.
+  rollAxisOut = viewForward;
+  // Tip (Y): the viewer's left-right line ("the y-axis (up/down) should
+  // only ever rotate the model around the axis that stretches to the left
+  // and right of the viewer"). PRE-SIGNED: a positive Y deflection lifts
+  // the model's face upward (its top edge tips away — one rotation, seen
+  // from each end).
   tipAxisOut = Vec3{-viewRightFlat.x, -viewRightFlat.y, -viewRightFlat.z};
+}
+
+bool stickRotateRoll(Scene& scene,
+                     std::vector<NodeId> const& selection,
+                     Vec3 const& pivot,
+                     Vec3 const& rollAxis,
+                     float deflection,
+                     float rateRadiansPerSec,
+                     float dt) {
+  float const angle = deflection * rateRadiansPerSec * dt;
+  if (angle == 0.0F) {
+    return false;
+  }
+  rotateSelectionAbout(scene, selection, pivot, rollAxis, angle);
+  return true;
 }
 
 bool stickRotateYaw(Scene& scene,
