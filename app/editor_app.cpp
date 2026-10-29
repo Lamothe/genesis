@@ -1552,6 +1552,83 @@ bool loadModels(App& app, VkRenderer& renderer, std::vector<char const*> const& 
   return true;
 }
 
+// The unattended eye-view capture (NOT a headset session): renders the
+// scene from the two eye poses of a nominal head pose - the app camera's
+// position/orientation offset by +/- half the standard 64 mm IPD along
+// the camera's right vector, at the app's render FOV - and writes
+// eye-left.ppm / eye-right.ppm. This is "what the headset would show" as
+// far as verifiable without a headset: the VR session's own eye poses and
+// per-eye FOV come from the headset at run time. Returns 0 on success.
+int runCaptureEyes(char const* shaderDir, std::vector<char const*> const& modelPaths,
+                   char const* dir) {
+  App app;
+  if (modelPaths.empty()) {
+    buildDemoScene(app);
+    app.selection.push_back(app.visuals[0].id);
+  }
+  VkRenderer renderer;
+  VkRenderer::Config config;
+  config.windowed = false;
+  config.width = 640;
+  config.height = 480;
+  config.shaderDir = shaderDir;
+  if (!renderer.init(config)) {
+    std::printf("CAPTURE FAIL: renderer init\n");
+    return 1;
+  }
+  if (!loadModels(app, renderer, modelPaths)) {
+    std::printf("CAPTURE FAIL: model loading\n");
+    return 1;
+  }
+  frameScene(app);
+
+  const float ipdHalf = 0.032F;  // half the standard 64 mm IPD
+  Vec3 const right = cameraRight(app.camera);
+  for (int eye = 0; eye < 2; ++eye) {
+    Camera eyeCam = app.camera;
+    const float sign = eye == 0 ? -1.0F : 1.0F;
+    eyeCam.position.x += right.x * ipdHalf * sign;
+    eyeCam.position.y += right.y * ipdHalf * sign;
+    eyeCam.position.z += right.z * ipdHalf * sign;
+
+    std::vector<DrawItem> items;
+    std::vector<RendererVertex> depthLines;
+    std::vector<RendererVertex> overlayLines;
+    assembleFrame(app, items, depthLines, overlayLines);
+    if (!renderer.draw(eyeCam, items, depthLines, overlayLines)) {
+      std::printf("CAPTURE FAIL: draw (eye %d)\n", eye);
+      return 1;
+    }
+    std::vector<std::uint8_t> pixels;
+    if (!renderer.readback(pixels)) {
+      std::printf("CAPTURE FAIL: readback (eye %d)\n", eye);
+      return 1;
+    }
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/eye-%s.ppm", dir,
+                  eye == 0 ? "left" : "right");
+    if (!writePpm(path, pixels, config.width, config.height)) {
+      std::printf("CAPTURE FAIL: write %s\n", path);
+      return 1;
+    }
+    int covered = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(config.width) * config.height; ++i) {
+      int r = pixels[i * 4U];
+      int g = pixels[i * 4U + 1U];
+      int b = pixels[i * 4U + 2U];
+      if (std::abs(r - 20) > 4 || std::abs(g - 23) > 4 || std::abs(b - 28) > 4) {
+        ++covered;
+      }
+    }
+    std::printf("CAPTURE eye-%s: %d/%d covered -> %s\n",
+                eye == 0 ? "left" : "right", covered,
+                config.width * config.height, path);
+  }
+  std::printf("CAPTURE OK: nominal head pose + 64 mm IPD, app render FOV; "
+              "the live session's eye poses/FOV come from the headset\n");
+  return 0;
+}
+
 int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& modelPaths,
                       bool textured) {
   App app;
@@ -2671,6 +2748,7 @@ int runInteractive(char const* shaderDir,
 
 int main(int argc, char** argv) {
   enum class Mode {
+    CaptureEyes,
     Interactive,
     SmokeOffscreen,
     SmokeTextured,
@@ -2684,6 +2762,7 @@ int main(int argc, char** argv) {
   int frames = 30;
   std::vector<char const*> modelPaths;
   std::string libraryDir; // spawn library: --library DIR (default below)
+  std::string captureDir;
 
   for (int i = 1; i < argc; ++i) {
     char const* arg = argv[i];
@@ -2693,6 +2772,11 @@ int main(int argc, char** argv) {
       libraryDir = argv[++i];
     } else if (std::strcmp(arg, "--smoke-offscreen") == 0) {
       mode = Mode::SmokeOffscreen;
+    } else if (std::strcmp(arg, "--capture-eyes") == 0) {
+      mode = Mode::CaptureEyes;
+      if (i + 1 < argc) {
+        captureDir = argv[++i];
+      }
     } else if (std::strcmp(arg, "--smoke-textured") == 0) {
       mode = Mode::SmokeTextured;
     } else if (std::strcmp(arg, "--smoke-perf") == 0) {
@@ -2723,7 +2807,7 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(arg, "--help") == 0) {
       std::printf(
           "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR] [--library DIR]\n"
-          "                [--xr | --smoke-offscreen | --smoke-textured |\n"
+          "                [--xr | --capture-eyes DIR | --smoke-offscreen | --smoke-textured |\n"
           "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n"
           "keys: WASD/QE fly (RMB look), arrows edit: left/right = X (scale in\n"
           "      move mode, roll in rotate; shift+X = spin), up/down = Y (height /\n"
@@ -2757,6 +2841,9 @@ int main(int argc, char** argv) {
   }
 
   switch (mode) {
+  case Mode::CaptureEyes:
+    return runCaptureEyes(shaderDir, modelPaths,
+                          captureDir.empty() ? ".build" : captureDir.c_str());
   case Mode::SmokeOffscreen:
     return runSmokeOffscreen(shaderDir, modelPaths, false);
   case Mode::SmokeTextured: {
