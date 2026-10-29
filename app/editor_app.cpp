@@ -1566,6 +1566,8 @@ int runCaptureEyes(char const* shaderDir, std::vector<char const*> const& modelP
     buildDemoScene(app);
     app.selection.push_back(app.visuals[0].id);
   }
+  std::error_code mkEc;
+  std::filesystem::create_directories(dir, mkEc);
   VkRenderer renderer;
   VkRenderer::Config config;
   config.windowed = false;
@@ -1582,6 +1584,12 @@ int runCaptureEyes(char const* shaderDir, std::vector<char const*> const& modelP
   }
   frameScene(app);
 
+  // The two eyes differ only by camera: assemble the frame once.
+  std::vector<DrawItem> items;
+  std::vector<RendererVertex> depthLines;
+  std::vector<RendererVertex> overlayLines;
+  assembleFrame(app, items, depthLines, overlayLines);
+
   const float ipdHalf = 0.032F;  // half the standard 64 mm IPD
   Vec3 const right = cameraRight(app.camera);
   for (int eye = 0; eye < 2; ++eye) {
@@ -1591,10 +1599,6 @@ int runCaptureEyes(char const* shaderDir, std::vector<char const*> const& modelP
     eyeCam.position.y += right.y * ipdHalf * sign;
     eyeCam.position.z += right.z * ipdHalf * sign;
 
-    std::vector<DrawItem> items;
-    std::vector<RendererVertex> depthLines;
-    std::vector<RendererVertex> overlayLines;
-    assembleFrame(app, items, depthLines, overlayLines);
     if (!renderer.draw(eyeCam, items, depthLines, overlayLines)) {
       std::printf("CAPTURE FAIL: draw (eye %d)\n", eye);
       return 1;
@@ -1605,8 +1609,12 @@ int runCaptureEyes(char const* shaderDir, std::vector<char const*> const& modelP
       return 1;
     }
     char path[512];
-    std::snprintf(path, sizeof(path), "%s/eye-%s.ppm", dir,
-                  eye == 0 ? "left" : "right");
+    const int n = std::snprintf(path, sizeof(path), "%s/eye-%s.ppm", dir,
+                                eye == 0 ? "left" : "right");
+    if (n < 0 || n >= static_cast<int>(sizeof(path))) {
+      std::printf("CAPTURE FAIL: output path too long\n");
+      return 1;
+    }
     if (!writePpm(path, pixels, config.width, config.height)) {
       std::printf("CAPTURE FAIL: write %s\n", path);
       return 1;
@@ -1622,7 +1630,11 @@ int runCaptureEyes(char const* shaderDir, std::vector<char const*> const& modelP
     }
     std::printf("CAPTURE eye-%s: %d/%d covered -> %s\n",
                 eye == 0 ? "left" : "right", covered,
-                config.width * config.height, path);
+                static_cast<int>(config.width * config.height), path);
+    if (covered == 0) {
+      std::printf("CAPTURE FAIL: eye %d is pure clear-colour\n", eye);
+      return 1;
+    }
   }
   std::printf("CAPTURE OK: nominal head pose + 64 mm IPD, app render FOV; "
               "the live session's eye poses/FOV come from the headset\n");
@@ -2774,7 +2786,7 @@ int main(int argc, char** argv) {
       mode = Mode::SmokeOffscreen;
     } else if (std::strcmp(arg, "--capture-eyes") == 0) {
       mode = Mode::CaptureEyes;
-      if (i + 1 < argc) {
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
         captureDir = argv[++i];
       }
     } else if (std::strcmp(arg, "--smoke-textured") == 0) {
