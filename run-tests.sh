@@ -33,4 +33,11 @@ fi
   src/mesh.cpp src/json.cpp src/gltf.cpp src/obj.cpp src/image.cpp \
   tests/test_core.cpp \
   -lz -o .build/test-core
+# The DLSS5 native seam adapter (this branch): the contract ABI
+# (neural-seam.h) implemented over two evaluator contexts, exercised with
+# synthetic stereo frames. Full-network frames: about two minutes.
+# Vendored boundary: third_party/dlss5-native (from dlss5-linux).
+"$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -ffp-contract=off   -I. -Iinclude -Ithird_party/dlss5-native   third_party/dlss5-native/native-host.cpp   src/neural-seam-native.cc   tests/test_neural_seam_native.cc   -pthread -o .build/test-neural-seam-native
+./.build/test-neural-seam-native
+
 exec ./.build/test-core
