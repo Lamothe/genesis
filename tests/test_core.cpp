@@ -1355,80 +1355,74 @@ void testMovingSetAndExplicitPivot() {
 }
 
 void testViewerRotationAxes() {
-  // The user rule: viewer-relative ROTATION LINES — "the y-axis (up/down)
-  // should only ever rotate the model around the axis that stretches to the
-  // left and right of the viewer" (tip) and "the x-axis ... on the other
-  // axis" = the line stretching toward/away from the viewer (roll). The
-  // directions are the whole user-facing behaviour of rotate mode, so they
-  // are asserted PHYSICALLY: the model's TOP and FACE must follow the stick.
-  Vec3 roll{}, tip{};
-  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, -1.0F}, roll, tip);
-  CHECK_NEAR3(roll, {0.0F, 0.0F, -1.0F}); // the toward/away line = view forward
-  CHECK_NEAR3(tip, {-1.0F, 0.0F, 0.0F});  // pre-signed left-right line
-  CHECK_NEAR(dot(roll, tip), 0.0F, 1e-6F); // always perpendicular
+  // The user rule: "only ever rotate the model around the axis that stretches
+  // to the left and right of the viewer" (tip) plus the spin about the scene's
+  // up axis (X; reverted from roll). The directions are the whole user-facing
+  // behaviour of rotate mode, so they are asserted PHYSICALLY: the model's
+  // FACE must follow the stick, in the VIEWER's frame.
+  Vec3 yaw{}, tip{};
+  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, yaw, tip);
+  CHECK_NEAR3(yaw, {0.0F, 1.0F, 0.0F});   // the scene's level vertical (spin)
+  CHECK_NEAR3(tip, {-1.0F, 0.0F, 0.0F});  // pre-signed viewer's right (tip)
+  CHECK_NEAR(dot(yaw, tip), 0.0F, 1e-6F); // always perpendicular (level)
+  // Horizontally right of a leaning viewer still gives level axes.
+  vredit::viewerRotationAxes({0.6F, 0.0F, 0.8F}, yaw, tip);
+  CHECK_NEAR3(yaw, {0.0F, 1.0F, 0.0F});
+  CHECK_NEAR(dot(yaw, tip), 0.0F, 1e-6F);
 
-  // Physical direction: a model at the origin, the viewer looking -Z with
-  // right = +X. The app drives the seams with POSITIVE stick deflections;
-  // the seams carry the signs.
+  // Physical direction: a model at the origin facing the viewer (+Z face,
+  // the viewer looking -Z with right = +X). The app drives the seams with
+  // POSITIVE stick deflections; the seams carry the signs.
   vredit::Scene scene;
   vredit::NodeId root = scene.create();
-  vredit::NodeId top = scene.create();
   vredit::NodeId face = scene.create();
-  vredit::Transform topLocal;
-  topLocal.translation = {0.0F, 1.0F, 0.0F};
   vredit::Transform faceLocal;
   faceLocal.translation = {0.0F, 0.0F, 1.0F};
-  scene.setLocal(top, topLocal);
+  vredit::Transform ident;
   scene.setLocal(face, faceLocal);
-  scene.setParent(top, root);
   scene.setParent(face, root);
-  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, -1.0F}, roll, tip);
-  // Stick RIGHT (positive X) must roll the model's TOP toward the viewer's
-  // right (+X) — "the model should rotate in the direction of the stick".
-  CHECK(vredit::stickRotateRoll(scene, {root}, {0.0F, 0.0F, 0.0F}, roll,
-                                /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
-  CHECK(scene.worldPosition(top).x > 0.0F);
+  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, yaw, tip);
+  // Stick RIGHT (positive X) spins about the scene's vertical: the FACE
+  // sweeps toward the viewer's right (+X), and a spin never changes height.
+  CHECK(vredit::stickRotateYaw(scene, {root}, {0.0F, 0.0F, 0.0F}, yaw,
+                               /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
+  CHECK(scene.worldPosition(face).x > 0.0F);
+  CHECK_NEAR(scene.worldPosition(face).y, 0.0F, 1e-5F);
   // Reset; stick UP (positive Y) must lift the FACE toward +Y (its top edge
   // tips away — one rotation, seen from each end).
-  scene.setLocal(top, topLocal);
-  scene.setLocal(face, faceLocal);
-  vredit::Transform ident;
   scene.setLocal(root, ident);
+  scene.setLocal(face, faceLocal);
   CHECK(vredit::stickRotateTip(scene, {root}, {0.0F, 0.0F, 0.0F}, tip,
                                /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
   CHECK(scene.worldPosition(face).y > 0.0F);
 
   // DISCRIMINATING cases: the lines are the VIEWER's, never the model's or
-  // the world's. (a) A turned viewer: forward = (1,0,-1)/sqrt2, right =
-  // (1,0,1)/sqrt2. Rolling positive must take the top toward THAT right.
-  vredit::viewerRotationAxes(normalized(Vec3{1.0F, 0.0F, 1.0F}),
-                             normalized(Vec3{1.0F, 0.0F, -1.0F}), roll, tip);
-  scene.setLocal(top, topLocal);
-  scene.setLocal(face, faceLocal);
+  // the world's. (a) A turned viewer: right = (1,0,1)/sqrt2. Tipping positive
+  // must take the face toward THAT up — exact magnitude: a WORLD-fixed tip
+  // would give sin(0.1) here; only the viewer's right line gives
+  // sin(0.1)/sqrt2.
+  vredit::viewerRotationAxes(normalized(Vec3{1.0F, 0.0F, 1.0F}), yaw, tip);
   scene.setLocal(root, ident);
-  CHECK(vredit::stickRotateRoll(scene, {root}, {0.0F, 0.0F, 0.0F}, roll,
-                                /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
-  // Exact magnitude: a WORLD-fixed roll would give sin(0.1)/sqrt2 here —
-  // only the viewer's forward line gives sin(0.1) along the viewer's right.
-  CHECK_NEAR(dot(scene.worldPosition(top), normalized(Vec3{1.0F, 0.0F, 1.0F})),
-             std::sin(0.1F), 1e-4F);
-  // (c) grip+X spin (stickRotateYaw): positive sweeps the FACE toward the
-  // viewer's right.
-  scene.setLocal(top, topLocal);
   scene.setLocal(face, faceLocal);
-  scene.setLocal(root, ident);
-  CHECK(vredit::stickRotateYaw(scene, {root}, {0.0F, 0.0F, 0.0F},
-                               Vec3{0.0F, 1.0F, 0.0F},
+  CHECK(vredit::stickRotateTip(scene, {root}, {0.0F, 0.0F, 0.0F}, tip,
                                /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
-  CHECK(scene.worldPosition(face).x > 0.0F);
-  // (d) A PRE-TIPPED model (its own axes differ from the viewer's): stick
-  // up must STILL lift the face toward +Y in the VIEWER's frame.
+  CHECK_NEAR(scene.worldPosition(face).y, std::sin(0.1F) / std::sqrt(2.0F), 1e-4F);
+  // (b) A PRE-TIPPED model (its own up is NOT the scene's up): the spin must
+  // still be about the SCENE's vertical — the face moves horizontally
+  // (x > 0, y unchanged), never vertically.
   vredit::Transform tipped;
   tipped.rotation = vredit::quatFromAxisAngle({0.0F, 0.0F, 1.0F}, kHalfPi);
   scene.setLocal(root, tipped);
-  scene.setLocal(top, topLocal);
   scene.setLocal(face, faceLocal);
-  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, -1.0F}, roll, tip);
+  vredit::viewerRotationAxes({1.0F, 0.0F, 0.0F}, yaw, tip);
+  CHECK(vredit::stickRotateYaw(scene, {root}, {0.0F, 0.0F, 0.0F}, yaw,
+                               /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
+  CHECK(scene.worldPosition(face).x > 0.0F);
+  CHECK_NEAR(scene.worldPosition(face).y, 0.0F, 1e-5F);
+  // (c) The pre-tipped model's TIP must still be the VIEWER's line: stick up
+  // lifts the face toward +Y in the viewer's frame.
+  scene.setLocal(root, tipped);
+  scene.setLocal(face, faceLocal);
   CHECK(vredit::stickRotateTip(scene, {root}, {0.0F, 0.0F, 0.0F}, tip,
                                /*deflection=*/1.0F, /*rate=*/0.1F, /*dt=*/1.0F));
   CHECK(scene.worldPosition(face).y > 0.0F);

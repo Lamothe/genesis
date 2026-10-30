@@ -23,15 +23,13 @@ struct XrFrameInput {
   Ray aimRays[2];        // per-hand aim rays in XR local space (left, right)
   bool aimValid[2] = {false, false}; // aimRays[i] is tracked this frame
   Vec3 headPosition{0.0F, 0.0F, 0.0F}; // midpoint of the eyes (tracking space)
-  Vec2 leftStick{0.0F, 0.0F};  // left stick: stick-driven ROTATE of the selection
-  Vec2 rightStick{0.0F, 0.0F}; // right stick: stick-driven MOVE of the selection
+  Vec2 leftStick{0.0F, 0.0F};  // left stick: stick-driven MOVE of the selection
+  Vec2 rightStick{0.0F, 0.0F}; // right stick: mode-driven edit of the selection
   bool selectHeld{false};
   bool selectPressed{false};
   bool selectReleased{false};
   bool menuPressed{false};
   bool menuHeld{false};    // held state for the backdrop toggle (hold = backdrop)
-  bool leftStickClickPressed{false}; // left stick CLICK = mode toggle
-  bool modeClickAvailable{false}; // this profile has the stick click (else menu-tap)
   bool undoPressed{false};  // latched: Face button on Touch, trackpad on Vive
   bool redoPressed{false};
   bool spawnPressed{false}; // latched: A on Touch (model gallery open/close)

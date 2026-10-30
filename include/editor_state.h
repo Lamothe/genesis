@@ -36,11 +36,11 @@ struct NodeVisual {
 // so a plain click selects the whole model and a secondary click (shift/
 // ctrl, or grip+trigger in VR) selects a single part. Group 0 = ungrouped.
 
-// The editor's two input modes (the left stick click toggles them): move =
-// the left stick scales (X) and changes height (Y); rotate = it rolls the
-// model's top toward the viewer's right (X) and tips the top away (Y)
-// — a trackball about the VIEWER's lines. NOTHING rotates outside rotate —
-// that rule lives in the app's mode switch, driven by this enum.
+// The editor's two input modes (a menu tap toggles them in VR, desktop 1/2):
+// move = the RIGHT stick scales (X) and changes height (Y); rotate = it
+// spins about the scene's up axis (X) and tips the top away (Y) — strictly
+// around the VIEWER's axes. NOTHING rotates outside rotate — that rule
+// lives in the app's mode switch, driven by this enum.
 enum class EditMode : std::uint8_t { move, rotate };
 using ModelGroups = std::vector<std::pair<NodeId, std::uint32_t>>;
 
@@ -95,13 +95,13 @@ void placeOnFloor(Scene& scene,
                   std::vector<NodeId> const& roots,
                   Vec3 const& target);
 
-// Stick-driven editing (VR): the right stick translates the selection
+// Stick-driven editing (VR): the LEFT stick translates the selection
 // horizontally ("models stay stuck to the floor" — y is never touched) in
-// both modes; the left stick is mode-driven (the app's EditMode): move =
-// X uniform scale / Y height, rotate = X rolls the model's top toward the
-// viewer's right about the toward/away line, Y tips the top away about the
-// viewer's left-right line (trackball; stickRotateRoll/stickRotateTip hold
-// the signs) — after which dropSelectionToFloor re-rests it on the ground.
+// both modes; the RIGHT stick is mode-driven (the app's EditMode): move =
+// X uniform scale / Y height, rotate = X spins about the scene's up axis,
+// Y tips the top away about the viewer's left-right line (stickRotateYaw/
+// stickRotateTip hold the signs) — after which dropSelectionToFloor
+// re-rests it on the ground.
 // All are drift-free (built on the gizmo's capture/apply machinery) and
 // respect the no-double-move
 // rule: a selected child rides along with its selected ancestor instead of
@@ -120,32 +120,21 @@ void rotateSelectionYaw(Scene& scene,
                         std::vector<NodeVisual> const& visuals,
                         std::vector<NodeId> const& selection,
                         float radians);
-// The stick-edit rotation axes: strictly VIEWER-relative LINES ("the y-axis
-// (up/down) should only ever rotate the model around the axis that stretches
-// to the left and right of the viewer" = the tip line; "the x-axis ... on
-// the other axis" = the line stretching toward/away from the viewer = the
-// roll line). Never the model's own frame. Both are PRE-SIGNED for the
-// stickRotate* seams: a positive deflection rotates the model in the
-// direction of the stick (trackball) — stick right rolls the model's TOP
-// toward the viewer's right, stick up tips the top away (the face lifts).
-void viewerRotationAxes(Vec3 const& viewRightFlat, Vec3 const& viewForward,
-                        Vec3& rollAxisOut, Vec3& tipAxisOut);
+// The stick-edit rotation axes: strictly VIEWER-relative ("only ever rotate
+// the model around the axis that stretches to the left and right of the
+// viewer" = the tip line; the spin is the scene's level vertical). Never the
+// model's own frame. Both are PRE-SIGNED for the stickRotate* seams: a
+// positive deflection rotates the model in the direction of the stick —
+// stick right sweeps the face toward the viewer's right, stick up tips the
+// top away (the face lifts).
+void viewerRotationAxes(Vec3 const& viewRightFlat, Vec3& yawAxisOut, Vec3& tipAxisOut);
 
 // One stick rotation step about the caller-latched axes (the two above).
-// TRACKBALL-signed: a POSITIVE deflection rotates the model in the
-// direction of the stick — stickRotateRoll (X) rolls the model's top toward
-// the viewer's right (about the toward-viewer line); stickRotateTip (Y)
-// tips the top away / lifts the face (about the viewer's left-right line);
-// stickRotateYaw (grip+X, the vertical axis the two tilt lines don't cover)
-// sweeps the face toward the viewer's right. The signs live HERE so tests
-// pin the user-facing direction. Returns true if anything rotated.
-bool stickRotateRoll(Scene& scene,
-                     std::vector<NodeId> const& selection,
-                     Vec3 const& pivot,
-                     Vec3 const& rollAxis,
-                     float deflection,
-                     float rateRadiansPerSec,
-                     float dt);
+// SIGNED: a POSITIVE deflection rotates the model in the direction of the
+// stick — stickRotateYaw (X) sweeps the face toward the viewer's right
+// (about the scene's vertical); stickRotateTip (Y) tips the top away /
+// lifts the face (about the viewer's left-right line). The signs live HERE
+// so tests pin the user-facing direction. Returns true if anything rotated.
 bool stickRotateYaw(Scene& scene,
                     std::vector<NodeId> const& selection,
                     Vec3 const& pivot,
@@ -195,9 +184,9 @@ void dropSelectionToFloor(Scene& scene,
 
 // Uniformly scales the selection about its bounds centre — the ONLY kind of
 // scaling in the editor; per-axis scaling does not exist. `factor` is
-// multiplicative (1.05 = 5% larger). Called by the move-mode left stick X
-// (VR and desktop arrows) and the carousel's stage/place sizing. Same
-// parent-vs-descendant rules as the other stick helpers.
+// multiplicative (1.05 = 5% larger). Called by the move-mode stick X
+// (right stick in VR, arrows on desktop) and the carousel's stage/place
+// sizing. Same parent-vs-descendant rules as the other stick helpers.
 bool scaleSelectionUniform(Scene& scene,
                            std::vector<NodeVisual> const& visuals,
                            std::vector<NodeId> const& selection,

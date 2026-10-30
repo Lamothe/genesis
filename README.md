@@ -33,7 +33,7 @@ renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash run-tests.sh        # core tests (858 checks; image fixtures via ImageMagick)
+bash run-tests.sh        # core tests (863 checks; image fixtures via ImageMagick)
 bash run-editor.sh       # build + interactive editor
 bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
@@ -58,10 +58,9 @@ forward/back.
 coloured axis handles were removed; all editing is the **arrow keys** (the
 desktop mirror of the sticks) and it is **mode-driven** with two modes:
 **1** = move (**left/right** uniform scale — per-axis scaling does not exist;
-**up/down** height, no floor rule), **2** = rotate (**left/right** rolls the
-model's top toward your right, **up/down** tips the top away / lifts the face
-— a trackball, strictly around the viewer's axes; **Shift+left/right** spins
-about the vertical). **Shift** runs
+**up/down** height, no floor rule), **2** = rotate (**left/right** spins the
+model about the scene's up axis, **up/down** tips the top away / lifts the
+face — strictly around the viewer's axes). **Shift** runs
 the arrows at quarter speed (fine). Nothing rotates outside rotate mode. Each
 arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
 **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (the
@@ -75,19 +74,19 @@ line-font text floating in front of the camera.
 
 In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
 Movement and rotation are the **sticks** (controller aim is too jittery for
-accurate placement): the **right stick** slides the selection across the floor
+accurate placement): the **left stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
-off the floor) in **both** modes, and the **left stick is mode-driven** — the
-**left stick click** toggles the two modes: **MOVE** (X = uniform scale,
-right = bigger; Y = height, up = lift) and **ROTATE** (X rolls the model's
-top toward your right, Y tips the top away / lifts the face — "the model
-rotates in the direction of the stick", a trackball; **grip+X** spins about
-the vertical). Nothing
-rotates outside ROTATE. The rotation lines are strictly the VIEWER's — the
-toward/away line and the left-right line through your eye, always
-perpendicular to each other; they, the rate and the pivot are latched per
-gesture (turning your head mid-gesture does not steer it), and a stick click
-mid-gesture is ignored (it is an accident, not a mode change). Whole models
+off the floor) in **both** modes, and the **right stick is mode-driven** — the
+left controller's **menu tap** toggles the two modes (**menu hold** toggles
+the backdrop; thumbstick clicks do nothing): **MOVE** (X = uniform scale,
+right = bigger; Y = height, up = lift) and **ROTATE** (X spins the model
+about the scene's up axis — stick right sweeps the face toward your right —
+Y tips the top away / lifts the face, "the model rotates in the direction of
+the stick"). Nothing
+rotates outside ROTATE. The rotation axes are strictly the VIEWER's — the
+scene's vertical and the left-right line through your eye, always
+perpendicular and level; they, the rate and the pivot are latched per
+gesture (turning your head mid-gesture does not steer it). Whole models
 re-rest on the floor after a tip; part selections tip in place. **Grip** held
 runs both sticks at quarter speed for fine control. Each stick gesture is one
 undo step. The bounding box is not a click target: pressing empty space next
@@ -96,7 +95,8 @@ current mode shows as line-font text floating in front of your head. **A**
 is the model carousel: a STATIONARY RING of library models around you — the
 centred model is staged at eye height in front of you and the previous/next
 models sit visible at the sides as cheap geometry-only previews (all
-previews stay untextured; textures load when a model is placed). **stick X**
+previews stay untextured; textures load when a model is placed). **right
+stick X**
 rotates
 the ring in and out of view INSTANTLY (decoding runs on a worker thread, so
 a huge model never blocks the switch; no filenames are shown), and the
