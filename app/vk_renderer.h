@@ -57,11 +57,13 @@ public:
 
   // Renders one frame into an arbitrary colour view (no present; blocks until
   // the target contents are complete; the target image ends in
-  // COLOR_ATTACHMENT_OPTIMAL). `viewProj` is proj * view in the renderer's
+  // COLOR_ATTACHMENT_OPTIMAL). `view` is the world->view matrix the blend
+  // sort transforms through; `viewProj` is proj * view in the renderer's
   // conventions (cameraViewProjection, or mul(cameraProjectionFromTangents(...),
   // cameraViewFromPose(...)) for per-eye VR views). The target format must be
   // the `colourFormat` passed to initExternal.
-  bool drawToView(VkImageView target, VkImage targetImage, Mat4 const& viewProj, Vec3 cameraPos,
+  bool drawToView(VkImageView target, VkImage targetImage, Mat4 const& view,
+                  Mat4 const& viewProj, Vec3 cameraPos,
                   std::vector<DrawItem> const& items,
                   std::vector<RendererVertex> const& depthLines,
                   std::vector<RendererVertex> const& overlayLines);

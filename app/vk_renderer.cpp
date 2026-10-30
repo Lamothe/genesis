@@ -1,5 +1,9 @@
 #include "vk_renderer.h"
 
+#include "triangle_sort.h"
+
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -65,6 +69,27 @@ static_assert(sizeof(PushData) == 112, "push constants must match the shader lay
 
 } // namespace
 
+// The blend sort re-runs only when the view moves past this (about 0.2
+// degrees of rotation or 4 mm of translation in view terms): closer views
+// give the same visible triangle order, and head-tracking jitter is smaller.
+// The bound is on the matrix, so the effective depth error scales with the
+// mesh's position-sum magnitudes: for huge meshes far from the origin the
+// safe band is proportionally narrower.
+constexpr float kSortReuseEpsilon = 0.004F;
+
+inline bool matricesEqual(Mat4 const& a, Mat4 const& b) {
+  return std::memcmp(a.m, b.m, sizeof(a.m)) == 0;
+}
+
+inline bool matricesClose(Mat4 const& a, Mat4 const& b, float epsilon) {
+  for (std::size_t i = 0; i < 16U; ++i) {
+    if (std::fabs(a.m[i] - b.m[i]) > epsilon) {
+      return false;
+    }
+  }
+  return true;
+}
+
 struct VkRenderer::Impl {
   struct MeshRecord {
     VkBuffer vertexBuffer{VK_NULL_HANDLE};
@@ -72,6 +97,12 @@ struct VkRenderer::Impl {
     VkBuffer indexBuffer{VK_NULL_HANDLE};
     VkDeviceMemory indexMemory{VK_NULL_HANDLE};
     std::uint32_t indexCount{0};
+    // CPU-side source data for the per-view blend sort (see recordCommands):
+    // per-triangle position sums (the depth key), the source indices (the
+    // rewrite input) and the mesh-space bounds centre (the item-ordering key).
+    std::vector<Vec3> triPosSums;
+    std::vector<std::uint32_t> indices;
+    Vec3 boundsCentre{0.0F, 0.0F, 0.0F};
   };
 
   // Backdrop void colour (setClearColour).
@@ -571,7 +602,9 @@ struct VkRenderer::Impl {
                       std::size_t overlayLineCount,
                       VkImageView colourViewUsed,
                       VkImage colourImageUsed,
-                      Target target) {
+                      Target target,
+                      Mat4 const& sortView,
+                      Vec3 const& sortCamPos) {
     VkCommandBufferBeginInfo beginInfo =
         vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -640,16 +673,181 @@ struct VkRenderer::Impl {
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
                             &descriptorSet, 0, nullptr);
 
-    // Meshes: one indexed draw per item (opaque first, blends last — the app
-    // orders items; the pipeline follows the item's alpha mode).
-    for (DrawItem const& item : items) {
+    // Draw order: opaque/mask items keep the app's order; blend items draw
+    // farthest-centre-first with a stable tie-break — the Centre Stage rule
+    // ("hair shells painted over strands unsorted"). Per view, so both eyes
+    // sort for their own camera. Within a blend item the same rule applies
+    // per triangle (see sortTrianglesBackToFront).
+    std::vector<std::size_t> order(items.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      order[i] = i;
+    }
+    std::vector<float> centreDist2(items.size(), 0.0F);
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      DrawItem const& item = items[i];
+      if (item.alpha != AlphaMode::Blend) {
+        continue;
+      }
+      std::size_t const centreHandle = item.mesh < meshes.size() ? item.mesh : 0U;
+      Vec3 const b = meshes[centreHandle].boundsCentre;
+      Vec3 const c{item.model.m[0] * b.x + item.model.m[4] * b.y + item.model.m[8] * b.z +
+                       item.model.m[12],
+                   item.model.m[1] * b.x + item.model.m[5] * b.y + item.model.m[9] * b.z +
+                       item.model.m[13],
+                   item.model.m[2] * b.x + item.model.m[6] * b.y + item.model.m[10] * b.z +
+                       item.model.m[14]};
+      Vec3 const d = c - sortCamPos;
+      centreDist2[i] = d.x * d.x + d.y * d.y + d.z * d.z;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+      bool const aBlend = items[a].alpha == AlphaMode::Blend;
+      bool const bBlend = items[b].alpha == AlphaMode::Blend;
+      if (aBlend != bBlend) {
+        return !aBlend; // non-blend first
+      }
+      if (!aBlend) {
+        return false; // non-blend items keep the app's order
+      }
+      return centreDist2[a] > centreDist2[b]; // blend: farthest centre first
+    });
+
+    // Per-triangle back-to-front rewrite of each blend item's indices, uploaded
+    // through one transient staging buffer into per-blend-ordinal DEVICE_LOCAL
+    // slots before any blend draw (one transfer->index barrier covers the
+    // batch).
+    std::size_t blendCount = 0;
+    VkDeviceSize stagingBytes = 0;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      if (items[i].alpha != AlphaMode::Blend) {
+        continue;
+      }
+      ++blendCount;
+      std::size_t const countHandle = items[i].mesh < meshes.size() ? items[i].mesh : 0U;
+      stagingBytes += sizeof(std::uint32_t) * meshes[countHandle].indices.size();
+    }
+    if (blendScratch.size() < blendCount) {
+      blendScratch.resize(blendCount);
+    }
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    void* stagingMapped = nullptr;
+    bool sortActive = blendCount > 0 && stagingBytes > 0;
+    if (sortActive) {
+      sortActive = createBuffer(stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                stagingBuffer, stagingMemory, &stagingMapped);
+    }
+    VkDeviceSize stagingOffset = 0;
+    std::size_t blendSlot = 0;
+    if (sortActive) {
+      auto* staging = static_cast<std::uint8_t*>(stagingMapped);
+      for (std::size_t oi = 0; oi < order.size() && sortActive; ++oi) {
+        DrawItem const& item = items[order[oi]];
+        if (item.alpha != AlphaMode::Blend) {
+          continue;
+        }
+        std::size_t const handle = item.mesh < meshes.size() ? item.mesh : 0U;
+        MeshRecord const& record = meshes[handle];
+        BlendScratch& slot = blendScratch[blendSlot];
+        VkDeviceSize const bytes = sizeof(std::uint32_t) * record.indices.size();
+        std::size_t const triCount = record.indices.size() / 3U;
+        if (record.triPosSums.empty() || record.indices.empty() ||
+            record.indices.size() % 3U != 0U || record.triPosSums.size() != triCount) {
+          sortActive = false; // unsortable: draws fall back to index order
+          break;
+        }
+        // Triangle depth sums through the draw's exact chain (view * model):
+        // the sum of a triangle's three view-space depths equals row 2 of the
+        // composed matrix dotted with the precomputed triangle position sum,
+        // plus three times the row's translation (column-major).
+        Mat4 const vm = mul(sortView, item.model);
+        bool const reuse = slot.hasSort && slot.indexBuffer != VK_NULL_HANDLE &&
+                           slot.capacity >= bytes && slot.lastMesh == static_cast<MeshHandle>(handle) &&
+                           matricesEqual(slot.lastModel, item.model) &&
+                           matricesClose(slot.lastView, vm, kSortReuseEpsilon);
+        if (reuse) {
+          // Head jitter: the previous order still applies and the scratch
+          // already holds it on the GPU — nothing to recompute or re-upload.
+          ++blendSlot;
+          continue;
+        }
+        if (slot.capacity < bytes) {
+          freeLater(slot.indexBuffer, slot.indexMemory);
+          slot.indexBuffer = VK_NULL_HANDLE;
+          slot.indexMemory = VK_NULL_HANDLE;
+          slot.capacity = 0;
+          slot.hasSort = false; // the buffer its state described is gone
+          if (!createBuffer(bytes,
+                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, slot.indexBuffer,
+                            slot.indexMemory, nullptr)) {
+            sortActive = false;
+            break;
+          }
+          slot.capacity = bytes;
+        }
+        blendDepths.resize(triCount);
+        float const rx = vm.m[2];
+        float const ry = vm.m[6];
+        float const rz = vm.m[10];
+        float const rw = 3.0F * vm.m[14];
+        for (std::size_t t = 0; t < triCount; ++t) {
+          Vec3 const& sum = record.triPosSums[t];
+          blendDepths[t] = rx * sum.x + ry * sum.y + rz * sum.z + rw;
+        }
+        blendSorted.resize(record.indices.size());
+        blendKeys.resize(2U * triCount);
+        sortTrianglesBackToFrontSums(blendDepths.data(), record.indices.data(),
+                                     static_cast<std::uint32_t>(triCount), blendSorted.data(),
+                                     blendKeys.data());
+        std::memcpy(staging + stagingOffset, blendSorted.data(),
+                    static_cast<std::size_t>(bytes));
+        VkBufferCopy copy{stagingOffset, 0, bytes};
+        vkCmdCopyBuffer(command, stagingBuffer, slot.indexBuffer, 1, &copy);
+        stagingOffset += bytes;
+        slot.hasSort = true;
+        slot.lastMesh = static_cast<MeshHandle>(handle);
+        slot.lastModel = item.model;
+        slot.lastView = vm;
+        ++blendSlot;
+      }
+    }
+    if (stagingOffset > 0) {
+      // Recorded copies must become visible to the index reads of the draws
+      // below (and of any later deadband reuse) — regardless of whether the
+      // draws this frame end up reading the sorted buffers or falling back.
+      VkMemoryBarrier2 toIndex = vkStruct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+      toIndex.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      toIndex.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      toIndex.dstStageMask = VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
+      toIndex.dstAccessMask = VK_ACCESS_2_INDEX_READ_BIT;
+      VkDependencyInfo sortDependency =
+          vkStruct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+      sortDependency.memoryBarrierCount = 1;
+      sortDependency.pMemoryBarriers = &toIndex;
+      vkCmdPipelineBarrier2(command, &sortDependency);
+    }
+    if (stagingBuffer != VK_NULL_HANDLE) {
+      freeLater(stagingBuffer, stagingMemory); // read this frame; freed after the fence wait
+    }
+
+    // Meshes: one indexed draw per item in the computed order (opaque+mask
+    // first, blends last; blend draws read their per-view sorted indices).
+    std::size_t drawBlendSlot = 0;
+    for (std::size_t oi = 0; oi < order.size(); ++oi) {
+      DrawItem const& item = items[order[oi]];
       std::size_t handle = item.mesh < meshes.size() ? item.mesh : 0U;
       MeshRecord const& record = meshes[handle];
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
                         item.alpha == AlphaMode::Blend ? blendPipeline : meshPipeline);
       VkDeviceSize zero = 0;
       vkCmdBindVertexBuffers(command, 0, 1, &record.vertexBuffer, &zero);
-      vkCmdBindIndexBuffer(command, record.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+      VkBuffer indexUsed = record.indexBuffer;
+      if (sortActive && item.alpha == AlphaMode::Blend) {
+        indexUsed = blendScratch[drawBlendSlot++].indexBuffer;
+      }
+      vkCmdBindIndexBuffer(command, indexUsed, 0, VK_INDEX_TYPE_UINT32);
       PushData push{};
       std::memcpy(push.model, item.model.m, sizeof(float) * 16U);
       push.tint[0] = item.colour.x;
@@ -739,7 +937,14 @@ struct VkRenderer::Impl {
                              readbackBuffer, 1, &copy);
     }
 
-    VK_CHECK(vkEndCommandBuffer(command));
+    if (!checkVk(vkEndCommandBuffer(command), "vkEndCommandBuffer")) {
+      // The recorded copies may never execute: the slot state must not claim
+      // sorted contents a later deadband reuse could bind (see the submit).
+      for (BlendScratch& slot : blendScratch) {
+        slot.hasSort = false;
+      }
+      return false;
+    }
 
     VkSubmitInfo submit = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
     VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -754,7 +959,12 @@ struct VkRenderer::Impl {
     submit.pCommandBuffers = &command;
     // Reset immediately before submit: any earlier failure leaves the fence
     // signalled, so a failed or skipped frame can never deadlock the next one.
-    VK_CHECK(vkResetFences(device, 1, &fence));
+    if (!checkVk(vkResetFences(device, 1, &fence), "vkResetFences")) {
+      for (BlendScratch& slot : blendScratch) {
+        slot.hasSort = false;
+      }
+      return false;
+    }
     VkResult submitResult = vkQueueSubmit(queue, 1, &submit, fence);
     if (submitResult != VK_SUCCESS) {
       // A failed submit leaves the fence unsignalled forever: recreate it
@@ -764,12 +974,58 @@ struct VkRenderer::Impl {
       freshInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
       fence = VK_NULL_HANDLE;
       vkCreateFence(device, &freshInfo, nullptr, &fence);
+      // The copies may not have executed: never leave slots claiming sorted
+      // contents — a later deadband reuse would bind stale indices.
+      for (BlendScratch& slot : blendScratch) {
+        slot.hasSort = false;
+      }
       return checkVk(submitResult, "vkQueueSubmit");
     }
     return true;
   }
 
   std::vector<DrawItem> items; // set by draw() before recordCommands()
+
+  // Per-view blend sort scratch (see recordCommands). Sorted indices upload
+  // through a transient staging buffer into DEVICE_LOCAL slots — persistent
+  // HOST_VISIBLE mesh memory triggers the NPOT texture driver bug (see
+  // addMesh). One slot per blend item of the current draw, reused only after
+  // the entry fence wait, so nothing in flight is ever rewritten.
+  struct BlendScratch {
+    VkBuffer indexBuffer{VK_NULL_HANDLE};
+    VkDeviceMemory indexMemory{VK_NULL_HANDLE};
+    VkDeviceSize capacity{0};
+    // What the buffer currently holds: the sorted indices of `lastMesh` under
+    // `lastModel` * `lastView`. Reused unchanged when the new view is within
+    // kSortReuseEpsilon (head jitter), so a still frame costs nothing.
+    MeshHandle lastMesh{UINT32_MAX};
+    Mat4 lastModel{};
+    Mat4 lastView{};
+    bool hasSort{false};
+  };
+  std::vector<BlendScratch> blendScratch;
+  std::vector<std::pair<VkBuffer, VkDeviceMemory>> pendingFree; // flushed after the fence wait
+  std::vector<float> blendDepths;         // CPU scratch: per-triangle depth sums
+  std::vector<std::uint64_t> blendKeys;   // CPU scratch: sort keys
+  std::vector<std::uint32_t> blendSorted; // CPU scratch: sorted indices
+
+  void freeLater(VkBuffer buffer, VkDeviceMemory memory) {
+    if (buffer != VK_NULL_HANDLE || memory != VK_NULL_HANDLE) {
+      pendingFree.emplace_back(buffer, memory);
+    }
+  }
+
+  void flushFrees() {
+    for (auto const& [buffer, memory] : pendingFree) {
+      if (buffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device, buffer, nullptr);
+      }
+      if (memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, memory, nullptr);
+      }
+    }
+    pendingFree.clear();
+  }
 };
 
 VkRenderer::VkRenderer() : impl_(std::make_unique<Impl>()) {}
@@ -1108,6 +1364,16 @@ void VkRenderer::shutdown() {
     return;
   }
   vkDeviceWaitIdle(g.device);
+  g.flushFrees();
+  for (Impl::BlendScratch& slot : g.blendScratch) {
+    if (slot.indexBuffer != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, slot.indexBuffer, nullptr);
+    }
+    if (slot.indexMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, slot.indexMemory, nullptr);
+    }
+  }
+  g.blendScratch.clear();
   for (VkPipeline pipeline :
        {g.meshPipeline, g.blendPipeline, g.lineDepthPipeline, g.lineOverlayPipeline}) {
     if (pipeline != VK_NULL_HANDLE) {
@@ -1208,6 +1474,38 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
   vkDeviceWaitIdle(g.device); // buffers may be rewritten between frames
 
   Impl::MeshRecord record{};
+  // CPU-side data for the per-view blend sort, built first so a mesh with
+  // out-of-range indices is rejected before any GPU allocation: per-triangle
+  // position sums (the depth key), the source indices (the rewrite input) and
+  // the mesh-space bounds centre (the item-ordering key).
+  Vec3 bmin = data.vertices.front().pos;
+  Vec3 bmax = bmin;
+  for (MeshVertex const& vertex : data.vertices) {
+    bmin.x = std::min(bmin.x, vertex.pos.x);
+    bmin.y = std::min(bmin.y, vertex.pos.y);
+    bmin.z = std::min(bmin.z, vertex.pos.z);
+    bmax.x = std::max(bmax.x, vertex.pos.x);
+    bmax.y = std::max(bmax.y, vertex.pos.y);
+    bmax.z = std::max(bmax.z, vertex.pos.z);
+  }
+  record.boundsCentre = (bmin + bmax) * 0.5F;
+  record.indices = data.indices;
+  // Validate every index (including any trailing partial triangle) before the
+  // CPU mirror reads through them.
+  for (std::uint32_t const index : data.indices) {
+    if (index >= data.vertices.size()) {
+      std::printf("[vk] mesh index out of range\n");
+      return kInvalidMesh;
+    }
+  }
+  record.triPosSums.resize(data.indices.size() / 3U);
+  for (std::size_t t = 0; t < record.triPosSums.size(); ++t) {
+    Vec3 sum{0.0F, 0.0F, 0.0F};
+    for (std::size_t k = 0; k < 3U; ++k) {
+      sum = sum + data.vertices[data.indices[3U * t + k]].pos;
+    }
+    record.triPosSums[t] = sum;
+  }
   VkDeviceSize vertexBytes = sizeof(MeshVertex) * data.vertices.size();
   VkDeviceSize indexBytes = sizeof(std::uint32_t) * data.indices.size();
 
@@ -1317,7 +1615,7 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
   }
 
   record.indexCount = static_cast<std::uint32_t>(data.indices.size());
-  g.meshes.push_back(record);
+  g.meshes.push_back(std::move(record));
   return static_cast<MeshHandle>(g.meshes.size() - 1U);
 }
 
@@ -1640,6 +1938,7 @@ bool VkRenderer::draw(Camera const& camera,
   }
 
   VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
+  g.flushFrees(); // completed frame: release retired scratch/staging buffers
   if (g.width == 0U || g.height == 0U) {
     return true; // minimised / zero-extent swapchain: nothing to render
   }
@@ -1676,8 +1975,8 @@ bool VkRenderer::draw(Camera const& camera,
   g.items = items;
   Impl::Target target = g.windowed ? Impl::Target::Window : Impl::Target::Readback;
   VkImage colourImageUsed = g.windowed ? g.swapchainImages[g.swapchainIndex] : g.colourImage;
-  if (!g.recordCommands(depthCount, overlayLines.size(), colourViewUsed, colourImageUsed,
-                        target)) {
+  if (!g.recordCommands(depthCount, overlayLines.size(), colourViewUsed, colourImageUsed, target,
+                        cameraView(camera), camera.position)) {
     return false;
   }
 
@@ -1723,8 +2022,9 @@ bool VkRenderer::initExternal(Config const& config, VkInstance instance, VkPhysi
   return true;
 }
 
-bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const& viewProj,
-                            Vec3 cameraPos, std::vector<DrawItem> const& items,
+bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const& view,
+                            Mat4 const& viewProj, Vec3 cameraPos,
+                            std::vector<DrawItem> const& items,
                             std::vector<RendererVertex> const& depthLines,
                             std::vector<RendererVertex> const& overlayLines) {
   Impl& g = *impl_;
@@ -1738,6 +2038,7 @@ bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const&
   }
 
   VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
+  g.flushFrees(); // completed frame: release retired scratch/staging buffers
   std::memcpy(g.uniformMapped, viewProj.m, sizeof(float) * 16U);
   float const camPos[4] = {cameraPos.x, cameraPos.y, cameraPos.z, 1.0F};
   std::memcpy(static_cast<char*>(g.uniformMapped) + sizeof(float) * 16U, camPos,
@@ -1754,7 +2055,7 @@ bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const&
 
   g.items = items;
   if (!g.recordCommands(depthCount, overlayLines.size(), target, targetImage,
-                        Impl::Target::External)) {
+                        Impl::Target::External, view, cameraPos)) {
     return false;
   }
   // The caller releases the swapchain image only after rendering completes.

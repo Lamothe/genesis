@@ -1863,6 +1863,99 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   return 0;
 }
 
+// Blend-order smoke: two overlapping translucent quads must composite
+// identically whether the items arrive near-first or far-first, and whether
+// their triangles share one mesh in the wrong order — the two Centre Stage
+// drawing-order rules (blend items farthest-centre-first with a stable
+// tie-break; back-to-front triangles within a blend mesh), proven through the
+// real pipeline. Wrong input order must produce the SAME pixels as right
+// input order; a missing sort flips the compositing and the bytes differ.
+int runSmokeBlend(char const* shaderDir) {
+  VkRenderer renderer;
+  VkRenderer::Config config;
+  config.windowed = false;
+  config.width = 160;
+  config.height = 120;
+  config.shaderDir = shaderDir;
+  if (!renderer.init(config)) {
+    std::printf("SMOKE FAIL: renderer init\n");
+    return 1;
+  }
+  renderer.setClearColour(0.0F, 0.0F, 0.0F, 1.0F);
+
+  auto quadMesh = [](float z, Vec3 colour) {
+    MeshData mesh;
+    mesh.vertices = {
+        {{-1.0F, -1.0F, z}, {0.0F, 0.0F, 1.0F}, colour, {0.0F, 0.0F}},
+        {{1.0F, -1.0F, z}, {0.0F, 0.0F, 1.0F}, colour, {1.0F, 0.0F}},
+        {{-1.0F, 1.0F, z}, {0.0F, 0.0F, 1.0F}, colour, {0.0F, 1.0F}},
+        {{1.0F, 1.0F, z}, {0.0F, 0.0F, 1.0F}, colour, {1.0F, 1.0F}},
+    };
+    mesh.indices = {0, 1, 2, 2, 1, 3};
+    return mesh;
+  };
+  MeshData const red = quadMesh(-3.0F, {1.0F, 0.0F, 0.0F});
+  MeshData const green = quadMesh(-1.0F, {0.0F, 1.0F, 0.0F});
+  MeshData both;
+  both.vertices = red.vertices;
+  both.vertices.insert(both.vertices.end(), green.vertices.begin(), green.vertices.end());
+  both.indices = {4, 5, 6, 6, 5, 7, 0, 1, 2, 2, 1, 3}; // near quad first: wrong order
+
+  MeshHandle const redHandle = renderer.addMesh(red);
+  MeshHandle const greenHandle = renderer.addMesh(green);
+  MeshHandle const bothHandle = renderer.addMesh(both);
+  if (redHandle == kInvalidMesh || greenHandle == kInvalidMesh || bothHandle == kInvalidMesh) {
+    std::printf("SMOKE FAIL: mesh registration\n");
+    return 1;
+  }
+
+  Camera camera; // default yaw/pitch: looks down -Z at the quads
+  camera.position = {0.0F, 0.0F, 2.0F};
+
+  auto blendItem = [](MeshHandle mesh) {
+    DrawItem item;
+    item.mesh = mesh;
+    item.alpha = AlphaMode::Blend;
+    item.alphaFactor = 0.5F;
+    item.lit = false;
+    return item;
+  };
+  std::vector<RendererVertex> const noLines;
+  std::vector<std::uint8_t> correct;
+  std::vector<std::uint8_t> wrongItems;
+  std::vector<std::uint8_t> wrongTriangles;
+  auto render = [&](std::vector<DrawItem> const& items, std::vector<std::uint8_t>& pixels) {
+    return renderer.draw(camera, items, noLines, noLines) && renderer.readback(pixels);
+  };
+  if (!render({blendItem(redHandle), blendItem(greenHandle)}, correct) ||
+      !render({blendItem(greenHandle), blendItem(redHandle)}, wrongItems) ||
+      !render({blendItem(bothHandle)}, wrongTriangles)) {
+    std::printf("SMOKE FAIL: draw/readback\n");
+    return 1;
+  }
+
+  bool const itemInvariant = correct == wrongItems;
+  bool const triangleInvariant = correct == wrongTriangles;
+  int const centre = (config.height / 2) * config.width + config.width / 2;
+  int const er = correct[static_cast<std::size_t>(centre) * 4U];
+  int const eg = correct[static_cast<std::size_t>(centre) * 4U + 1U];
+  int const eb = correct[static_cast<std::size_t>(centre) * 4U + 2U];
+  // Analytic compositing at the centre: green 0.5 over (red 0.5 over black)
+  // = (0.25, 0.5, 0) -> about (64, 128, 0) in 8-bit.
+  bool const analytic = std::abs(er - 64) <= 8 && std::abs(eg - 128) <= 8 && eb <= 8;
+  writePpm(".build/smoke-blend.ppm", correct, config.width, config.height);
+  std::printf(
+      "SMOKE blend: centre=(%d,%d,%d) item-order-invariant=%s triangle-order-invariant=%s\n", er,
+      eg, eb, itemInvariant ? "yes" : "no", triangleInvariant ? "yes" : "no");
+  if (!itemInvariant || !triangleInvariant || !analytic) {
+    std::printf("SMOKE FAIL (blend ordering)\n");
+    return 1;
+  }
+  std::printf("SMOKE PASS (blend ordering) on %s\n", renderer.deviceName());
+  renderer.shutdown();
+  return 0;
+}
+
 int runSmokeWindow(char const* shaderDir, int frames, std::vector<char const*> const& modelPaths) {
   App app;
   if (modelPaths.empty()) {
@@ -2389,8 +2482,8 @@ int runXr(char const* shaderDir,
       Quat const totalOrient = horizonLock * (cameraOrientation(rig) * input.eyeOrient[eye]);
       Mat4 const view = cameraViewFromPose(eyeWorld, totalOrient);
       Mat4 viewProj = mul(input.eyeProj[eye], view);
-      if (!renderer.drawToView(shell.eyeView(eye), shell.eyeImage(eye), viewProj, eyeWorld, items,
-                               depthLines, overlayLines)) {
+      if (!renderer.drawToView(shell.eyeView(eye), shell.eyeImage(eye), view, viewProj, eyeWorld,
+                               items, depthLines, overlayLines)) {
         std::printf("[xr] eye draw failed\n");
         drew = false;
         break;
@@ -2640,6 +2733,7 @@ int main(int argc, char** argv) {
     Interactive,
     SmokeOffscreen,
     SmokeTextured,
+    SmokeBlend,
     SmokeWindow,
     SmokePerf,
     Xr,
@@ -2661,6 +2755,8 @@ int main(int argc, char** argv) {
       mode = Mode::SmokeOffscreen;
     } else if (std::strcmp(arg, "--smoke-textured") == 0) {
       mode = Mode::SmokeTextured;
+    } else if (std::strcmp(arg, "--smoke-blend") == 0) {
+      mode = Mode::SmokeBlend;
     } else if (std::strcmp(arg, "--smoke-perf") == 0) {
       mode = Mode::SmokePerf;
     } else if (std::strcmp(arg, "--smoke-window") == 0) {
@@ -2690,7 +2786,8 @@ int main(int argc, char** argv) {
       std::printf(
           "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR] [--library DIR]\n"
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
-          "                 --smoke-perf | --smoke-xr | --smoke-window [FRAMES]]\n"
+          "                 --smoke-blend | --smoke-perf | --smoke-xr |\n"
+          "                 --smoke-window [FRAMES]]\n"
           "keys: WASD/QE fly (RMB look), arrows edit: left/right = X (scale in\n"
           "      move mode, spin in rotate), up/down = Y (height / tip),\n"
           "      shift = fine, 1 move / 2 rotate,\n"
@@ -2724,6 +2821,8 @@ int main(int argc, char** argv) {
   switch (mode) {
   case Mode::SmokeOffscreen:
     return runSmokeOffscreen(shaderDir, modelPaths, false);
+  case Mode::SmokeBlend:
+    return runSmokeBlend(shaderDir);
   case Mode::SmokeTextured: {
     // Fixed fixtures written by the test binary (checkerboard GLB + OBJ).
     std::vector<char const*> fixtures{".build/test-textured.glb", ".build/test-texture.obj"};

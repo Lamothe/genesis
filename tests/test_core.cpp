@@ -1,6 +1,7 @@
 // Core tests for the scene-editor maths: vecmath, scene graph, picking, gizmos.
 // Compile and run via run-tests.sh (typed C++ only; no scripting).
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include "obj.h"
 #include "picking.h"
 #include "scene.h"
+#include "triangle_sort.h"
 #include "undo.h"
 #include "vecmath.h"
 
@@ -2481,6 +2483,128 @@ void testXrMath() {
   CHECK_NEAR3(transformPoint(rotated, eye), {0.0F, 0.0F, 0.0F});
 }
 
+// Painter's-algorithm triangle ordering (ported from Centre Stage's
+// TriangleSortTests): the same semantics must hold here because the same
+// hair-card compositing bug lives in this renderer.
+void testTriangleSort() {
+  auto sorted = [](std::vector<float> const& depth, std::vector<std::uint32_t> const& indices) {
+    std::vector<std::uint32_t> out(indices.size());
+    std::vector<std::uint64_t> keys(2U * indices.size() / 3U);
+    sortTrianglesBackToFront(depth.data(), indices.data(),
+                             static_cast<std::uint32_t>(indices.size() / 3U), out.data(),
+                             keys.data());
+    return out;
+  };
+
+  // Triangle 0 in the index list is (3,4,5) at depth -0.5 (near); triangle 1
+  // is (0,1,2) at -2 (far). Index order draws the near one first; the sort
+  // must flip them.
+  {
+    auto const out = sorted({-2.0F, -2.0F, -2.0F, -0.5F, -0.5F, -0.5F}, {3, 4, 5, 0, 1, 2});
+    CHECK(out == std::vector<std::uint32_t>({0, 1, 2, 3, 4, 5}));
+  }
+  // Equal depths must not reorder: stability is what stops coplanar cards
+  // flickering between frames.
+  {
+    auto const out = sorted({-1.0F, -1.0F, -1.0F, -1.0F, -1.0F, -1.0F}, {0, 1, 2, 3, 4, 5});
+    CHECK(out == std::vector<std::uint32_t>({0, 1, 2, 3, 4, 5}));
+  }
+  // Three triangles given near-to-far: output must be far-to-near.
+  {
+    auto const out = sorted({-0.1F, -0.1F, -0.1F, -1.0F, -1.0F, -1.0F, -5.0F, -5.0F, -5.0F},
+                            {0, 1, 2, 3, 4, 5, 6, 7, 8});
+    CHECK(out == std::vector<std::uint32_t>({6, 7, 8, 3, 4, 5, 0, 1, 2}));
+  }
+  // The three indices of a triangle travel together and keep their order.
+  // Triangle (7,8,9) sums to -6, farther than (1,2,3) at -3: it draws first,
+  // and its index order (7,8,9) survives the sort untouched.
+  {
+    std::vector<float> depth(10, -1.0F);
+    depth[7] = depth[8] = depth[9] = -2.0F;
+    auto const out = sorted(depth, {7, 8, 9, 1, 2, 3});
+    CHECK(out == std::vector<std::uint32_t>({7, 8, 9, 1, 2, 3}));
+  }
+  // Triangles with mixed per-vertex depths order by their sum: t0 = -3,
+  // t1 = -9 (farthest), t2 = -6.
+  {
+    auto const out = sorted({-1.0F, -1.0F, -1.0F, -3.0F, -3.0F, -3.0F, -2.0F, -2.0F, -2.0F},
+                            {0, 1, 2, 3, 4, 5, 6, 7, 8});
+    CHECK(out == std::vector<std::uint32_t>({3, 4, 5, 6, 7, 8, 0, 1, 2}));
+  }
+  // The camera can sit inside the geometry (fly close enough), so some
+  // triangles legitimately have positive view depth. A signed key comparison
+  // would drag them in front of everything — the regression the ulong fix
+  // guards.
+  {
+    auto const out = sorted({2.0F, 2.0F, 2.0F, -1.0F, -1.0F, -1.0F, -5.0F, -5.0F, -5.0F},
+                            {0, 1, 2, 3, 4, 5, 6, 7, 8});
+    CHECK(out == std::vector<std::uint32_t>({6, 7, 8, 3, 4, 5, 0, 1, 2}));
+  }
+  // A single triangle passes through with its winding untouched.
+  {
+    auto const out = sorted({-1.0F, -2.0F, -3.0F}, {2, 0, 1});
+    CHECK(out == std::vector<std::uint32_t>({2, 0, 1}));
+  }
+
+  // The precomputed-sums entry point (per-triangle depth sums) must order
+  // identically to the per-vertex entry point: same depth definition, same
+  // stability, same winding.
+  {
+    auto sortedSums = [](std::vector<float> const& sums,
+                         std::vector<std::uint32_t> const& indices) {
+      std::vector<std::uint32_t> out(indices.size());
+      std::vector<std::uint64_t> keys(2U * indices.size() / 3U);
+      sortTrianglesBackToFrontSums(sums.data(), indices.data(),
+                                   static_cast<std::uint32_t>(indices.size() / 3U), out.data(),
+                                   keys.data());
+      return out;
+    };
+    std::vector<std::uint32_t> const indices = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    // Sums of the mixed-sign case above: t0 = 6, t1 = -3, t2 = -15.
+    CHECK(sortedSums({6.0F, -3.0F, -15.0F}, indices) == sorted({2.0F, 2.0F, 2.0F, -1.0F, -1.0F,
+                                                                -1.0F, -5.0F, -5.0F, -5.0F},
+                                                               indices));
+    // Ties keep original order through this entry point too.
+    CHECK(sortedSums({-3.0F, -3.0F}, {0, 1, 2, 3, 4, 5}) ==
+          std::vector<std::uint32_t>({0, 1, 2, 3, 4, 5}));
+  }
+
+  // A large deterministic case: the radix order must match a reference
+  // stable sort by depth sum (dense exact ties + mixed signs).
+  {
+    std::uint32_t const triCount = 5000;
+    std::vector<float> sums(triCount);
+    std::vector<std::uint32_t> indices(3U * triCount);
+    std::uint32_t state = 12345U;
+    for (std::uint32_t t = 0; t < triCount; ++t) {
+      state = state * 1664525U + 1013904223U;
+      sums[t] = static_cast<float>(static_cast<int>(state % 51U) - 25) * 0.5F;
+      indices[3U * t] = 3U * t;
+      indices[3U * t + 1U] = 3U * t + 1U;
+      indices[3U * t + 2U] = 3U * t + 2U;
+    }
+    std::vector<std::uint32_t> out(3U * triCount);
+    std::vector<std::uint64_t> keys(2U * triCount);
+    sortTrianglesBackToFrontSums(sums.data(), indices.data(), triCount, out.data(), keys.data());
+    std::vector<std::uint32_t> reference(triCount);
+    for (std::uint32_t t = 0; t < triCount; ++t) {
+      reference[t] = t;
+    }
+    std::stable_sort(reference.begin(), reference.end(),
+                     [&](std::uint32_t a, std::uint32_t b) { return sums[a] < sums[b]; });
+    bool same = true;
+    for (std::uint32_t t = 0; t < triCount; ++t) {
+      std::uint32_t const src = 3U * reference[t];
+      if (out[3U * t] != indices[src] || out[3U * t + 1U] != indices[src + 1U] ||
+          out[3U * t + 2U] != indices[src + 2U]) {
+        same = false;
+        break;
+      }
+    }
+    CHECK(same);
+  }
+}
+
 int main() {
   testVecBasics();
   testQuatMatchesMatrix();
@@ -2543,6 +2667,7 @@ int main() {
   testGlbSizeWrapRejected();
   testCarouselRing();
   testObjLoader();
+  testTriangleSort();
 
   std::printf("%d checks, %d failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
