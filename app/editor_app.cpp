@@ -2794,6 +2794,7 @@ int main(int argc, char** argv) {
           "      N model carousel ([ ] cycle, click places), Delete remove,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
           "vr:   trigger select (grip+trigger part), left stick move on the floor,\n"
+          "      hands: right pinch = select, hand aim = pointer (no buttons/sticks),\n"
           "      right stick: X/Y = the mode (menu tap toggles MOVE\n"
           "      scale+height / ROTATE spin+tip), grip = fine,\n"
           "      A model carousel (right stick X cycles, trigger places),\n"

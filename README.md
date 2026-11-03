@@ -73,6 +73,11 @@ part selection marks the part) and the current mode's name shows as
 line-font text floating in front of the camera.
 
 In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
+With hand tracking on (Quest through WiVRn), the hands are pointers: each tracked
+hand draws an aim beam and the **right-hand pinch** is the trigger, so you can
+point and place with bare hands. Controllers keep every button and stick, so
+hands cannot change mode, open the carousel, delete, undo/redo or move the
+selection — pick the controllers up for those.
 Movement and rotation are the **sticks** (controller aim is too jittery for
 accurate placement): the **left stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts

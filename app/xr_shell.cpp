@@ -91,6 +91,10 @@ struct XrShell::ImplData {
   bool redoPending{false};
   bool spawnPending{false};
   bool menuPending{false}; // latched menu press (the tap/hold start)
+  bool handInteraction{false}; // XR_EXT_hand_interaction enabled at instance creation
+  XrPath rightHandPath{XR_NULL_PATH}; // "/user/hand/right" (profile diagnostics)
+  XrPath rightProfile{XR_NULL_PATH};  // last active profile seen for the right hand
+  int profileCheckIn{0};              // frames until the next profile poll
 
   // XR_KHR_vulkan_enable2 entry points.
   PFN_xrCreateVulkanInstanceKHR pfnCreateVulkanInstance{nullptr};
@@ -114,9 +118,31 @@ XrShell::InitResult XrShell::init() {
                XR_MAX_ENGINE_NAME_SIZE - 1);
   instanceInfo.applicationInfo.engineVersion = 1;
   instanceInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-  char const* extensions[] = {"XR_KHR_vulkan_enable2"};
-  instanceInfo.enabledExtensionCount = 1;
-  instanceInfo.enabledExtensionNames = extensions;
+  // Optional input extension: hand tracking. The hand-interaction profile
+  // only exists for an instance that enabled XR_EXT_hand_interaction, so ask
+  // the runtime rather than assuming WiVRn is in front of us.
+  std::vector<char const*> extensions{"XR_KHR_vulkan_enable2"};
+  std::uint32_t availableCount = 0;
+  std::vector<XrExtensionProperties> available;
+  if (XR_SUCCEEDED(xrEnumerateInstanceExtensionProperties(nullptr, 0, &availableCount, nullptr)) &&
+      availableCount > 0) {
+    available.assign(availableCount, xrStruct<XrExtensionProperties>(XR_TYPE_EXTENSION_PROPERTIES));
+    if (XR_FAILED(xrEnumerateInstanceExtensionProperties(nullptr, availableCount, &availableCount,
+                                                         available.data()))) {
+      available.clear(); // unknown extension set: controllers only, never fatal
+    } else {
+      available.resize(availableCount);
+    }
+  }
+  for (XrExtensionProperties const& offered : available) {
+    if (std::strcmp(offered.extensionName, XR_EXT_HAND_INTERACTION_EXTENSION_NAME) == 0) {
+      extensions.push_back(XR_EXT_HAND_INTERACTION_EXTENSION_NAME);
+      xr_->handInteraction = true;
+      break;
+    }
+  }
+  instanceInfo.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
+  instanceInfo.enabledExtensionNames = extensions.data();
 
   XrResult result = xrCreateInstance(&instanceInfo, &xr_->instance);
   if (result == XR_ERROR_RUNTIME_UNAVAILABLE) {
@@ -125,6 +151,11 @@ XrShell::InitResult XrShell::init() {
   }
   if (!xrOk(result, "xrCreateInstance")) {
     return InitResult::Failed;
+  }
+  if (xr_->handInteraction) {
+    std::printf("[xr] hand interaction: enabled (right pinch selects, hand aim is the pointer)\n");
+  } else {
+    std::printf("[xr] hand interaction: not offered by this runtime; controllers only\n");
   }
 
   XrSystemGetInfo systemInfo = xrStruct<XrSystemGetInfo>(XR_TYPE_SYSTEM_GET_INFO);
@@ -363,6 +394,7 @@ bool XrShell::createActions() {
     return false;
   }
   XrPath hands[2] = {leftPath, rightPath};
+  xr_->rightHandPath = rightPath;
 
   auto makeFloat = [&](char const* name, XrAction* out) {
     XrActionCreateInfo info = xrStruct<XrActionCreateInfo>(XR_TYPE_ACTION_CREATE_INFO);
@@ -452,6 +484,20 @@ bool XrShell::createActions() {
         {"/user/hand/right/input/trackpad/click", xr_->undoAction},
         {"/user/hand/left/input/trackpad/click", xr_->redoAction}}},
   };
+  if (xr_->handInteraction) {
+    // Hands: the aim pose for both hands (the drawn pointers), and the right
+    // hand's AIM-ACTIVATE pinch as the select input. aim_activate_ext is the
+    // aim-ray activation gesture (paired with aim/pose); pinch_ext is the
+    // separate manipulation pinch and would be the wrong feel for the
+    // existing trigger-as-select semantics. grasp_ext is the grip. Hands have
+    // no face buttons or sticks, so everything else stays controller-only.
+    bindings.push_back(
+        {"/interaction_profiles/ext/hand_interaction_ext",
+         {{"/user/hand/right/input/aim/pose", xr_->aimAction},
+          {"/user/hand/left/input/aim/pose", xr_->aimAction},
+          {"/user/hand/right/input/aim_activate_ext/value", xr_->triggerAction},
+          {"/user/hand/right/input/grasp_ext/value", xr_->gripAction}}});
+  }
 
   for (Binding const& binding : bindings) {
     XrPath profilePath = XR_NULL_PATH;
@@ -764,6 +810,28 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
     // Head gaze fallback: the same horizon-locked eye pose the view is
     // rendered from, so the drag anchor matches what the user sees.
     input.pointerRay = rayFromPose(xr_->correctedViews[0].pose);
+  }
+
+  // Which input device is actually driving the right hand? A profile change
+  // is the difference between "hands are being tracked" and "the runtime is
+  // ignoring them", so say it once per change instead of leaving it a guess.
+  if (--xr_->profileCheckIn <= 0) {
+    xr_->profileCheckIn = 60; // ~1 s at headset frame rates
+    XrInteractionProfileState profile =
+        xrStruct<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
+    if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_->session, xr_->rightHandPath, &profile)) &&
+        profile.interactionProfile != xr_->rightProfile) {
+      xr_->rightProfile = profile.interactionProfile;
+      char name[XR_MAX_PATH_LENGTH]{};
+      std::uint32_t written = 0;
+      if (profile.interactionProfile == XR_NULL_PATH ||
+          XR_FAILED(xrPathToString(xr_->instance, profile.interactionProfile, sizeof(name), &written,
+                                   name))) {
+        std::printf("[xr] right hand input: none\n");
+      } else {
+        std::printf("[xr] right hand input: %s\n", name);
+      }
+    }
   }
   return true;
 }
