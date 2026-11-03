@@ -465,7 +465,7 @@ bool XrShell::createActions() {
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
         {"/user/hand/left/input/aim/pose", xr_->aimAction},
         // Undo/redo/spawn on the face buttons. Thumbstick clicks are
-        // deliberately UNBOUND (the user's binding): the mode toggle is the
+        // deliberately UNBOUND (the user's binding): the carousel is the
         // left menu button's TAP. A = spawn, X (held) = delete.
         {"/user/hand/right/input/b/click", xr_->undoAction},
         {"/user/hand/left/input/y/click", xr_->redoAction},
@@ -734,9 +734,10 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
     stats_.rightYMax = std::max(stats_.rightYMax, std::abs(input.rightStick.y));
   }
 
-  // The mode/backdrop button is the LEFT controller's menu only (the user's
-  // binding). The press edge is LATCHED like undo/redo so a skipped frame
-  // cannot swallow a tap; the held state stays raw for the tap/hold split.
+  // The carousel/backdrop button is the LEFT controller's menu only (the
+  // user's binding). The press edge is LATCHED like undo/redo so a skipped
+  // frame cannot swallow a tap; the held state stays raw for the tap/hold
+  // split.
   XrActionStateBoolean menuLeft = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
   getInfo.action = xr_->menuAction;
   getInfo.subactionPath = leftPath;

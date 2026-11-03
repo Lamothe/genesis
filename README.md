@@ -76,27 +76,25 @@ In VR the trigger only *selects* — whole model, or a single part with grip+tri
 With hand tracking on (Quest through WiVRn), the hands are pointers: each tracked
 hand draws an aim beam and the **right-hand pinch** is the trigger, so you can
 point and place with bare hands. Controllers keep every button and stick, so
-hands cannot change mode, open the carousel, delete, undo/redo or move the
+hands cannot open the carousel, delete, undo/redo or move the
 selection — pick the controllers up for those.
-Movement and rotation are the **sticks** (controller aim is too jittery for
+Movement and editing are the **sticks** (controller aim is too jittery for
 accurate placement): the **left stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
-off the floor) in **both** modes, and the **right stick is mode-driven** — the
-left controller's **menu tap** toggles the two modes (**menu hold** toggles
-the backdrop; thumbstick clicks do nothing): **MOVE** (X = uniform scale,
-right = bigger; Y = height, up = lift) and **ROTATE** (X spins the model
-about the scene's up axis — stick right sweeps the face toward your right —
-Y tips the top away / lifts the face, "the model rotates in the direction of
-the stick"). Nothing
-rotates outside ROTATE. The rotation axes are strictly the VIEWER's — the
-scene's vertical and the left-right line through your eye, always
-perpendicular and level; they, the rate and the pivot are latched per
-gesture (turning your head mid-gesture does not steer it). Whole models
-re-rest on the floor after a tip; part selections tip in place. **Grip** held
-runs both sticks at quarter speed for fine control. Each stick gesture is one
+off the floor), and the **right stick** scales it (X, right = bigger) and
+raises it (Y, up = lift). The **left controller's menu** is two controls:
+**tap** = the model carousel, **hold** = the backdrop (thumbstick clicks do
+nothing). The old menu-tap MOVE/ROTATE switch is gone — the modes come back as
+gestures — so nothing rotates in VR for now; the desktop **2** key still
+rotates, strictly around the VIEWER's axes (the scene's vertical and the
+left-right line through your eye, always perpendicular and level, latched per
+gesture: turning your head mid-gesture does not steer it; whole models
+re-rest on the floor after a tip, part selections tip in place). **Grip** held
+runs the sticks at quarter speed for fine control. Each stick gesture is one
 undo step. The bounding box is not a click target: pressing empty space next
 to a model selects nothing. The selection is shown by a thin warm rim; the
-current mode shows as line-font text floating in front of your head. **A**
+current mode shows as line-font text floating in front of your head (a fixed
+**MOVE** in VR until the gestures land). **A** or a **menu tap**
 is the model carousel: a STATIONARY RING of library models around you — the
 centred model is staged at eye height in front of you and the previous/next
 models sit visible at the sides as cheap geometry-only previews (all
@@ -108,7 +106,7 @@ a huge model never blocks the switch; no filenames are shown), and the
 trigger places the centred model at natural size on the floor where your aim
 beam
 meets it — one undo step (undo removes it entirely), and the carousel
-closes. **A** or undo (B) closes without placing. The library folder
+closes. **A**, a **menu tap** or undo (B) closes without placing. The library folder
 (`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
 opens — drop a file in and place it without restarting. **Hold X** to
 delete: the selection ramps red and the delete fires at full charge (0.6 s);

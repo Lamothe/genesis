@@ -173,10 +173,11 @@ struct App {
   // Backdrop = the ground grid + the tinted clear colour. Toggled off
   // ("show the model without the background"), the scene is a plain void.
   bool showBackdrop{false}; // passthrough/void is the default; B or menu-hold adds the grid
-  // Editing mode (menu tap toggles in VR; desktop 1/2). The RIGHT stick is
-  // mode-driven: move = X uniform scale, Y height; rotate = X spins about
-  // the scene's up axis, Y lifts/lowers the face. The LEFT stick is planar
-  // floor-move in BOTH modes; nothing rotates in move.
+  // Editing mode (desktop 1/2 only: the VR menu tap is the carousel now, and
+  // rotation comes back as gestures). The RIGHT stick is mode-driven: move =
+  // X uniform scale, Y height; rotate = X spins about the scene's up axis,
+  // Y lifts/lowers the face. The LEFT stick is planar floor-move in BOTH
+  // modes; nothing rotates in move.
   EditMode mode{EditMode::move};
   bool looking{false};
   bool panning{false};
@@ -222,12 +223,12 @@ struct App {
   // before a new gesture may start, or the same frame's drift would
   // cancel-and-restart and swallow the undo.
   bool stickArmed{true};
-  // Menu tap/hold (VR): a tap toggles the editing mode (MOVE/ROTATE); a hold
-  // toggles the backdrop once at 0.4 s (cancelling the tap). Thumbstick
-  // clicks do nothing (the user's binding).
+  // Menu tap/hold (VR): a tap opens/closes the model carousel; a hold toggles
+  // the backdrop once at 0.4 s (cancelling the tap). Thumbstick clicks do
+  // nothing (the user's binding).
   float menuCharge{0.0F};
   bool menuHoldLatched{false};
-  bool menuTapped{false}; // a pending tap (fires the mode toggle on release)
+  bool menuTapped{false}; // a pending tap (fires the carousel on release)
   bool menuPrevHeld{false};
   // Hold-X delete (VR): the selection's tint ramps red over kDeleteChargeS
   // and the delete fires at full charge; release before that cancels.
@@ -2191,10 +2192,12 @@ int runXr(char const* shaderDir,
     // at the user's request ("I can now move in the real world"). Grip is the
     // fine-control modifier.
 
-    // Mode switching is the left controller's MENU TAP (the user's binding);
-    // thumbstick clicks do NOTHING. The tap fires on release so a hold can be
-    // told apart from a tap: the menu button is tap = MOVE/ROTATE toggle,
-    // hold (0.4 s) = backdrop toggle (the tap is cancelled by the hold).
+    // The left controller's MENU carries two controls (the user's binding):
+    // TAP = the model carousel (open/close, the same rule as A), HOLD (0.4 s)
+    // = backdrop toggle. The tap fires on release so a hold can be told apart
+    // from a tap (the hold cancels the tap); thumbstick clicks do NOTHING.
+    // The tap used to switch MOVE/ROTATE — that comes back as gestures.
+    bool carouselToggled = false;
     if (input.menuPressed || (input.menuHeld && !app.menuPrevHeld)) {
       // The app-side rising edge backs up the shell's edge: a press swallowed
       // by a skipped frame must still initialise the tap/hold state, or a
@@ -2213,8 +2216,17 @@ int runXr(char const* shaderDir,
       }
     } else if (app.menuTapped) {
       app.menuTapped = false;
-      app.mode = app.mode == EditMode::move ? EditMode::rotate : EditMode::move;
-      endEdits(app);
+      // Same open/close rule as A (galleryOpen ends any live stick gesture).
+      if (app.galleryActive) {
+        galleryClose(app);
+      } else {
+        galleryOpen(app, renderer);
+      }
+      // The stick that was cycling the ring is still deflected: it must
+      // re-centre before it can start a scale/height gesture on the model the
+      // close just revealed (this frame's stick block runs after this one).
+      app.stickArmed = false;
+      carouselToggled = true;
     }
     bool cancelledLiveEdit = false;
     if (input.undoPressed) {
@@ -2306,7 +2318,8 @@ int runXr(char const* shaderDir,
     float const leftX = stickValue(input.leftStick.x);
     float const leftY = stickValue(input.leftStick.y);
     // The LEFT stick moves (X/Z) in both modes. The RIGHT stick is
-    // mode-driven (menu tap toggles): MOVE = X uniform scale, Y height;
+    // mode-driven (desktop 1/2 only — VR has no switch until the gestures
+    // land): MOVE = X uniform scale, Y height;
     // ROTATE = X spins about the scene's up axis, Y tips the top away ("the
     // model should rotate in the direction of the stick").
     bool const sticksActive = std::fabs(input.rightStick.x) > stickThreshold ||
@@ -2436,7 +2449,7 @@ int runXr(char const* shaderDir,
     // the old "grip+A cancels" chord silently swallowed EVERY press (the
     // reported "nothing appears when I press A"). Cancelling is undo (B) — a
     // single, stable button the user already has.
-    if (input.spawnPressed) {
+    if (input.spawnPressed && !carouselToggled) {
       if (app.galleryActive) {
         galleryClose(app);
       } else {
@@ -2795,10 +2808,10 @@ int main(int argc, char** argv) {
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
           "vr:   trigger select (grip+trigger part), left stick move on the floor,\n"
           "      hands: right pinch = select, hand aim = pointer (no buttons/sticks),\n"
-          "      right stick: X/Y = the mode (menu tap toggles MOVE\n"
-          "      scale+height / ROTATE spin+tip), grip = fine,\n"
-          "      A model carousel (right stick X cycles, trigger places),\n"
-          "      hold X delete, B/Y undo/redo, menu hold = backdrop\n");
+          "      right stick: scale (X) and height (Y), grip = fine,\n"
+          "      A or menu tap = model carousel (right stick X cycles,\n"
+          "      trigger places), hold X delete, B/Y undo/redo,\n"
+          "      menu hold = backdrop\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);

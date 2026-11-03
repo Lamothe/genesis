@@ -36,7 +36,8 @@ struct NodeVisual {
 // so a plain click selects the whole model and a secondary click (shift/
 // ctrl, or grip+trigger in VR) selects a single part. Group 0 = ungrouped.
 
-// The editor's two input modes (a menu tap toggles them in VR, desktop 1/2):
+// The editor's two input modes (desktop 1/2; VR's switch is pending — the
+// menu tap now opens the carousel and gestures will choose the mode):
 // move = the RIGHT stick scales (X) and changes height (Y); rotate = it
 // spins about the scene's up axis (X) and tips the top away (Y) — strictly
 // around the VIEWER's axes. NOTHING rotates outside rotate — that rule
