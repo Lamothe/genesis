@@ -85,4 +85,15 @@ CarouselRing::SlotPose CarouselRing::slotPose(int i, Vec3 const& eye, Vec3 const
   return SlotPose{position, yaw};
 }
 
+CarouselRing::SlotPose CarouselRing::labelPose(int i, Vec3 const& eye, Vec3 const& forward,
+                                               float halfHeight, float gap) const {
+  // The label belongs to its own slot: same horizontal position and the same
+  // facing as the model, hung below the visible geometry. halfHeight comes
+  // from the fitted preview, so a squat model's label sits close under it and
+  // a tall one's does not collide with the floor ring.
+  SlotPose const model = slotPose(i, eye, forward);
+  float const drop = (halfHeight > 0.0F ? halfHeight : 0.0F) + (gap > 0.0F ? gap : 0.0F);
+  return SlotPose{Vec3{model.position.x, model.position.y - drop, model.position.z}, model.yaw};
+}
+
 } // namespace vredit

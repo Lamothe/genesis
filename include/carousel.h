@@ -44,6 +44,15 @@ struct CarouselRing {
     float yaw;
   };
   SlotPose slotPose(int i, Vec3 const& eye, Vec3 const& forward) const;
+
+  // Where slot `i`'s name label hangs: centred on the slot's horizontal
+  // position, `halfHeight` below it (the preview's own vertical half-extent,
+  // so the text clears the model's feet rather than a fixed gap under a
+  // nominal box), facing the viewer with the same yaw as the model. Naming
+  // each preview is what makes "which model is this" answerable without
+  // placing it.
+  SlotPose labelPose(int i, Vec3 const& eye, Vec3 const& forward, float halfHeight,
+                     float gap) const;
 };
 
 } // namespace vredit

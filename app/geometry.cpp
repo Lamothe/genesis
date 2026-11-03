@@ -258,10 +258,43 @@ constexpr LineGlyph kGlyphs[] = {
     {'_', 1, {{0.05F, -0.12F, 0.57F, -0.12F}}},
 };
 
+// Latin-1 letters with diacritics fold to their base letter: the stroke font
+// has no accents, and a dropped letter would make a name unreadable.
+char foldAccent(unsigned char c) {
+  switch (c) {
+    case 0xC0: case 0xC1: case 0xC2: case 0xC3: case 0xC4: case 0xC5:
+    case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5:
+      return 'A';
+    case 0xC7: case 0xE7:
+      return 'C';
+    case 0xC8: case 0xC9: case 0xCA: case 0xCB:
+    case 0xE8: case 0xE9: case 0xEA: case 0xEB:
+      return 'E';
+    case 0xCC: case 0xCD: case 0xCE: case 0xCF:
+    case 0xEC: case 0xED: case 0xEE: case 0xEF:
+      return 'I';
+    case 0xD1: case 0xF1:
+      return 'N';
+    case 0xD2: case 0xD3: case 0xD4: case 0xD5: case 0xD6: case 0xD8:
+    case 0xF2: case 0xF3: case 0xF4: case 0xF5: case 0xF6: case 0xF8:
+      return 'O';
+    case 0xD9: case 0xDA: case 0xDB: case 0xDC:
+    case 0xF9: case 0xFA: case 0xFB: case 0xFC:
+      return 'U';
+    case 0xDD: case 0xFD: case 0xFF:
+      return 'Y';
+    default:
+      return static_cast<char>(c);
+  }
+}
+
 LineGlyph const* findGlyph(char c) {
+  // Names are ASCII apart from the odd accented letter ("Mégane_Blender"):
+  // fold those to their base letter so a name never renders with a hole.
   char const u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  char const base = foldAccent(static_cast<unsigned char>(u));
   for (auto const& g : kGlyphs) {
-    if (g.c == u) {
+    if (g.c == base) {
       return &g;
     }
   }
@@ -290,6 +323,13 @@ void appendTextLines(std::vector<RendererVertex>& out, std::string_view text, Ma
     }
     pen += 0.72F * height;
   }
+}
+
+float textLineWidth(std::string_view text, float height) {
+  // Every character — drawn or not — advances exactly one 0.72 cell, so the
+  // width is the character count times that step. Keeping the step in one
+  // place is why callers can centre text exactly rather than by eye.
+  return static_cast<float>(text.size()) * 0.72F * height;
 }
 
 } // namespace vredit

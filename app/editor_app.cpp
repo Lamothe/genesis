@@ -127,10 +127,19 @@ struct CarouselSlot {
   vredit::NodeId wrapper{vredit::kInvalidNode};
   float fit{1.0F};
   Vec3 centre{0.0F, 0.0F, 0.0F}; // model bounds centre before fitting
+  float halfHeight{0.0F};        // fitted vertical half-extent: the label hangs below it
 };
 
 constexpr std::size_t kSlotCount = 5; // centre ± 2
 constexpr float kPreviewExtent = 0.6F;
+
+// Carousel labels: each staged preview is NAMED underneath, so "which model is
+// this" is answerable from the ring without placing it. The name is fitted
+// into kLabelMaxWidth so the longest entries ("..._DIAMOND_EARRINGS") cannot
+// run into their neighbours a slot away.
+constexpr float kLabelHeight = 0.05F;
+constexpr float kLabelMaxWidth = 0.8F;
+constexpr float kLabelGap = 0.035F;
 
 // ---- GPU mesh cache (content-keyed) ----
 // The renderer has no removal API, so re-staging the same model (preview and
@@ -849,6 +858,7 @@ bool slotAttach(App& app, VkRenderer& renderer, CarouselSlot& slot, Model const&
       slot.fit = kPreviewExtent / extent;
     }
     slot.centre = (bounds.min + bounds.max) * 0.5F;
+    slot.halfHeight = size.y * 0.5F * slot.fit;
   }
   slot.hasModel = true;
   return true;
@@ -1233,9 +1243,8 @@ void assembleFrame(App& app,
   }
   // The mode HUD: the current mode's name in the line font, view-locked in
   // front of the camera/head (XR passes the head pose; desktop uses the
-  // camera), so "which mode is this" is readable in the headset. No
-  // filenames: the user said "I really don't need the file name in the
-  // carousel".
+  // camera), so "which mode is this" is readable in the headset. The carousel
+  // names the MODELS instead (see below), so the mode text is hidden there.
   std::string hudText = app.mode == EditMode::move ? "MOVE" : "ROTATE";
   // No HUD over the carousel ("You still have the words MOVE in the
   // carousel"): the mode text is only for normal editing.
@@ -1247,6 +1256,42 @@ void assembleFrame(App& app,
     Vec3 const hudAt = hudEye + hudFwd * 0.55F + hudUp * 0.17F;
     appendTextLines(overlayLines, hudText, trs(hudAt, hudFace, Vec3{1.0F, 1.0F, 1.0F}),
                     0.028F, Vec3{1.0F, 0.85F, 0.4F});
+  }
+  // The carousel's model names: one label per staged preview, centred on its
+  // slot, hung just below the model's own feet (slot.halfHeight, not a fixed
+  // box) and facing the viewer with the model. The centred slot is brighter,
+  // so "the name in front of me" is unambiguous. Never drawn for a slot that
+  // failed to load — there is nothing above the text to name.
+  if (app.galleryActive) {
+    for (CarouselSlot const& slot : app.carousel) {
+      if (!slot.hasModel || slot.index < 0 ||
+          static_cast<std::size_t>(slot.index) >= app.galleryFiles.size()) {
+        continue;
+      }
+      std::string const name =
+          std::filesystem::path(app.galleryFiles[static_cast<std::size_t>(slot.index)])
+              .stem()
+              .string();
+      if (name.empty()) {
+        continue;
+      }
+      vredit::CarouselRing::SlotPose const label = app.ring.labelPose(
+          slot.index, app.ringOrigin, app.ringForward, slot.halfHeight, kLabelGap);
+      // Long names shrink to fit the slot's width; short ones keep full size.
+      float height = kLabelHeight;
+      float const unitWidth = textLineWidth(name, 1.0F);
+      if (unitWidth > 0.0F && unitWidth * height > kLabelMaxWidth) {
+        height = kLabelMaxWidth / unitWidth;
+      }
+      Quat const face = quatFromAxisAngle(Vec3{0.0F, 1.0F, 0.0F}, label.yaw);
+      // Centre the run: local +X is the viewer's right for this facing, so the
+      // origin shifts half a width left and the pen starts at zero.
+      Vec3 const right = rotate(face, Vec3{1.0F, 0.0F, 0.0F});
+      Vec3 const at = label.position - right * (0.5F * textLineWidth(name, height));
+      bool const centred = slot.index == app.ring.index;
+      Vec3 const colour = centred ? Vec3{1.0F, 0.95F, 0.82F} : Vec3{0.62F, 0.68F, 0.78F};
+      appendTextLines(overlayLines, name, trs(at, face, Vec3{1.0F, 1.0F, 1.0F}), height, colour);
+    }
   }
 }
 
@@ -1817,6 +1862,99 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   if (!app.galleryActive || staged() == 0 || app.visuals.size() <= baseVisuals) {
     std::printf("SMOKE FAIL: carousel staged nothing\n");
     return 1;
+  }
+  // EVERY PREVIEW IS NAMED. With the gallery open the overlay line list holds
+  // nothing but the model labels (the mode HUD is suppressed there), so this
+  // is a direct check of the production path: the labels exist, they sit
+  // BELOW the previews they belong to (never over the models), and each one is
+  // centred on its own slot rather than all stacking in the middle. Then the
+  // frame is rendered so the placement is visible, not merely numbered.
+  {
+    items.clear();
+    depthLines.clear();
+    overlayLines.clear();
+    assembleFrame(app, items, depthLines, overlayLines);
+    int const labelVerts = static_cast<int>(overlayLines.size());
+    if (labelVerts < 4 * staged()) {
+      std::printf("SMOKE FAIL: carousel labels missing (%d vertices for %d slots)\n",
+                  labelVerts, staged());
+      return 1;
+    }
+    float minY = 1e9F;
+    float maxY = -1e9F;
+    float minX = 1e9F;
+    float maxX = -1e9F;
+    for (RendererVertex const& v : overlayLines) {
+      minY = std::fmin(minY, v.pos.y);
+      maxY = std::fmax(maxY, v.pos.y);
+      minX = std::fmin(minX, v.pos.x);
+      maxX = std::fmax(maxX, v.pos.x);
+    }
+    // The label BASELINE hangs below its preview; the glyphs themselves rise
+    // one cap height from it, so a flat fixture can put its text top a few
+    // centimetres above the preview's own centre. The band below allows that
+    // while still catching a label drifting up over the models or to the ring
+    // centre.
+    if (maxY > hudPos.y + 0.1F || minY < hudPos.y - 1.0F || minX < -1.4F || maxX > 1.4F ||
+        maxX - minX < 0.4F) {
+      std::printf("SMOKE FAIL: carousel label placement out of range "
+                  "(x %.2f..%.2f, y %.2f..%.2f)\n",
+                  minX, maxX, minY, maxY);
+      return 1;
+    }
+    // EVERY PREVIEW IS FITTED THE SAME. A model's stray armature (nodes far
+    // outside the visible mesh) used to inflate the staged bounds: Maid drew
+    // at 3.7 mm and Teen Kitty at a 172 m box, and their labels hung at chest
+    // height instead of under the feet. Measure the box the viewer actually
+    // gets — the wrapper's whole subtree — and require kPreviewExtent, with
+    // the label baseline strictly below the geometry.
+    for (CarouselSlot const& slot : app.carousel) {
+      if (!slot.hasModel || slot.wrapper == vredit::kInvalidNode) {
+        continue;
+      }
+      std::vector<vredit::NodeId> nodes = app.scene.descendants(slot.wrapper);
+      nodes.push_back(slot.wrapper);
+      vredit::Aabb box{};
+      if (!vredit::nodesBounds(app.scene, app.visuals, nodes, box)) {
+        std::printf("SMOKE FAIL: carousel slot %d has no bounds\n", slot.index);
+        return 1;
+      }
+      Vec3 const size = box.max - box.min;
+      float const maxDim = std::fmax(size.x, std::fmax(size.y, size.z));
+      // The fit divides by the axis-aligned box of each mesh through its node
+      // chain, so rotating the wrapper into its ring pose re-measures that box
+      // and the drawn size lands anywhere in kPreviewExtent/sqrt(2) ..
+      // kPreviewExtent*sqrt(2) for an awkwardly turned model. The band below
+      // allows exactly that and nothing more: what it catches is the failure
+      // seen in the real library, where a stray armature inflated the staged
+      // box ~100x and the preview shrank to a speck (Maid drew at 3.7 mm).
+      if (maxDim > kPreviewExtent * 1.45F || maxDim < kPreviewExtent * 0.69F) {
+        std::printf("SMOKE FAIL: carousel preview %d draws at %.3f m (target %.3f)\n", slot.index,
+                    maxDim, kPreviewExtent);
+        return 1;
+      }
+      vredit::CarouselRing::SlotPose const label = app.ring.labelPose(
+          slot.index, app.ringOrigin, app.ringForward, slot.halfHeight, kLabelGap);
+      if (label.position.y >= box.min.y) {
+        std::printf("SMOKE FAIL: carousel label %d sits at the model, not under it "
+                    "(%.3f vs bottom %.3f)\n",
+                    slot.index, label.position.y, box.min.y);
+        return 1;
+      }
+    }
+    // Stand where the ring was latched, looking along it, and render: the
+    // picture proves what the numbers above only imply.
+    app.camera.position = hudPos;
+    app.camera.yaw = 0.0F;
+    app.camera.pitch = -0.25F;
+    if (!renderer.draw(app.camera, items, depthLines, overlayLines) ||
+        !renderer.readback(pixels)) {
+      std::printf("SMOKE FAIL: carousel label render\n");
+      return 1;
+    }
+    writePpm(".build/carousel-labels.ppm", pixels, config.width, config.height);
+    std::printf("SMOKE carousel labels: %d vertices over %d slots -> .build/carousel-labels.ppm\n",
+                labelVerts, staged());
   }
   int const centredBefore = app.ring.index;
   galleryCycle(app, renderer, 1);

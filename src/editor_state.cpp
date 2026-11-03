@@ -67,6 +67,28 @@ bool nodesBounds(Scene& scene,
                  std::vector<NodeVisual> const& visuals,
                  std::vector<NodeId> const& ids,
                  Aabb& boundsOut) {
+  // GEOMETRY ONLY when the set has any: a model's rig can carry meshless nodes
+  // far outside its visible mesh (Sketchfab exports ship a stray armature at
+  // raw centimetre scale — 100x away from the body). Those nodes draw nothing,
+  // so a zero-size point at their origin must not stretch the box: it would
+  // mis-fit the carousel preview, mis-place its label, and put the floor drop
+  // in the wrong place. A selection with no geometry at all keeps the point
+  // fallback (otherwise nothing would bound).
+  bool anyGeometry = false;
+  for (NodeId id : ids) {
+    if (!scene.valid(id)) {
+      continue;
+    }
+    for (NodeVisual const& visual : visuals) {
+      if (visual.id == id) {
+        anyGeometry = true;
+        break;
+      }
+    }
+    if (anyGeometry) {
+      break;
+    }
+  }
   bool any = false;
   Aabb bounds{};
   for (NodeId id : ids) {
@@ -83,6 +105,9 @@ bool nodesBounds(Scene& scene,
       }
     }
     if (!found) {
+      if (anyGeometry) {
+        continue; // meshless: contributes no surface, so no bounds
+      }
       Vec3 point = scene.worldPosition(id);
       contribution = {point, point};
     }

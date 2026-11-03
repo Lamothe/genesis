@@ -1263,6 +1263,39 @@ void testStickMotion() {
   CHECK_NEAR3(scene.local(child).translation, {1.0F, 0.0F, 0.0F});
 }
 
+void testNodesBoundsIgnoreMeshless() {
+  // A model's rig can carry meshless nodes far outside its visible geometry
+  // (Sketchfab exports ship a stray armature at raw centimetre scale, ~100x
+  // away). Those nodes draw nothing, so they must not stretch the bounds: an
+  // inflated box mis-fits the carousel preview, mis-places its name label and
+  // puts the floor drop in the wrong place. Found in Maid.glb, whose armature
+  // sits 160 m up while the mesh is 1.65 m tall.
+  vredit::Scene scene;
+  vredit::NodeId body = scene.create();
+  vredit::NodeVisual vb;
+  vb.id = body;
+  vb.localBounds = {{-0.2F, 0.0F, -0.1F}, {0.2F, 1.65F, 0.1F}};
+  std::vector<vredit::NodeVisual> visuals{vb};
+  vredit::NodeId stray = scene.create();
+  vredit::Transform st;
+  st.translation = {0.0F, 160.0F, 0.0F};
+  scene.setLocal(stray, st);
+
+  vredit::Aabb bounds{};
+  CHECK(vredit::nodesBounds(scene, visuals, {body, stray}, bounds));
+  CHECK_NEAR(bounds.min.y, 0.0F, 1e-5F);
+  CHECK_NEAR(bounds.max.y, 1.65F, 1e-5F);
+  CHECK_NEAR(bounds.max.x, 0.2F, 1e-5F);
+  // Every meshless selection still gets a box (the point fallback), so
+  // operations on empty nodes keep working.
+  CHECK(vredit::nodesBounds(scene, visuals, {stray}, bounds));
+  CHECK_NEAR(bounds.min.y, 160.0F, 1e-5F);
+  CHECK_NEAR(bounds.max.y, 160.0F, 1e-5F);
+  // An INVALID id contributes nothing either way.
+  CHECK(vredit::nodesBounds(scene, visuals, {body, 9999}, bounds));
+  CHECK_NEAR(bounds.max.y, 1.65F, 1e-5F);
+}
+
 void testStickTipAndFloor() {
   // Tipping (pitch/roll about a horizontal axis through the bounds centre)
   // and the re-rest: a tip swings the bounding box below the floor; the drop
@@ -2063,6 +2096,29 @@ void testCarouselRing() {
   CHECK(ring.index == 1 && ring.atRest());
   vredit::CarouselRing::SlotPose const cv = ring.slotPose(1, eye, Vec3{0.0F, 1.0F, 0.0F});
   CHECK(std::isfinite(cv.position.x) && std::isfinite(cv.yaw));
+
+  // The NAME LABEL for each slot: centred on the slot's own horizontal
+  // position (never drifting to the ring centre), hung below the model by its
+  // own half-height plus the gap, and facing the viewer exactly as the model
+  // does. Naming previews is what makes "which model is this" answerable
+  // without placing it.
+  vredit::CarouselRing::SlotPose const label0 = ring.labelPose(0, eye, fwd, 0.4F, 0.05F);
+  vredit::CarouselRing::SlotPose const model0 = ring.slotPose(0, eye, fwd);
+  CHECK_NEAR(label0.position.x, model0.position.x, 1e-5F);
+  CHECK_NEAR(label0.position.z, model0.position.z, 1e-5F);
+  CHECK_NEAR(label0.position.y, model0.position.y - 0.45F, 1e-5F);
+  CHECK_NEAR(label0.yaw, model0.yaw, 1e-6F);
+  // A side slot's label follows ITS x, not the centre: the bug this guards
+  // against is every label stacking in the middle of the ring.
+  vredit::CarouselRing::SlotPose const label1 = ring.labelPose(1, eye, fwd, 0.3F, 0.0F);
+  vredit::CarouselRing::SlotPose const model1 = ring.slotPose(1, eye, fwd);
+  CHECK(std::fabs(label1.position.x - label0.position.x) > 0.2F);
+  CHECK_NEAR(label1.position.x, model1.position.x, 1e-5F);
+  CHECK_NEAR(label1.position.y, model1.position.y - 0.3F, 1e-5F);
+  // Degenerate inputs must not push the label through the model or to NaN.
+  vredit::CarouselRing::SlotPose const labelNeg = ring.labelPose(0, eye, fwd, -1.0F, -1.0F);
+  CHECK_NEAR(labelNeg.position.y, model0.position.y, 1e-5F);
+  CHECK(std::isfinite(labelNeg.position.y) && std::isfinite(labelNeg.yaw));
 }
 
 void testObjLoader() {
@@ -2649,6 +2705,7 @@ int main() {
   testMipChain();
   testSegmentAndPolygonPicking();
   testStickMotion();
+  testNodesBoundsIgnoreMeshless();
   testStickTipAndFloor();
   testMovingSetAndExplicitPivot();
   testViewerRotationAxes();
