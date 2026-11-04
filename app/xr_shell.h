@@ -16,6 +16,7 @@ namespace vredit {
 // combined basis gets its own horizon lock (a pitched rig composed with a
 // yawed head produces phantom roll otherwise).
 struct XrFrameInput {
+  bool handOpen[2] = {false, false}; // at least three tracked extended fingers
   HandPose hands[2]; // palm joint poses, not runtime-filtered aim orientations
   bool handActive[2] = {false, false}; // actual hand-interaction profile
   float pinch[2] = {0.0F, 0.0F};

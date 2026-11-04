@@ -10,6 +10,59 @@ struct HandPose {
   bool valid{false};
 };
 
+// Viewer-relative swipe, one step per stroke. A short stationary pause rearms;
+// the return stroke cannot immediately cycle back. No velocity-only triggers.
+class HandSwipe {
+ public:
+  void reset() { *this = HandSwipe{}; }
+  int update(bool valid, bool open, Vec3 position, Vec3 viewerRight, float dt) {
+    if (!valid || !open || !std::isfinite(dt) || dt <= 0.0F || dt > .15F ||
+        !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
+      reset();
+      return 0;
+    }
+    if (!haveSample_) {
+      haveSample_ = true;
+      start_ = last_ = position;
+      right_ = normalized(viewerRight);
+      return 0;
+    }
+    auto const delta = position - last_;
+    last_ = position;
+    bool const still = length(delta) / dt < .12F;
+    quiet_ = still ? quiet_ + dt : 0.0F;
+    if (quiet_ >= .25F) {
+      armed_ = true;
+      start_ = position;
+      right_ = normalized(viewerRight);
+      elapsed_ = 0;
+      return 0; // stationary acquisition is not part of the stroke time
+    }
+    if (!armed_) { return 0; }
+    elapsed_ += dt;
+    auto const travel = position - start_;
+    auto const horizontal = dot(travel, right_);
+    auto const offAxis = travel - right_ * horizontal;
+    if (length(offAxis) > .10F || elapsed_ > .80001F) {
+      armed_ = false;
+      quiet_ = 0;
+      return 0;
+    }
+    if (std::fabs(horizontal) >= .16F) {
+      armed_ = false;
+      quiet_ = 0;
+      // Swipe left pulls the next model into the centre, like a touch carousel.
+      return horizontal < 0 ? 1 : -1;
+    }
+    return 0;
+  }
+ private:
+  bool haveSample_{false};
+  bool armed_{false};
+  Vec3 start_{}, last_{}, right_{};
+  float quiet_{0}, elapsed_{0};
+};
+
 class HandGesture {
  public:
   // Acquisition (including after tracking loss) must observe a released pinch.

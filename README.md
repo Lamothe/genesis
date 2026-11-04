@@ -33,7 +33,7 @@ renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash run-tests.sh        # 891 core + 10,186 hand checks; fixtures via ImageMagick
+bash run-tests.sh        # core + hand gesture checks; fixtures via ImageMagick
 bash run-editor.sh       # build + interactive editor
 bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
@@ -76,9 +76,13 @@ In VR the trigger only *selects* — whole model, or a single part with grip+tri
 Bare hands (Quest through WiVRn) use a separate control path; controller
 buttons and sticks are unchanged:
 
-- **Left pinch** opens/closes the carousel. Point with the right hand and
-  **right-pinch PREVIOUS/NEXT** to browse; right-pinch away from the arrows
-  places the centred model on the floor under the aim ray.
+- **Left pinch** opens/closes the carousel. With the right hand open, pause
+  briefly then **swipe left for next / right for previous** (about 16 cm,
+  one model per swipe). Pause for 0.25 s between strokes; the return movement
+  does not immediately reverse the carousel. There are no carousel buttons.
+  **Right pinch** places the centred model on the floor under the aim ray;
+  pinches in the 0.4 s settling interval after a swipe are ignored until released.
+  Swiping requires tracked palm/finger joints; controller stick browsing is unchanged.
 - **Right pinch** selects the model under the right aim beam (grasp + pinch
   selects a part). Hold to grab: moving the palm translates the selection,
   and turning the hand rotates it by the same relative orientation change

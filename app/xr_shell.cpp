@@ -872,6 +872,25 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
     locate.time = static_cast<XrTime>(displayTime);
     if (XR_SUCCEEDED(xr_->locateHandJoints(xr_->trackers[hand], &locate, &locations)) &&
         locations.isActive) {
+      int extended = 0;
+      for (int finger = 0; finger < 4; ++finger) {
+        int const proximal = XR_HAND_JOINT_INDEX_PROXIMAL_EXT + finger * 5;
+        auto const& a = joints[proximal];
+        auto const& b = joints[proximal + 1];
+        auto const& c = joints[proximal + 3];
+        constexpr auto trackedPosition = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+        if ((a.locationFlags & trackedPosition) == trackedPosition &&
+            (b.locationFlags & trackedPosition) == trackedPosition &&
+            (c.locationFlags & trackedPosition) == trackedPosition) {
+          auto point = [](XrHandJointLocationEXT const& joint) {
+            return Vec3{joint.pose.position.x, joint.pose.position.y, joint.pose.position.z};
+          };
+          if (dot(normalized(point(b) - point(a)), normalized(point(c) - point(b))) > .75F) {
+            ++extended;
+          }
+        }
+      }
+      input.handOpen[hand] = extended >= 3;
       auto const& palm = joints[XR_HAND_JOINT_PALM_EXT];
       constexpr XrSpaceLocationFlags required = XR_SPACE_LOCATION_POSITION_VALID_BIT |
           XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT |

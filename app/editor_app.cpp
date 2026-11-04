@@ -2293,16 +2293,16 @@ void prepareHandTool(App& app, int button) {
 }
 
 constexpr std::array<char const*, 12> kHandTools{
-    "PREVIOUS", "NEXT", "SMALLER", "BIGGER", "LOWER", "RAISE",
+    "", "", "SMALLER", "BIGGER", "LOWER", "RAISE",
     "TURN LEFT", "TURN RIGHT", "UNDO", "REDO", "DELETE", "BACKDROP"};
 
 void drawHandPanel(App const& app, std::vector<RendererVertex>& lines) {
-  if (!app.handPanel.visible) {
+  if (!app.handPanel.visible || app.galleryActive) {
     return;
   }
   auto const& panel = app.handPanel;
-  int const first = app.galleryActive ? 0 : 2;
-  int const last = app.galleryActive ? 2 : 12;
+  int const first = 2;
+  int const last = 12;
   auto point = [&](Vec3 local) { return panel.origin + rotate(panel.orientation, local); };
   for (int button = first; button < last; ++button) {
     auto const centre = handPanelButtonCentre(button);
@@ -2549,6 +2549,13 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
       !check(writePpm(".build/hand-tools.ppm", pixels, renderer.width(), renderer.height()), "panel screenshot")) {
     return false;
   }
+  app.galleryActive = true;
+  lines.clear();
+  drawHandPanel(app, lines);
+  if (!check(lines.empty(), "carousel has no tool panel or browse buttons")) {
+    return false;
+  }
+  app.galleryActive = false;
   app.handPanel.visible = false;
   lines.clear();
   drawHandPanel(app, lines);
@@ -2625,6 +2632,8 @@ int runXr(char const* shaderDir,
 
   bool running = true;
   int framesRendered = 0;
+  HandSwipe carouselSwipe;
+  float swipePlacementGuard = 0.0F;
   HandGesture leftPinch;
   HandGesture rightPinch;
   bool palmUp = false;
@@ -2649,6 +2658,8 @@ int runXr(char const* shaderDir,
       if (app.handGrab || app.handTool >= 0) {
         endEdits(app);
       }
+      carouselSwipe.reset();
+      swipePlacementGuard = 0.0F;
       leftPinch.reset();
       rightPinch.reset();
       app.handUiOwned = true;
@@ -2738,16 +2749,34 @@ int runXr(char const* shaderDir,
     if (app.galleryActive && !app.ringLatched) {
       galleryTick(app, renderer, 0.0F, headWorld, headForward);
     }
-    bool const panelWanted = handRight && (app.galleryActive || palmCharge >= .25F);
+    swipePlacementGuard = std::max(0.0F, swipePlacementGuard - dt);
+    if (!app.galleryActive || handCarouselToggled) {
+      carouselSwipe.reset();
+      swipePlacementGuard = 0.0F;
+    } else {
+      auto const right = normalized(cross(Vec3{headForward.x, 0, headForward.z}, Vec3{0,1,0}));
+      // Subtract head position: walking must not browse the library.
+      int const step = carouselSwipe.update(handRight && worldHands[1].valid,
+          input.handOpen[1] && input.pinch[1] <= .4F,
+          worldHands[1].position - headWorld, right, dt);
+      if (step != 0) {
+        galleryCycle(app, renderer, step);
+        swipePlacementGuard = .4F;
+        std::printf("[hands] carousel swipe: %s\n", step > 0 ? "next" : "previous");
+      }
+    }
+    // A pinch during the swipe settling interval must be released, not queued.
+    if (handRight && swipePlacementGuard > 0 && input.selectPressed) {
+      app.handUiOwned = true;
+      input.selectPressed = false;
+    }
+    bool const panelWanted = handRight && !app.galleryActive && palmCharge >= .25F;
     if (panelWanted && (!app.handPanel.visible || app.handPanelCarousel != app.galleryActive)) {
       endEdits(app);
       app.handPanelCarousel = app.galleryActive;
       app.handPanel.orientation = quatFromAxisAngle({0,1,0}, std::atan2(-headForward.x, -headForward.z));
       app.handPanel.origin = headWorld + headForward * .65F + Vec3{0,.08F,0};
-      if (app.galleryActive) {
-        app.handPanel.origin = app.ringOrigin + app.ringForward * .85F + Vec3{0,-.48F,0};
-        app.handPanel.orientation = quatFromAxisAngle({0,1,0}, std::atan2(-app.ringForward.x, -app.ringForward.z));
-      }
+
       app.handUiOwned = handHeld;
       std::printf("[hands] %s panel open\n", app.galleryActive ? "carousel" : "tools");
     }
@@ -2770,9 +2799,7 @@ int runXr(char const* shaderDir,
       prepareHandTool(app, button);
       app.handUiOwned = true;
       std::printf("[hands] tool: %s\n", kHandTools[button]);
-      if (button < 2) {
-        galleryCycle(app, renderer, button == 0 ? -1 : 1);
-      } else if (button < 8 && !app.selection.empty()) {
+      if (button >= 2 && button < 8 && !app.selection.empty()) {
         app.undo.begin(snapshot(app));
         app.handTool = button;
       } else if (button == 8) {
