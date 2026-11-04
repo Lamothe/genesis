@@ -174,6 +174,47 @@ void projection() {
     auto const delta = projectedHandGrabTransform(view, start, now, surface, Mat4{});
     CHECK(length(transformPoint(delta, surface) - target) < .0001F);
   }
+  // Depth is relative to the grab-start hand and surface depth: a 10%
+  // push/pull moves near and distant surfaces by the same percentage.
+  for (float depth : {0.3F, 1.0F, 10.0F, 100.0F}) {
+    Vec3 const surface{depth * .2F, depth * .1F, -depth};
+    auto const away = projectedGrabPoint(view, hand, {hand.x, hand.y, -.55F}, surface);
+    auto const closer = projectedGrabPoint(view, hand, {hand.x, hand.y, -.45F}, surface);
+    CHECK(std::fabs(-away.z / depth - 1.1F) < .0001F);
+    CHECK(std::fabs(-closer.z / depth - .9F) < .0001F);
+    // Depth-only motion preserves the existing projection calculation.
+    CHECK(std::fabs(away.x / -away.z - (surface.x / depth + hand.x / .55F - hand.x / .5F)) < .0001F);
+    CHECK(std::fabs(closer.y / -closer.z - (surface.y / depth + hand.y / .45F - hand.y / .5F)) < .0001F);
+    CHECK(near(projectedGrabPoint(view, hand, hand, surface), surface));
+  }
+  // The projection clamp must not clamp depth, including a grab started
+  // inside the projection near plane. Starting in place must never jump.
+  auto const closeHand = projectedGrabPoint(view, hand, {.1F,.1F,-.05F}, {0,0,-10});
+  CHECK(std::fabs(closeHand.z + 1.0F) < .0001F);
+  Vec3 const nearStart{.01F, .02F, -.099F};
+  Vec3 const farSurface{2,1,-10};
+  CHECK(near(projectedGrabPoint(view, nearStart, nearStart, farSurface), farSurface));
+  auto const nearPush = projectedGrabPoint(view, nearStart, {.01F,.02F,-.198F}, farSurface);
+  CHECK(std::fabs(nearPush.z + 19.9F) < .0001F);
+  auto const rayStart = Vec3{.06F, 0, -.06F};
+  auto const sameRay = projectedGrabPoint(view, rayStart, {.1F,0,-.1F}, {0,0,-10});
+  CHECK(std::fabs(sameRay.x) < .0001F);
+  auto const tinyStart = projectedGrabPoint(view, {0,0,-.0011F}, {.1F,0,-.0111F}, {0,0,-10});
+  auto const behindStart = projectedGrabPoint(view, {0,0,.05F}, {.1F,0,.05F}, {0,0,-10});
+  CHECK(near(tinyStart, {.1F,0,-10.01F}));
+  CHECK(near(behindStart, {.1F,0,-10}));
+  auto const behind = projectedGrabPoint(view, hand, {.1F,.1F,.01F}, {0,0,-10});
+  CHECK(std::fabs(behind.z + .05F) < .0001F);
+  // Depth and lateral motion combine without losing the proportional gain.
+  auto const combined = projectedGrabPoint(view, hand, {.15F, .08F, -.55F}, {2,1,-10});
+  CHECK(std::fabs(combined.z + 11.0F) < .0001F);
+  CHECK(std::fabs(combined.x / 11.0F - (.2F + .15F / .55F - .1F / .5F)) < .0001F);
+  CHECK(std::fabs(combined.y / 11.0F - (.1F + .08F / .55F - .1F / .5F)) < .0001F);
+  // When the hand crosses the near plane, the mapping remains bounded and continuous.
+  auto const nearDepthA = projectedGrabPoint(view, hand, {.2F,.1F,-.10001F}, {0,0,-10});
+  auto const nearDepthB = projectedGrabPoint(view, hand, {.2F,.1F,-.09999F}, {0,0,-10});
+  CHECK(length(nearDepthA - nearDepthB) < .01F);
+  CHECK(-nearDepthB.z >= .05F);
   auto const orientation = quatFromAxisAngle({0, 1, 0}, .7F);
   HandGrabView const turned{{2,1,3}, orientation, true};
   auto world = [&](Vec3 v) { return turned.eye + rotate(orientation, v); };

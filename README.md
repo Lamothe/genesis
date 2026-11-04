@@ -87,8 +87,9 @@ buttons and sticks are unchanged:
 - Outside the menu, **right pinch and release** selects the whole model under
   the aim beam. Pinch and hold the selected model again to move it with the
   palm and rotate it with the wrist around the picked surface. Lateral motion is
-  view-relative (larger at greater distance); depth motion remains physical.
-  The grab view is latched; releasing commits one undo step. Hand selection is whole-model only;
+  view-relative: lateral motion follows the hand in the view, and depth changes
+  by the same fraction as the hand's distance from the viewer. The grab view is
+  latched; releasing commits one undo step. Hand selection is whole-model only;
   controllers retain grip+trigger part selection.
 - While holding a right-hand grab, pinch and hold with the left hand and vary
   the distance between the palms to scale uniformly about the model's centre.

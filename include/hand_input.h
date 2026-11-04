@@ -145,13 +145,17 @@ inline Vec3 projectedGrabPoint(HandGrabView const& view, Vec3 handStart, Vec3 ha
   auto const h1 = rotate(inv, handNow - view.eye);
   auto const p = rotate(inv, point - view.eye);
   float const z0 = -h0.z, z1 = -h1.z, zp = -p.z;
-  if (!(z0 > .10F && zp > .05F)) { return point + (handNow - handStart); }
-  // Clamp projection at the near plane rather than switching formulae as a
-  // hand crosses it. This avoids a discontinuity and unbounded lateral gain.
-  float const safeDepth = std::fmax(.10F, z1);
-  float const depth = std::fmax(.05F, zp + z1 - z0);
-  Vec3 const target{(p.x / zp + h1.x / safeDepth - h0.x / z0) * depth,
-                    (p.y / zp + h1.y / safeDepth - h0.y / z0) * depth, -depth};
+  if (!(z0 > .05F && zp > .05F)) { return point + (handNow - handStart); }
+  // Bound gain for a hand starting close to or behind the eye plane. At normal
+  // hand distances the surface follows the hand's exact fractional depth.
+  float const startDepth = std::fmax(.10F, z0);
+  float const currentDepth = std::fmax(.10F, z1);
+  float const depth = std::fmax(.05F, zp * (1.0F + (z1 - z0) / startDepth));
+  // This is the difference of projected coordinates, attenuated smoothly
+  // near the eye plane. It remains zero for motion along the same eye ray.
+  float const denom = startDepth * currentDepth;
+  Vec3 const target{(p.x / zp + (h1.x * z0 - h0.x * z1) / denom) * depth,
+                    (p.y / zp + (h1.y * z0 - h0.y * z1) / denom) * depth, -depth};
   return view.eye + rotate(view.orientation, target);
 }
 
