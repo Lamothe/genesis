@@ -91,6 +91,11 @@ struct XrShell::ImplData {
   bool redoPending{false};
   bool spawnPending{false};
   bool menuPending{false}; // latched menu press (the tap/hold start)
+  bool handTracking{false};
+  XrHandTrackerEXT trackers[2]{XR_NULL_HANDLE, XR_NULL_HANDLE};
+  PFN_xrCreateHandTrackerEXT createHandTracker{nullptr};
+  PFN_xrDestroyHandTrackerEXT destroyHandTracker{nullptr};
+  PFN_xrLocateHandJointsEXT locateHandJoints{nullptr};
   bool handInteraction{false}; // XR_EXT_hand_interaction enabled at instance creation
   XrPath handPaths[2]{XR_NULL_PATH, XR_NULL_PATH};    // "/user/hand/left|right" (diagnostics)
   XrPath handProfiles[2]{XR_NULL_PATH, XR_NULL_PATH}; // last active profile seen per hand
@@ -142,6 +147,12 @@ XrShell::InitResult XrShell::init() {
       break;
     }
   }
+  for (auto const& offered : available) {
+    if (std::strcmp(offered.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0) {
+      extensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+      xr_->handTracking = true;
+    }
+  }
   instanceInfo.enabledExtensionCount = static_cast<std::uint32_t>(extensions.size());
   instanceInfo.enabledExtensionNames = extensions.data();
 
@@ -159,6 +170,15 @@ XrShell::InitResult XrShell::init() {
     std::printf("[xr] hand interaction: not offered by this runtime; controllers only\n");
   }
 
+  if (xr_->handTracking) {
+    xrGetInstanceProcAddr(xr_->instance, "xrCreateHandTrackerEXT",
+                         reinterpret_cast<PFN_xrVoidFunction*>(&xr_->createHandTracker));
+    xrGetInstanceProcAddr(xr_->instance, "xrDestroyHandTrackerEXT",
+                         reinterpret_cast<PFN_xrVoidFunction*>(&xr_->destroyHandTracker));
+    xrGetInstanceProcAddr(xr_->instance, "xrLocateHandJointsEXT",
+                         reinterpret_cast<PFN_xrVoidFunction*>(&xr_->locateHandJoints));
+    xr_->handTracking = xr_->createHandTracker && xr_->destroyHandTracker && xr_->locateHandJoints;
+  }
   XrSystemGetInfo systemInfo = xrStruct<XrSystemGetInfo>(XR_TYPE_SYSTEM_GET_INFO);
   systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
   result = xrGetSystem(xr_->instance, &systemInfo, &xr_->system);
@@ -168,6 +188,13 @@ XrShell::InitResult XrShell::init() {
   }
   if (!xrOk(result, "xrGetSystem")) {
     return InitResult::Failed;
+  }
+  if (xr_->handTracking) {
+    auto hands = xrStruct<XrSystemHandTrackingPropertiesEXT>(XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT);
+    auto properties = xrStruct<XrSystemProperties>(XR_TYPE_SYSTEM_PROPERTIES);
+    properties.next = &hands;
+    xr_->handTracking = XR_SUCCEEDED(xrGetSystemProperties(xr_->instance, xr_->system, &properties)) &&
+        hands.supportsHandTracking;
   }
   // Does the runtime composite ALPHA_BLEND frames (passthrough under models)?
   std::uint32_t blendCount = 0;
@@ -342,6 +369,17 @@ XrShell::InitResult XrShell::init() {
     return InitResult::Failed;
   }
 
+  if (xr_->handTracking) {
+    for (int hand = 0; hand < 2; ++hand) {
+      auto info = xrStruct<XrHandTrackerCreateInfoEXT>(XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT);
+      info.hand = hand == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+      info.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+      xrOk(xr_->createHandTracker(xr_->session, &info, &xr_->trackers[hand]), "create hand tracker");
+    }
+  }
+  std::printf("[hands] palm joints: left %s, right %s (aim/pinch still available without joints)\n",
+      xr_->trackers[0] != XR_NULL_HANDLE ? "enabled" : "unavailable",
+      xr_->trackers[1] != XR_NULL_HANDLE ? "enabled" : "unavailable");
   std::uint32_t viewCount = 0;
   xr_->viewConfig[0] = xrStruct<XrViewConfigurationView>(XR_TYPE_VIEW_CONFIGURATION_VIEW);
   xr_->viewConfig[1] = xrStruct<XrViewConfigurationView>(XR_TYPE_VIEW_CONFIGURATION_VIEW);
@@ -492,11 +530,12 @@ bool XrShell::createActions() {
     // aim-ray activation gesture (paired with aim/pose); pinch_ext is the
     // separate manipulation pinch and would be the wrong feel for the
     // existing trigger-as-select semantics. grasp_ext is the grip. Hands have
-    // no face buttons or sticks, so everything else stays controller-only.
+    // no face buttons or sticks; the app supplies hand-only tools and grabbing.
     bindings.push_back(
         {"/interaction_profiles/ext/hand_interaction_ext",
          {{"/user/hand/right/input/aim/pose", xr_->aimAction},
           {"/user/hand/left/input/aim/pose", xr_->aimAction},
+          {"/user/hand/left/input/aim_activate_ext/value", xr_->triggerAction},
           {"/user/hand/right/input/aim_activate_ext/value", xr_->triggerAction},
           {"/user/hand/right/input/grasp_ext/value", xr_->gripAction}}});
   }
@@ -806,6 +845,44 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   xrGetActionStateFloat(xr_->session, &getInfo, &gripState);
   input.gripHeld = gripState.isActive ? gripState.currentState : 0.0F;
 
+  // Keep hand-only gestures separate from controllers (including inferred joints).
+  XrPath handProfile = XR_NULL_PATH;
+  if (xr_->handInteraction) {
+    xrStringToPath(xr_->instance, "/interaction_profiles/ext/hand_interaction_ext", &handProfile);
+  }
+  for (int hand = 0; hand < 2; ++hand) {
+    auto profile = xrStruct<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
+    input.handActive[hand] = handProfile != XR_NULL_PATH &&
+        XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_->session, xr_->handPaths[hand], &profile)) &&
+        profile.interactionProfile == handProfile;
+    auto pinch = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
+    getInfo.action = xr_->triggerAction;
+    getInfo.subactionPath = xr_->handPaths[hand];
+    xrGetActionStateFloat(xr_->session, &getInfo, &pinch);
+    input.pinch[hand] = pinch.isActive ? pinch.currentState : 0.0F;
+    if (!input.handActive[hand] || xr_->trackers[hand] == XR_NULL_HANDLE) {
+      continue;
+    }
+    XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT]{};
+    auto locations = xrStruct<XrHandJointLocationsEXT>(XR_TYPE_HAND_JOINT_LOCATIONS_EXT);
+    locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+    locations.jointLocations = joints;
+    auto locate = xrStruct<XrHandJointsLocateInfoEXT>(XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT);
+    locate.baseSpace = xr_->space;
+    locate.time = static_cast<XrTime>(displayTime);
+    if (XR_SUCCEEDED(xr_->locateHandJoints(xr_->trackers[hand], &locate, &locations)) &&
+        locations.isActive) {
+      auto const& palm = joints[XR_HAND_JOINT_PALM_EXT];
+      constexpr XrSpaceLocationFlags required = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+          XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+          XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+      if ((palm.locationFlags & required) == required) {
+        auto const& p = palm.pose;
+        input.hands[hand] = {{p.position.x, p.position.y, p.position.z},
+            {p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w}, true};
+      }
+    }
+  }
   // Per-hand aim rays for the drawn pointers; the right-hand aim doubles as
   // the manipulation pointer (head gaze fallback when it is untracked).
   uint32_t tracked = XR_SPACE_LOCATION_POSITION_VALID_BIT |
@@ -1091,6 +1168,11 @@ void XrShell::shutdown() {
     if (aimSpace != XR_NULL_HANDLE) {
       xrDestroySpace(aimSpace);
       aimSpace = XR_NULL_HANDLE;
+    }
+  }
+  for (auto tracker : xr_->trackers) {
+    if (tracker != XR_NULL_HANDLE && xr_->destroyHandTracker) {
+      xr_->destroyHandTracker(tracker);
     }
   }
   if (xr_->space != XR_NULL_HANDLE) {

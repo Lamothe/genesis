@@ -1,0 +1,178 @@
+#include "hand_input.h"
+
+#include <cstdio>
+#include <initializer_list>
+#include <limits>
+
+using namespace vredit;
+
+namespace {
+int checks = 0;
+int failures = 0;
+
+void check(bool condition, char const* expression, int line) {
+  ++checks;
+  if (!condition) {
+    ++failures;
+    std::printf("FAIL test_hands.cpp:%d: %s\n", line, expression);
+  }
+}
+#define CHECK(...) check((__VA_ARGS__), #__VA_ARGS__, __LINE__)
+
+bool near(Vec3 a, Vec3 b) {
+  return length(a - b) < 2e-5F;
+}
+
+bool near(Mat4 const& a, Mat4 const& b) {
+  for (int i = 0; i < 16; ++i) {
+    if (!(std::fabs(a.m[i] - b.m[i]) < 2e-5F)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void gestures() {
+  HandGesture gesture;
+  CHECK(!gesture.update(false, 0.0F));
+  CHECK(!gesture.update(true, 1.0F));
+  CHECK(!gesture.update(true, 0.5F));
+  CHECK(!gesture.update(true, 0.4F));
+  CHECK(!gesture.update(true, 0.549F));
+  CHECK(gesture.update(true, 0.55F));
+  CHECK(!gesture.update(true, 1.0F));
+  CHECK(!gesture.update(true, 0.41F));
+  CHECK(!gesture.update(true, 0.55F));
+  CHECK(!gesture.update(true, 0.4F));
+  CHECK(gesture.update(true, 0.55F));
+  CHECK(!gesture.update(false, 0.0F));
+  CHECK(!gesture.update(true, 0.9F));
+  CHECK(!gesture.update(true, 0.45F));
+  CHECK(!gesture.update(true, 0.9F));
+  CHECK(!gesture.update(true, 0.0F));
+  CHECK(gesture.update(true, 0.8F));
+  gesture.reset();
+  CHECK(!gesture.update(true, 1.0F));
+  CHECK(!gesture.update(true, 0.0F));
+  CHECK(gesture.update(true, 1.0F));
+  CHECK(!gesture.update(true, std::numeric_limits<float>::quiet_NaN()));
+  CHECK(!gesture.update(true, 1.0F));
+  CHECK(!gesture.update(true, 0.0F));
+  CHECK(gesture.update(true, 0.6F));
+}
+
+void panels() {
+  HandPanel panel;
+  auto front = [](Vec3 point) { return Ray{point + Vec3{0, 0, 1}, {0, 0, -1}}; };
+  CHECK(panel.hit(front(handPanelButtonCentre(0))) == -1);
+  panel.visible = true;
+  for (int i = 0; i < 12; ++i) {
+    auto const centre = handPanelButtonCentre(i);
+    CHECK(near(centre, {(i % 2 == 0) ? -0.115F : 0.115F,
+                        -0.065F * (static_cast<float>(i / 2) + 0.5F), 0}));
+    CHECK(panel.hit(front(centre)) == i);
+    CHECK(panel.hit({centre - Vec3{0, 0, 1}, {0, 0, 1}}) == -1);
+    CHECK(panel.hit({centre - Vec3{0, 0, 1}, {0, 0, -1}}) == -1);
+    CHECK(panel.hit(front(centre + Vec3{0.1049F, 0.0279F, 0})) == i);
+    CHECK(panel.hit(front(centre - Vec3{0.1049F, 0.0279F, 0})) == i);
+    CHECK(panel.hit(front(centre + Vec3{0.1051F, 0, 0})) == -1);
+    CHECK(panel.hit(front(centre + Vec3{0, 0.0281F, 0})) == -1);
+  }
+  // Exact inclusive edges on representable coordinates.
+  auto const centre = handPanelButtonCentre(0);
+  CHECK(panel.hit(front({centre.x + 0.105F, centre.y, 0})) == 0);
+  CHECK(panel.hit(front({centre.x, centre.y + 0.028F, 0})) == 0);
+  CHECK(panel.hit(front({0, -0.1F, 0})) == -1); // column gap
+  CHECK(panel.hit(front({-0.115F, -0.065F, 0})) == -1); // row gap
+  CHECK(panel.hit(front({0, 0, 0})) == -1);
+  CHECK(panel.hit(front({0, -0.5F, 0})) == -1);
+  CHECK(panel.hit({{0, 0, 1}, {1, 0, 0}}) == -1);
+  CHECK(panel.hit({{0, 0, 1}, {0, 0, -0.0000001F}}) == -1);
+  CHECK(panel.hit({{0, 0, 1}, {0, 0, 0}}) == -1);
+  auto const nan = std::numeric_limits<float>::quiet_NaN();
+  CHECK(panel.hit({{nan, 0, 1}, {0, 0, -1}}) == -1);
+  CHECK(panel.hit({{0, 0, 1}, {0, 0, nan}}) == -1);
+  CHECK(near(handPanelButtonCentre(-1), Vec3{}));
+  CHECK(near(handPanelButtonCentre(12), Vec3{}));
+  CHECK(near(handPanelButtonCentre(1000000), Vec3{}));
+
+  panel.origin = {3, 2, -4};
+  panel.orientation = quatFromAxisAngle({0, 1, 0}, 1.1F) *
+                      quatFromAxisAngle({1, 0, 0}, 0.4F);
+  for (int i = 0; i < 12; ++i) {
+    auto const world = panel.origin + rotate(panel.orientation, handPanelButtonCentre(i));
+    auto const normal = rotate(panel.orientation, {0, 0, 1});
+    CHECK(panel.hit({world + normal, -normal}) == i);
+    CHECK(panel.hit({world - normal, normal}) == -1);
+  }
+}
+
+void palms() {
+  HandPose pose;
+  CHECK(!palmFacingUp(pose, false));
+  pose.valid = true;
+  CHECK(!palmFacingUp(pose, false)); // identity palm points down
+  pose.orientation = quatFromAxisAngle({1, 0, 0}, 3.14159265F);
+  CHECK(palmFacingUp(pose, false));
+  pose.orientation = quatFromAxisAngle({1, 0, 0}, std::acos(-0.65F));
+  CHECK(!palmFacingUp(pose, false));
+  CHECK(palmFacingUp(pose, true));
+  pose.orientation = quatFromAxisAngle({1, 0, 0}, std::acos(-0.5F));
+  CHECK(!palmFacingUp(pose, true));
+  pose.orientation = quatFromAxisAngle({0, 0, 1}, 3.14159265F);
+  CHECK(palmFacingUp(pose, false));
+  pose.valid = false;
+  CHECK(!palmFacingUp(pose, true));
+}
+
+void grabs() {
+  HandPose const start{{1, 2, 3},
+                       quatFromAxisAngle({1, 0, 0}, 0.4F) *
+                       quatFromAxisAngle({0, 1, 0}, -0.7F), true};
+  Vec3 const pivot{2, -1, 0.5F};
+  Mat4 const initial = trs({4, 2, -3}, quatFromAxisAngle({0, 0, 1}, 0.3F), {2, 3, 4});
+  CHECK(near(handGrabTransform(start, start, pivot, initial), initial));
+  for (Vec3 const axis : {Vec3{0, 1, 0}, Vec3{1, 0, 0}, Vec3{0, 0, 1}}) {
+    auto const delta = quatFromAxisAngle(axis, 1.2F);
+    HandPose current = start;
+    current.orientation = delta * start.orientation;
+    current.position = start.position + Vec3{-0.3F, 0.2F, 0.7F};
+    auto const result = handGrabTransform(start, current, pivot, initial);
+    // Independent point/vector expectations catch quaternion order, pivot,
+    // translation order, and preservation of initial orientation/scale.
+    for (Vec3 const point : {Vec3{}, Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}}) {
+      CHECK(near(transformPoint(result, point),
+                 pivot + current.position - start.position +
+                 rotate(delta, transformPoint(initial, point) - pivot)));
+    }
+    CHECK(near(transformVector(result, {1, 2, 3}),
+               rotate(delta, transformVector(initial, {1, 2, 3}))));
+  }
+  HandPose current = start;
+  current.position = start.position + Vec3{0.25F, -0.5F, 1.5F};
+  auto const expected = mul(translationMatrix(current.position - start.position), initial);
+  for (int i = 0; i < 10000; ++i) {
+    CHECK(near(handGrabTransform(start, current, pivot, initial), expected));
+  }
+  // Returning to the captured start must undo every intermediate sample.
+  for (int i = 0; i < 1000; ++i) {
+    current.position = start.position + Vec3{static_cast<float>(i) * 0.001F, 0, 0};
+    current.orientation = quatFromAxisAngle({0, 1, 0}, static_cast<float>(i) * 0.01F) *
+                          start.orientation;
+    (void)handGrabTransform(start, current, pivot, initial);
+  }
+  CHECK(near(handGrabTransform(start, start, pivot, initial), initial));
+  current.valid = false;
+  CHECK(near(handGrabTransform(start, current, pivot, initial), initial));
+  CHECK(near(handGrabTransform(current, start, pivot, initial), initial));
+}
+} // namespace
+
+int main() {
+  gestures();
+  panels();
+  palms();
+  grabs();
+  std::printf("Hand tests: %d checks, %d failures\n", checks, failures);
+  return failures == 0 ? 0 : 1;
+}

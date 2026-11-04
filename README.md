@@ -33,7 +33,7 @@ renderer bolted on later through the seam contract
 ## Build and test
 
 ```sh
-bash run-tests.sh        # core tests (863 checks; image fixtures via ImageMagick)
+bash run-tests.sh        # 891 core + 10,186 hand checks; fixtures via ImageMagick
 bash run-editor.sh       # build + interactive editor
 bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
@@ -73,28 +73,50 @@ part selection marks the part) and the current mode's name shows as
 line-font text floating in front of the camera.
 
 In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
-With hand tracking on (Quest through WiVRn), the hands are pointers: each tracked
-hand draws an aim beam and the **right-hand pinch** is the trigger, so you can
-point and place with bare hands. Controllers keep every button and stick, so
-hands cannot open the carousel, delete, undo/redo or move the
-selection — pick the controllers up for those.
+Bare hands (Quest through WiVRn) use a separate control path; controller
+buttons and sticks are unchanged:
+
+- **Left pinch** opens/closes the carousel. Point with the right hand and
+  **right-pinch PREVIOUS/NEXT** to browse; right-pinch away from the arrows
+  places the centred model on the floor under the aim ray.
+- **Right pinch** selects the model under the right aim beam (grasp + pinch
+  selects a part). Hold to grab: moving the palm translates the selection,
+  and turning the hand rotates it by the same relative orientation change
+  around the moving subtree's bounds centre. Releasing keeps the pose and
+  records one undo step. All three rotation axes are tracked; there is no
+  floor clamp during a hand grab, so models can be lifted and tipped freely.
+- **Left palm facing up** for 0.25 s shows a stationary, head-facing tool
+  panel. Point and right-pinch a labelled button: **SMALLER/BIGGER**,
+  **LOWER/RAISE**, **TURN LEFT/RIGHT** run while held; **UNDO**, **REDO** and
+  **BACKDROP** fire once. **DELETE** requires a 0.6 s hold, with the existing
+  red charge feedback. Release before full charge or lower the left palm
+  to cancel deletion. A held tool stays captured until release and cannot
+  accidentally grab a model behind it. Lower the palm to hide the panel.
+- Tracking loss or a skipped/paused XR frame ends the current hand edit;
+  release the pinch before starting again. Aim-and-pinch select/place remains
+  available without joint tracking, but grab/rotation and palm-up tools need
+  tracked palm joints. The console reports joint availability and tracking,
+  left-pinch carousel actions and tool activations.
+
+**Verification status:** build, automated hand/core tests and offscreen hand
+editing/panel smoke checks are available; these do **not** verify the runtime
+bindings or gesture usability in the headset. Michael's headset confirmation
+is still required for every feature above.
+
 Movement and editing are the **sticks** (controller aim is too jittery for
 accurate placement): the **left stick** slides the selection across the floor
 relative to your head (pushing forward walks it away from you; it never lifts
 off the floor), and the **right stick** scales it (X, right = bigger) and
 raises it (Y, up = lift). The **left controller's menu** is two controls:
 **tap** = the model carousel, **hold** = the backdrop (thumbstick clicks do
-nothing). The old menu-tap MOVE/ROTATE switch is gone — the modes come back as
-gestures — so nothing rotates in VR for now; the desktop **2** key still
+nothing). The old menu-tap MOVE/ROTATE switch is gone — hand grabs provide rotation; the desktop **2** key still
 rotates, strictly around the VIEWER's axes (the scene's vertical and the
 left-right line through your eye, always perpendicular and level, latched per
 gesture: turning your head mid-gesture does not steer it; whole models
 re-rest on the floor after a tip, part selections tip in place). **Grip** held
 runs the sticks at quarter speed for fine control. Each stick gesture is one
 undo step. The bounding box is not a click target: pressing empty space next
-to a model selects nothing. The selection is shown by a thin warm rim; the
-current mode shows as line-font text floating in front of your head (a fixed
-**MOVE** in VR until the gestures land). **A** or a **menu tap**
+to a model selects nothing. The selection is shown by a thin warm rim; the mode label is desktop-only (there is no fixed MOVE label in VR). **A** or a **menu tap**
 is the model carousel: a STATIONARY RING of library models around you — the
 centred model is staged at eye height in front of you and the previous/next
 models sit visible at the sides as cheap geometry-only previews (all
@@ -102,7 +124,7 @@ previews stay untextured; textures load when a model is placed). **right
 stick X**
 rotates
 the ring in and out of view INSTANTLY (decoding runs on a worker thread, so
-a huge model never blocks the switch; no filenames are shown), and the
+a huge model never blocks the switch; each preview is labelled with its filename stem), and the
 trigger places the centred model at natural size on the floor where your aim
 beam
 meets it — one undo step (undo removes it entirely), and the carousel

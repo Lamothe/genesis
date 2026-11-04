@@ -164,6 +164,7 @@ inline std::uint64_t meshContentHash(MeshData const& data) {
 }
 
 struct App;
+bool smokeHandEditing(App& app, VkRenderer& renderer);
 inline MeshHandle cachedMesh(App& app, VkRenderer& renderer, MeshData const& data);
 
 struct App {
@@ -218,6 +219,15 @@ struct App {
   double galleryCycleCooldown{0.0}; // stick-held cycling: one step per 0.25 s
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
   // first deflection past the dead zone, committed when the sticks settle.
+  bool handGrab{false};
+  HandPose grabStart{};
+  Vec3 grabPivot{};
+  std::vector<std::pair<NodeId, Mat4>> grabWorlds;
+  HandPanel handPanel{};
+  bool handPanelCarousel{false};
+  int handHover{-1};
+  int handTool{-1}; // captured until pinch release, never retarget mid-hold
+  bool handUiOwned{false};
   bool stickSession{false};
   // The stick gesture's frame, latched at gesture start: the pivot (the
   // moving set's bounds centre), the pre-signed tip axis and the fine rate.
@@ -627,6 +637,8 @@ void pointerPress(App& app, PointerTarget const& target, bool partSelect) {
 // clear an existing redo branch and make the cancelled edit itself redoable.
 void cancelLiveEdit(App& app) {
   app.stickSession = false;
+  app.handGrab = false;
+  app.handTool = -1;
   // Disarm the sticks exactly like the apply paths: a held stick would
   // otherwise restart the cancelled gesture in the SAME frame, re-applying
   // the drift and swallowing the undo/redo press that cancelled it.
@@ -646,8 +658,10 @@ void cancelLiveEdit(App& app) {
 // still-held key/stick must return to neutral before a new gesture starts,
 // or the next frame would split one physical hold into two undo steps.
 bool endEdits(App& app) {
-  bool const wasActive = app.stickSession;
+  bool const wasActive = app.stickSession || app.handGrab || app.handTool >= 2;
   app.stickSession = false;
+  app.handGrab = false;
+  app.handTool = -1;
   app.stickArmed = false;
   return wasActive ? app.undo.commit(snapshot(app)) : false;
 }
@@ -1480,7 +1494,7 @@ void handleEvent(App& app,
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
       // Undo/redo during a live edit cancels that edit first and stops there,
       // leaving both stacks untouched (see cancelLiveEdit).
-      if (app.stickSession || app.galleryActive) {
+      if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
         cancelLiveEdit(app);
         break;
       }
@@ -1492,7 +1506,7 @@ void handleEvent(App& app,
       }
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      if (app.stickSession || app.galleryActive) {
+      if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
         cancelLiveEdit(app);
         break;
       }
@@ -1994,6 +2008,10 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     return 1;
   }
   std::printf("SMOKE carousel: ring open -> rotate -> place -> undo -> redo OK\n");
+  App handFixture;
+  if (!smokeHandEditing(handFixture, renderer)) {
+    return 1;
+  }
   std::printf("SMOKE PASS (offscreen) on %s\n", renderer.deviceName());
   renderer.shutdown();
   return 0;
@@ -2223,6 +2241,325 @@ int runPerfSmoke(char const* shaderDir, std::vector<char const*> const& modelPat
 
 // Interactive or smoke VR session through the OpenXR shell. Returns 0 when no
 // runtime/headset is available (nothing to test against), 2 on setup failure.
+// Hand-only editing: capture world matrices of the topmost selected nodes.
+// Children ride along once; converting through the current parent keeps part
+// selections correct without applying a hierarchy transform twice.
+void beginHandGrab(App& app, HandPose pose) {
+  Aabb bounds;
+  if (!pose.valid || !movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
+    return;
+  }
+  endEdits(app);
+  app.grabStart = pose;
+  app.grabPivot = (bounds.min + bounds.max) * 0.5F;
+  app.grabWorlds.clear();
+  for (auto id : app.selection) {
+    bool child = false;
+    for (auto parent = app.scene.parent(id); parent != kInvalidNode; parent = app.scene.parent(parent)) {
+      if (std::find(app.selection.begin(), app.selection.end(), parent) != app.selection.end()) {
+        child = true;
+        break;
+      }
+    }
+    if (!child) {
+      app.grabWorlds.emplace_back(id, app.scene.world(id));
+    }
+  }
+  app.undo.begin(snapshot(app));
+  app.handGrab = true;
+}
+
+void updateHandGrab(App& app, HandPose pose) {
+  for (auto const& [id, initial] : app.grabWorlds) {
+    auto world = handGrabTransform(app.grabStart, pose, app.grabPivot, initial);
+    auto parent = app.scene.parent(id);
+    if (parent != kInvalidNode) {
+      Mat4 parentInverse;
+      if (!invertAffine(app.scene.world(parent), parentInverse)) {
+        continue;
+      }
+      world = mul(parentInverse, world);
+    }
+    app.scene.setLocal(id, toTransform(world));
+  }
+}
+
+// History buttons must leave a pending edit intact for the shared cancellation
+// path; committing here would discard an existing redo branch.
+void prepareHandTool(App& app, int button) {
+  if (button != 8 && button != 9) {
+    endEdits(app);
+  }
+}
+
+constexpr std::array<char const*, 12> kHandTools{
+    "PREVIOUS", "NEXT", "SMALLER", "BIGGER", "LOWER", "RAISE",
+    "TURN LEFT", "TURN RIGHT", "UNDO", "REDO", "DELETE", "BACKDROP"};
+
+void drawHandPanel(App const& app, std::vector<RendererVertex>& lines) {
+  if (!app.handPanel.visible) {
+    return;
+  }
+  auto const& panel = app.handPanel;
+  int const first = app.galleryActive ? 0 : 2;
+  int const last = app.galleryActive ? 2 : 12;
+  auto point = [&](Vec3 local) { return panel.origin + rotate(panel.orientation, local); };
+  for (int button = first; button < last; ++button) {
+    auto const centre = handPanelButtonCentre(button);
+    Vec3 const colour = button == app.handTool ? Vec3{1.0F, 0.55F, 0.25F} :
+        button == app.handHover ? Vec3{1.0F, 0.9F, 0.4F} : Vec3{0.6F, 0.9F, 1.0F};
+    Vec3 const corners[4] = {{centre.x-.105F, centre.y-.028F, 0},
+        {centre.x+.105F, centre.y-.028F, 0}, {centre.x+.105F, centre.y+.028F, 0},
+        {centre.x-.105F, centre.y+.028F, 0}};
+    for (int edge = 0; edge < 4; ++edge) {
+      lines.push_back({point(corners[edge]), {0,1,0}, colour, {0,0}});
+      lines.push_back({point(corners[(edge+1)%4]), {0,1,0}, colour, {0,0}});
+    }
+    constexpr float height = .018F;
+    auto at = centre - Vec3{.5F * textLineWidth(kHandTools[button], height), height*.5F, 0};
+    appendTextLines(lines, kHandTools[button], trs(point(at), panel.orientation, {1,1,1}), height, colour);
+  }
+}
+
+bool smokeHandEditing(App& app, VkRenderer& renderer) {
+  auto check = [](bool passed, char const* what) {
+    if (!passed) {
+      std::printf("SMOKE FAIL: hand editing %s\n", what);
+    }
+    return passed;
+  };
+  auto nearVector = [](Vec3 a, Vec3 b) { return length(a - b) < 2e-4F; };
+  auto nearMatrix = [](Mat4 const& a, Mat4 const& b) {
+    for (int i = 0; i < 16; ++i) {
+      if (std::fabs(a.m[i] - b.m[i]) > 2e-4F) {
+        return false;
+      }
+    }
+    return true;
+  };
+  buildDemoScene(app); // isolated fixture; renderer mesh 0 is the built-in cube
+  auto const cube = app.visuals.front().id;
+  app.selection = {cube};
+  auto const before = snapshot(app);
+  auto const initialWorld = app.scene.world(cube);
+  HandPose const start{{.4F, 1.2F, -.3F}, quatFromAxisAngle({1, 2, -1}, .65F), true};
+  auto const turn = quatFromAxisAngle({-1, 2, 3}, .9F);
+  Vec3 const displacement{.3F, .4F, -.2F};
+  HandPose const current{start.position + displacement, normalized(turn * start.orientation), true};
+  beginHandGrab(app, start);
+  auto const pivot = app.grabPivot;
+  if (!check(app.handGrab && app.grabWorlds.size() == 1, "begin captures cube")) {
+    return false;
+  }
+  updateHandGrab(app, current);
+  auto const movedWorld = app.scene.world(cube);
+  if (!check(nearVector(transformPoint(movedWorld, {}), pivot + displacement),
+             "bounds pivot follows palm displacement") ||
+      !check(nearVector(transformVector(movedWorld, {1, 0, 0}),
+                        rotate(turn, transformVector(initialWorld, {1, 0, 0}))) &&
+             nearVector(transformVector(movedWorld, {0, 1, 0}),
+                        rotate(turn, transformVector(initialWorld, {0, 1, 0}))),
+             "full rotation relative to nonidentity palm start")) {
+    return false;
+  }
+  for (int repeat = 0; repeat < 32; ++repeat) {
+    updateHandGrab(app, current);
+  }
+  if (!check(nearMatrix(app.scene.world(cube), movedWorld), "repeated update has no drift")) {
+    return false;
+  }
+  if (!check(endEdits(app) && !app.handGrab, "release commits") ||
+      !check(!endEdits(app), "release does not commit twice")) {
+    return false;
+  }
+  auto const after = snapshot(app);
+  auto state = snapshot(app);
+  if (!check(app.undo.undo(state), "undo exists")) {
+    return false;
+  }
+  applySnapshot(app, state);
+  if (!check(sameSnapshot(snapshot(app), before) && !app.undo.canUndo(), "exactly one undo restores start") ||
+      !check(app.undo.redo(state), "redo exists")) {
+    return false;
+  }
+  applySnapshot(app, state);
+  if (!check(sameSnapshot(snapshot(app), after) && !app.undo.canRedo(), "redo restores grab")) {
+    return false;
+  }
+
+  // Selecting both an ancestor and a child must transform the subtree once.
+  auto const parent = app.scene.create();
+  app.scene.setLocal(parent, {{.8F, .9F, -.4F}, quatFromAxisAngle({1, 1, 0}, .6F), {1.7F, 1.7F, 1.7F}});
+  auto const child = app.scene.create(parent);
+  app.scene.setLocal(child, {{.25F, .1F, -.2F}, quatFromAxisAngle({0, 0, 1}, .3F), {.4F, .4F, .4F}});
+  addCubeVisual(app, child, {.6F, .8F, 1});
+  app.selection = {child, parent}; // child first also exercises ancestor filtering
+  app.undo.clear();
+  auto const childLocal = app.scene.local(child);
+  auto const childWorld = app.scene.world(child);
+  beginHandGrab(app, start);
+  auto const hierarchyPivot = app.grabPivot;
+  auto expectedWorld = [&](Mat4 const& world, Vec3 centre) {
+    return mul(translationMatrix(centre + displacement),
+               mul(rotationMatrix(turn), mul(translationMatrix(-centre), world)));
+  };
+  if (!check(app.grabWorlds.size() == 1 && app.grabWorlds.front().first == parent,
+             "ancestor and child captured once")) {
+    return false;
+  }
+  updateHandGrab(app, current);
+  if (!check(sameTransform(app.scene.local(child), childLocal) &&
+             nearMatrix(app.scene.world(child), expectedWorld(childWorld, hierarchyPivot)),
+             "ancestor moves child exactly once")) {
+    return false;
+  }
+  cancelLiveEdit(app);
+  if (!check(!app.handGrab &&
+             nearMatrix(app.scene.world(child), childWorld) && !app.undo.canUndo(),
+             "cancel clears grab and restores hierarchy without history")) {
+    return false;
+  }
+
+  // Parent-only part selection includes the offset child's geometry in its
+  // rotation pivot, including when the selected parent has no visual mesh.
+  app.selection = {parent};
+  Aabb movingBounds;
+  if (!check(movingSetBounds(app.scene, app.visuals, app.selection, movingBounds),
+             "parent-only moving bounds exist")) {
+    return false;
+  }
+  beginHandGrab(app, start);
+  auto const subtreePivot = (movingBounds.min + movingBounds.max) * .5F;
+  if (!check(nearVector(app.grabPivot, subtreePivot), "parent-only pivot includes descendants")) {
+    return false;
+  }
+  updateHandGrab(app, current);
+  if (!check(nearMatrix(app.scene.world(child), expectedWorld(childWorld, subtreePivot)),
+             "parent-only child rotates about moving subtree centre")) {
+    return false;
+  }
+  cancelLiveEdit(app);
+
+  // Child-only editing converts captured world back through the rotated,
+  // uniformly scaled parent; the unselected parent must remain unchanged.
+  app.selection = {child};
+  auto const parentWorld = app.scene.world(parent);
+  auto const childBefore = snapshot(app);
+  beginHandGrab(app, start);
+  auto const childPivot = app.grabPivot;
+  updateHandGrab(app, current);
+  if (!check(nearMatrix(app.scene.world(parent), parentWorld) &&
+             nearMatrix(app.scene.world(child), expectedWorld(childWorld, childPivot)),
+             "child-only world delta under rotated scaled parent")) {
+    return false;
+  }
+  updateHandGrab(app, current);
+  if (!check(nearMatrix(app.scene.world(child), expectedWorld(childWorld, childPivot)),
+             "child-only repeat has no drift")) {
+    return false;
+  }
+  cancelLiveEdit(app);
+  if (!check(sameSnapshot(snapshot(app), childBefore), "child-only cancellation restores snapshot")) {
+    return false;
+  }
+  HandPose invalid = current;
+  invalid.valid = false;
+  beginHandGrab(app, invalid);
+  // Tracking-invalid samples are gated out by runXr, not passed to updateHandGrab.
+  if (!check(!app.handGrab && sameSnapshot(snapshot(app), childBefore) &&
+             nearMatrix(handGrabTransform(start, invalid, childPivot, childWorld), childWorld),
+             "invalid tracking cannot start or transform a grab")) {
+    return false;
+  }
+
+  // History tools cancel rather than commit live stick edits, preserving
+  // the pre-existing redo branch for either UNDO or REDO.
+  for (int button : {8, 9}) {
+    app.undo.clear();
+    auto const baseState = snapshot(app);
+    app.undo.begin(baseState);
+    moveSelectionVertical(app.scene, app.selection, .2F);
+    app.undo.commit(snapshot(app));
+    auto historyState = snapshot(app);
+    app.undo.undo(historyState);
+    applySnapshot(app, historyState);
+    app.undo.begin(snapshot(app));
+    app.stickSession = true;
+    moveSelectionVertical(app.scene, app.selection, .1F);
+    prepareHandTool(app, button);
+    if (!check(app.stickSession && app.undo.canRedo(), "history tool preserves live edit for cancellation")) {
+      return false;
+    }
+    cancelLiveEdit(app);
+    if (!check(sameSnapshot(snapshot(app), baseState) && app.undo.canRedo() && !app.undo.canUndo(),
+               "history tool cancellation preserves redo branch")) {
+      return false;
+    }
+  }
+
+  app.handPanel = {{0, .195F, 0}, quatFromAxisAngle({0, 1, 0}, .3F), true};
+  auto const normal = rotate(app.handPanel.orientation, {0, 0, 1});
+  for (int index = 0; index < 12; ++index) {
+    auto const centre = app.handPanel.origin + rotate(app.handPanel.orientation, handPanelButtonCentre(index));
+    if (!check(app.handPanel.hit({centre + normal, -normal}) == index,
+               "panel button centre hit")) {
+      return false;
+    }
+  }
+  if (!check(app.handPanel.hit({app.handPanel.origin + normal, -normal}) == -1 &&
+             app.handPanel.hit({app.handPanel.origin - normal, normal}) == -1,
+             "panel gap and back face miss")) {
+    return false;
+  }
+  app.handHover = 2;
+  std::vector<RendererVertex> lines;
+  drawHandPanel(app, lines);
+  if (!check(!lines.empty() && lines.size() % 2 == 0, "panel produces line pairs")) {
+    return false;
+  }
+  Camera camera;
+  auto const centre = app.handPanel.origin + rotate(app.handPanel.orientation, {0, -.195F, 0});
+  camera.position = centre + normal * .85F;
+  camera.yaw = -.3F;
+  camera.pitch = 0;
+  if (!check(renderer.draw(camera, {}, {}, {}), "panel blank draw")) {
+    return false;
+  }
+  std::vector<std::uint8_t> blank;
+  if (!check(renderer.readback(blank), "panel blank readback")) {
+    return false;
+  }
+  if (!check(renderer.draw(camera, {}, {}, lines), "panel draw")) {
+    return false;
+  }
+  std::vector<std::uint8_t> pixels;
+  if (!check(renderer.readback(pixels), "panel readback succeeds")) {
+    return false;
+  }
+  if (!check(!pixels.empty() && pixels.size() == blank.size(), "panel readback")) {
+    return false;
+  }
+  std::size_t changed = 0;
+  for (std::size_t i = 0; i < pixels.size(); i += 4) {
+    if (pixels[i] != blank[i] || pixels[i + 1] != blank[i + 1] || pixels[i + 2] != blank[i + 2]) {
+      ++changed;
+    }
+  }
+  if (!check(changed > 300, "panel visible in rendered pixels") ||
+      !check(writePpm(".build/hand-tools.ppm", pixels, renderer.width(), renderer.height()), "panel screenshot")) {
+    return false;
+  }
+  app.handPanel.visible = false;
+  lines.clear();
+  drawHandPanel(app, lines);
+  if (!check(lines.empty() && app.handPanel.hit({centre + normal, -normal}) == -1,
+             "hidden panel neither draws nor hits")) {
+    return false;
+  }
+  std::printf("SMOKE: hand editing grab/hierarchy/undo/cancel/panel checks passed (%zu panel pixels; .build/hand-tools.ppm)\n", changed);
+  return true;
+}
+
 int runXr(char const* shaderDir,
           std::vector<char const*> const& modelPaths,
           bool smoke,
@@ -2288,6 +2625,12 @@ int runXr(char const* shaderDir,
 
   bool running = true;
   int framesRendered = 0;
+  HandGesture leftPinch;
+  HandGesture rightPinch;
+  bool palmUp = false;
+  int jointSignature = -1;
+  float palmCharge = 0.0F;
+  bool rightWasHand = false;
   int skipsInARow = 0;
   double frameMsTotal = 0.0;
   double frameMsMax = 0.0;
@@ -2299,6 +2642,19 @@ int runXr(char const* shaderDir,
     XrShell::FrameStatus status = shell.beginFrame(input);
     if (status == XrShell::FrameStatus::Exit) {
       break;
+    }
+    if (status == XrShell::FrameStatus::Pump || status == XrShell::FrameStatus::Skipped) {
+      // Rendering must not hide a tracking interruption. End the edit and
+      // require a released pinch before reacquisition can start another one.
+      if (app.handGrab || app.handTool >= 0) {
+        endEdits(app);
+      }
+      leftPinch.reset();
+      rightPinch.reset();
+      app.handUiOwned = true;
+      app.handPanel.visible = false;
+      palmUp = false;
+      palmCharge = 0.0F;
     }
     if (status == XrShell::FrameStatus::Pump) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5)); // session still starting
@@ -2327,12 +2683,139 @@ int runXr(char const* shaderDir,
     // at the user's request ("I can now move in the real world"). Grip is the
     // fine-control modifier.
 
+    // Head and pointer in world space (rig-transformed).
+    Mat4 rigView = cameraView(rig);
+    Mat4 rigWorld{};
+    if (!invertAffine(rigView, rigWorld)) {
+      shell.endFrame(); // frame is begun: pair the begin before bailing
+      running = false;
+      break;
+    }
+    Vec3 headWorld = transformPoint(rigWorld, input.headPosition);
+    Vec3 headForward =
+        normalized(transformVector(rigWorld, rotate(input.headOrient, {0.0F, 0.0F, -1.0F})));
+    Ray worldRay{transformPoint(rigWorld, input.pointerRay.origin),
+                 normalized(transformVector(rigWorld, input.pointerRay.direction))};
+
+    // Only the hand profile can drive gestures: controller joints may be inferred.
+    HandPose worldHands[2] = {input.hands[0], input.hands[1]};
+    for (auto& hand : worldHands) {
+      hand.position = transformPoint(rigWorld, hand.position);
+      hand.orientation = normalized(cameraOrientation(rig) * hand.orientation);
+    }
+    int const jointsNow = (worldHands[0].valid ? 1 : 0) + (worldHands[1].valid ? 2 : 0);
+    if (jointsNow != jointSignature) {
+      std::printf("[hands] palm tracking: left %s, right %s\n",
+          worldHands[0].valid ? "tracked" : "untracked", worldHands[1].valid ? "tracked" : "untracked");
+      jointSignature = jointsNow;
+    }
+    bool const handRight = input.handActive[1];
+    bool const handTracked = handRight && input.aimValid[1];
+    bool const leftPressed = leftPinch.update(input.handActive[0] && input.aimValid[0], input.pinch[0]);
+    bool const rightPressed = rightPinch.update(handTracked, input.pinch[1]);
+    bool const handHeld = handTracked && input.pinch[1] > .4F;
+    if (handRight || rightWasHand) {
+      input.selectPressed = handRight && rightPressed;
+      input.selectHeld = handHeld;
+      input.selectReleased = !handHeld;
+    }
+    rightWasHand = handRight;
+    bool handCarouselToggled = false;
+    if (leftPressed) {
+      endEdits(app);
+      app.handUiOwned = true;
+      if (app.galleryActive) {
+        galleryClose(app);
+      } else {
+        galleryOpen(app, renderer);
+      }
+      handCarouselToggled = true;
+      std::printf("[hands] left pinch: carousel %s\n", app.galleryActive ? "open" : "closed");
+    }
+    palmUp = input.handActive[0] && palmFacingUp(worldHands[0], palmUp);
+    palmCharge = palmUp ? palmCharge + dt : 0.0F;
+    // Latch the carousel anchor before positioning its arrows on the opening frame.
+    if (app.galleryActive && !app.ringLatched) {
+      galleryTick(app, renderer, 0.0F, headWorld, headForward);
+    }
+    bool const panelWanted = handRight && (app.galleryActive || palmCharge >= .25F);
+    if (panelWanted && (!app.handPanel.visible || app.handPanelCarousel != app.galleryActive)) {
+      endEdits(app);
+      app.handPanelCarousel = app.galleryActive;
+      app.handPanel.orientation = quatFromAxisAngle({0,1,0}, std::atan2(-headForward.x, -headForward.z));
+      app.handPanel.origin = headWorld + headForward * .65F + Vec3{0,.08F,0};
+      if (app.galleryActive) {
+        app.handPanel.origin = app.ringOrigin + app.ringForward * .85F + Vec3{0,-.48F,0};
+        app.handPanel.orientation = quatFromAxisAngle({0,1,0}, std::atan2(-app.ringForward.x, -app.ringForward.z));
+      }
+      app.handUiOwned = handHeld;
+      std::printf("[hands] %s panel open\n", app.galleryActive ? "carousel" : "tools");
+    }
+    if (!panelWanted && app.handPanel.visible) {
+      endEdits(app);
+    }
+    app.handPanel.visible = panelWanted;
+    app.handHover = handTracked ? app.handPanel.hit(worldRay) : -1;
+    if ((app.galleryActive && app.handHover >= 2) || (!app.galleryActive && app.handHover < 2)) {
+      app.handHover = -1;
+    }
+    if (!handHeld) {
+      if (app.handGrab || app.handTool >= 0) {
+        endEdits(app);
+      }
+      app.handUiOwned = false;
+    }
+    if (rightPressed && app.handHover >= 0 && !handCarouselToggled) {
+      int const button = app.handHover;
+      prepareHandTool(app, button);
+      app.handUiOwned = true;
+      std::printf("[hands] tool: %s\n", kHandTools[button]);
+      if (button < 2) {
+        galleryCycle(app, renderer, button == 0 ? -1 : 1);
+      } else if (button < 8 && !app.selection.empty()) {
+        app.undo.begin(snapshot(app));
+        app.handTool = button;
+      } else if (button == 8) {
+        input.undoPressed = true;
+      } else if (button == 9) {
+        input.redoPressed = true;
+      } else if (button == 10 && !app.selection.empty()) {
+        app.handTool = button;
+        app.deleteHolding = false;
+      } else if (button == 11) {
+        toggleBackdrop(app, renderer, &shell);
+      }
+    } else if (rightPressed && app.handPanel.visible && !app.galleryActive) {
+      app.handUiOwned = true; // tool panel owns misses too; do not click through
+    }
+    if (app.handTool >= 2 && app.handTool < 8 && handHeld && panelWanted) {
+      if (app.handTool < 4) {
+        scaleSelectionUniform(app.scene, app.visuals, app.selection,
+            std::exp((app.handTool == 2 ? -.45F : .45F) * dt));
+      } else if (app.handTool < 6) {
+        moveSelectionVertical(app.scene, app.selection, (app.handTool == 4 ? -.3F : .3F) * dt);
+      } else {
+        rotateSelectionYaw(app.scene, app.visuals, app.selection,
+            (app.handTool == 6 ? .7F : -.7F) * dt);
+      }
+    }
+    if (app.handGrab) {
+      if (handHeld && worldHands[1].valid && !app.handUiOwned && !panelWanted && !app.galleryActive) {
+        updateHandGrab(app, worldHands[1]);
+      } else {
+        endEdits(app);
+      }
+    }
+    if (handRight && app.handUiOwned) {
+      input.selectPressed = false;
+    }
+
     // The left controller's MENU carries two controls (the user's binding):
     // TAP = the model carousel (open/close, the same rule as A), HOLD (0.4 s)
     // = backdrop toggle. The tap fires on release so a hold can be told apart
     // from a tap (the hold cancels the tap); thumbstick clicks do NOTHING.
     // The tap used to switch MOVE/ROTATE — that comes back as gestures.
-    bool carouselToggled = false;
+    bool carouselToggled = handCarouselToggled;
     if (input.menuPressed || (input.menuHeld && !app.menuPrevHeld)) {
       // The app-side rising edge backs up the shell's edge: a press swallowed
       // by a skipped frame must still initialise the tap/hold state, or a
@@ -2365,7 +2848,7 @@ int runXr(char const* shaderDir,
     }
     bool cancelledLiveEdit = false;
     if (input.undoPressed) {
-      if (app.stickSession || app.galleryActive) {
+      if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
         cancelLiveEdit(app);
         cancelledLiveEdit = true;
       } else {
@@ -2379,7 +2862,7 @@ int runXr(char const* shaderDir,
     // Same guard as the desktop keys: one cancel per frame leaves both stacks
     // untouched even if both arrive together.
     if (input.redoPressed && !cancelledLiveEdit) {
-      if (app.stickSession || app.galleryActive) {
+      if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
         cancelLiveEdit(app);
       } else {
         vredit::EditorSnapshot state = snapshot(app);
@@ -2390,35 +2873,25 @@ int runXr(char const* shaderDir,
       }
     }
 
-    // Head and pointer in world space (rig-transformed).
-    Mat4 rigView = cameraView(rig);
-    Mat4 rigWorld{};
-    if (!invertAffine(rigView, rigWorld)) {
-      shell.endFrame(); // frame is begun: pair the begin before bailing
-      running = false;
-      break;
-    }
-    Vec3 headWorld = transformPoint(rigWorld, input.headPosition);
-    Vec3 headForward =
-        normalized(transformVector(rigWorld, rotate(input.headOrient, {0.0F, 0.0F, -1.0F})));
-    Ray worldRay{transformPoint(rigWorld, input.pointerRay.origin),
-                 normalized(transformVector(rigWorld, input.pointerRay.direction))};
-
     // The right controller's aim ray drives the same state machine as the
     // mouse. A body press only SELECTS —
     // movement and rotation are the sticks' job (controller aim is too
     // jittery for accurate placement).
     app.camera.position = headWorld;
-    if (input.selectPressed) {
+    if (input.selectPressed && !handCarouselToggled) {
       if (app.galleryActive) {
         // The carousel owns the trigger: it places the staged model at the
         // floor point under the aim ray.
         (void)galleryPick(app, renderer, worldRay);
+        if (handRight) { app.handUiOwned = true; }
       } else {
         // Grip + trigger selects a single part; trigger alone the whole model.
         bool const partSelect = input.gripHeld > 0.5F;
         PointerTarget target = resolvePointerTarget(app, worldRay);
         pointerPress(app, target, partSelect);
+        if (handTracked) {
+          beginHandGrab(app, worldHands[1]);
+        }
       }
     }
 
@@ -2479,7 +2952,7 @@ int runXr(char const* shaderDir,
     if (!sticksActive) {
       app.stickArmed = true;
     }
-    if (sticksActive && !app.stickSession && !app.galleryActive &&
+    if (sticksActive && !app.stickSession && !app.handGrab && app.handTool < 0 && !app.galleryActive &&
         !app.selection.empty() && app.stickArmed) {
       app.undo.begin(snapshot(app));
       app.stickSession = true;
@@ -2560,7 +3033,8 @@ int runXr(char const* shaderDir,
     // Hold-X delete: the selection's tint ramps red over kDeleteChargeS and
     // the delete fires at full charge; release before that cancels. Hold-to-
     // confirm on purpose — face buttons on Quest controllers are wobbly.
-    if (input.deleteHeld && !app.selection.empty() && !app.galleryActive) {
+    if ((input.deleteHeld || (app.handTool == 10 && handHeld && panelWanted)) &&
+        !app.selection.empty() && !app.galleryActive) {
       if (!app.deleteHolding) {
         app.deleteHolding = true;
         app.deleteHoldStart = std::chrono::steady_clock::now();
@@ -2600,6 +3074,7 @@ int runXr(char const* shaderDir,
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;
     assembleFrame(app, items, depthLines, overlayLines);
+    drawHandPanel(app, overlayLines);
     // Controller pointers: one beam per tracked hand, always on top so the
     // aimed point is visible even against the model. Left is cool, right (the
     // manipulation pointer) is warm.

@@ -5,6 +5,7 @@
 #include <vulkan/vulkan.h>
 
 #include "camera.h"
+#include "hand_input.h"
 #include "vecmath.h"
 
 namespace vredit {
@@ -15,6 +16,9 @@ namespace vredit {
 // combined basis gets its own horizon lock (a pitched rig composed with a
 // yawed head produces phantom roll otherwise).
 struct XrFrameInput {
+  HandPose hands[2]; // palm joint poses, not runtime-filtered aim orientations
+  bool handActive[2] = {false, false}; // actual hand-interaction profile
+  float pinch[2] = {0.0F, 0.0F};
   Mat4 eyeProj[2];       // per-eye projection from the runtime fov tangents
   Vec3 eyePos[2];        // corrected eye positions (tracking space)
   Quat eyeOrient[2];     // corrected eye orientations (tracking space)

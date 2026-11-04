@@ -33,4 +33,7 @@ fi
   src/mesh.cpp src/json.cpp src/gltf.cpp src/obj.cpp src/image.cpp \
   tests/test_core.cpp \
   -lz -o .build/test-core
-exec ./.build/test-core
+./.build/test-core
+"$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
+  tests/test_hands.cpp -o .build/test-hands
+exec ./.build/test-hands
