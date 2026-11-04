@@ -84,6 +84,10 @@ public:
   Transform const& local(NodeId id) const;
   void setLocal(NodeId id, Transform const& t); // no-op when exactly unchanged
 
+  // Non-undoable animation offset after the editable local transform.
+  void setPoseOffset(NodeId id, Mat4 const& offset);
+  Mat4 poseOffset(NodeId id) const;
+
   Mat4 world(NodeId id);
   Vec3 worldPosition(NodeId id);
 
@@ -107,6 +111,7 @@ private:
     NodeId parent{kInvalidNode};
     std::vector<NodeId> children;
     Transform local{};
+    Mat4 poseOffset{};
     Mat4 world{};
     bool worldDirty{true};
   };

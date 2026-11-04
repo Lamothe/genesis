@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "animation.h"
 #include "image.h"
 #include "scene.h"
 
@@ -67,6 +68,7 @@ struct Model {
   std::vector<ModelNode> nodes;
   std::vector<std::int32_t> roots;
   std::vector<ModelTexture> textures;
+  std::vector<AnimationClip> clips;
 };
 
 // Axis-aligned bounds of mesh data (local space).

@@ -130,6 +130,44 @@ inline bool palmFacingUp(HandPose const& pose, bool previous) {
          rotate(pose.orientation, {0.0F, -1.0F, 0.0F}).y > (previous ? 0.55F : 0.75F);
 }
 
+// Frame latched at grab start. Projection offsets are relative to the eye,
+// so a remote surface follows the same fraction of the view as the hand.
+struct HandGrabView {
+  Vec3 eye{};
+  Quat orientation{}; // local -Z is forward
+  bool valid{false};
+};
+
+inline Vec3 projectedGrabPoint(HandGrabView const& view, Vec3 handStart, Vec3 handNow, Vec3 point) {
+  if (!view.valid) { return point + (handNow - handStart); }
+  auto const inv = conjugate(view.orientation);
+  auto const h0 = rotate(inv, handStart - view.eye);
+  auto const h1 = rotate(inv, handNow - view.eye);
+  auto const p = rotate(inv, point - view.eye);
+  float const z0 = -h0.z, z1 = -h1.z, zp = -p.z;
+  if (!(z0 > .10F && zp > .05F)) { return point + (handNow - handStart); }
+  // Clamp projection at the near plane rather than switching formulae as a
+  // hand crosses it. This avoids a discontinuity and unbounded lateral gain.
+  float const safeDepth = std::fmax(.10F, z1);
+  float const depth = std::fmax(.05F, zp + z1 - z0);
+  Vec3 const target{(p.x / zp + h1.x / safeDepth - h0.x / z0) * depth,
+                    (p.y / zp + h1.y / safeDepth - h0.y / z0) * depth, -depth};
+  return view.eye + rotate(view.orientation, target);
+}
+
+inline Mat4 projectedHandGrabTransform(HandGrabView const& view, HandPose start,
+                                      HandPose current, Vec3 pivot, Mat4 initialWorld) {
+  if (!start.valid || !current.valid) { return initialWorld; }
+  if (current.position.x == start.position.x && current.position.y == start.position.y &&
+      current.position.z == start.position.z && start.orientation.x == current.orientation.x &&
+      start.orientation.y == current.orientation.y && start.orientation.z == current.orientation.z &&
+      start.orientation.w == current.orientation.w) { return initialWorld; }
+  auto const rotation = normalized(current.orientation * conjugate(start.orientation));
+  auto const target = projectedGrabPoint(view, start.position, current.position, pivot);
+  return mul(translationMatrix(target), mul(rotationMatrix(rotation),
+             mul(translationMatrix(-pivot), initialWorld)));
+}
+
 // Poses/orientations are world-space unit quaternions, as supplied by tracking.
 // Always reapply the cumulative delta to the captured initialWorld, never the
 // previous result. The caller converts world to parent-local if needed.

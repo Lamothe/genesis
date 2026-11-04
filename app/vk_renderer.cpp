@@ -663,15 +663,6 @@ struct VkRenderer::Impl {
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachments = &colourAttachment;
     rendering.pDepthAttachment = &depthAttachment;
-    vkCmdBeginRendering(command, &rendering);
-
-    VkViewport viewport{0.0F, 0.0F, static_cast<float>(width), static_cast<float>(height), 0.0F,
-                        1.0F};
-    VkRect2D scissor{{0, 0}, {width, height}};
-    vkCmdSetViewport(command, 0, 1, &viewport);
-    vkCmdSetScissor(command, 0, 1, &scissor);
-    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
-                            &descriptorSet, 0, nullptr);
 
     // Draw order: opaque/mask items keep the app's order; blend items draw
     // farthest-centre-first with a stable tie-break — the Centre Stage rule
@@ -831,6 +822,16 @@ struct VkRenderer::Impl {
     if (stagingBuffer != VK_NULL_HANDLE) {
       freeLater(stagingBuffer, stagingMemory); // read this frame; freed after the fence wait
     }
+
+    // Transfer commands and their barrier must be outside dynamic rendering.
+    vkCmdBeginRendering(command, &rendering);
+    VkViewport viewport{0.0F, 0.0F, static_cast<float>(width), static_cast<float>(height), 0.0F,
+                        1.0F};
+    VkRect2D scissor{{0, 0}, {width, height}};
+    vkCmdSetViewport(command, 0, 1, &viewport);
+    vkCmdSetScissor(command, 0, 1, &scissor);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
+                            &descriptorSet, 0, nullptr);
 
     // Meshes: one indexed draw per item in the computed order (opaque+mask
     // first, blends last; blend draws read their per-view sorted indices).
@@ -1094,9 +1095,17 @@ bool VkRenderer::init(Config const& config) {
   for (VkPhysicalDevice device : devices) {
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(device, &props);
-    if (props.apiVersion < VK_API_VERSION_1_3) {
+    VkPhysicalDeviceFeatures supported{};
+    vkGetPhysicalDeviceFeatures(device, &supported);
+    auto const& limits = props.limits;
+    auto const count = static_cast<std::uint32_t>(Impl::kMaxTextures);
+    if (props.apiVersion < VK_API_VERSION_1_3 || !supported.shaderSampledImageArrayDynamicIndexing ||
+        limits.maxPerStageDescriptorSampledImages < count || limits.maxPerStageDescriptorSamplers < count ||
+        limits.maxDescriptorSetSampledImages < count || limits.maxDescriptorSetSamplers < count ||
+        limits.maxPerStageResources < count + 1U) {
       continue;
     }
+
     std::uint32_t familyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(device, &familyCount, nullptr);
     std::vector<VkQueueFamilyProperties> families(familyCount);
@@ -1160,8 +1169,18 @@ bool VkRenderer::init(Config const& config) {
     deviceExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
   }
 
+  VkPhysicalDeviceFeatures supported{};
+  vkGetPhysicalDeviceFeatures(g.physical, &supported);
+  if (!supported.shaderSampledImageArrayDynamicIndexing) {
+    std::printf("[vk] sampled image dynamic indexing unavailable\n");
+    return false;
+  }
+  VkPhysicalDeviceFeatures enabled{};
+  enabled.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
   VkDeviceCreateInfo deviceInfo =
       vkStruct<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+  deviceInfo.pEnabledFeatures = &enabled;
+
   deviceInfo.pNext = &features13;
   deviceInfo.queueCreateInfoCount = 1;
   deviceInfo.pQueueCreateInfos = &queueInfo;
@@ -1237,7 +1256,18 @@ bool VkRenderer::createCommonResources(char const* shaderDir, VkFormat colourFor
   moduleInfo.pCode = reinterpret_cast<std::uint32_t const*>(fragCode.data());
   VK_CHECK(vkCreateShaderModule(g.device, &moduleInfo, nullptr, &g.fragModule));
 
+  VkPhysicalDeviceProperties limitsProps{};
+  vkGetPhysicalDeviceProperties(g.physical, &limitsProps);
+  auto const& limits = limitsProps.limits;
+  auto const count = static_cast<std::uint32_t>(Impl::kMaxTextures);
+  if (limits.maxPerStageDescriptorSampledImages < count || limits.maxPerStageDescriptorSamplers < count ||
+      limits.maxDescriptorSetSampledImages < count || limits.maxDescriptorSetSamplers < count ||
+      limits.maxPerStageResources < count + 1U) {
+    std::printf("[vk] insufficient descriptor limits for %u textures\n", count);
+    return false;
+  }
   VkDescriptorSetLayoutBinding bindings[2] = {};
+
   bindings[0].binding = 0;
   bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
   bindings[0].descriptorCount = 1;
@@ -1701,10 +1731,10 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
       vkAllocateMemory(g.device, &allocInfo, nullptr, &record.memory) != VK_SUCCESS ||
       vkBindImageMemory(g.device, record.image, record.memory, 0) != VK_SUCCESS) {
     std::printf("[vk] texture memory allocation failed\n");
+    vkDestroyImage(g.device, record.image, nullptr);
     if (record.memory != VK_NULL_HANDLE) {
       vkFreeMemory(g.device, record.memory, nullptr);
     }
-    vkDestroyImage(g.device, record.image, nullptr);
     return kInvalidTexture;
   }
 
@@ -1718,8 +1748,8 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   viewInfo.subresourceRange.layerCount = 1;
   if (vkCreateImageView(g.device, &viewInfo, nullptr, &record.view) != VK_SUCCESS) {
     std::printf("[vk] texture view creation failed\n");
-    vkFreeMemory(g.device, record.memory, nullptr);
     vkDestroyImage(g.device, record.image, nullptr);
+    vkFreeMemory(g.device, record.memory, nullptr);
     return kInvalidTexture;
   }
 
@@ -1737,8 +1767,8 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   if (vkCreateSampler(g.device, &samplerInfo, nullptr, &record.sampler) != VK_SUCCESS) {
     std::printf("[vk] texture sampler creation failed\n");
     vkDestroyImageView(g.device, record.view, nullptr);
-    vkFreeMemory(g.device, record.memory, nullptr);
     vkDestroyImage(g.device, record.image, nullptr);
+    vkFreeMemory(g.device, record.memory, nullptr);
     return kInvalidTexture;
   }
 
@@ -1759,8 +1789,8 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
                       stagingBuffer, stagingMemory, &stagingMapped)) {
     vkDestroySampler(g.device, record.sampler, nullptr);
     vkDestroyImageView(g.device, record.view, nullptr);
-    vkFreeMemory(g.device, record.memory, nullptr);
     vkDestroyImage(g.device, record.image, nullptr);
+    vkFreeMemory(g.device, record.memory, nullptr);
     return kInvalidTexture;
   }
   auto* window = static_cast<std::uint8_t*>(stagingMapped);

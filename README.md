@@ -66,7 +66,7 @@ arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
 **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (the
 ring of models rotates in/out of view around the camera; **[** **]** cycle
 the library; clicking the exact surface of the centred preview places the
-staged model at the floor point under the cursor as one undo step. Otherwise,
+staged model below the centred preview as one undo step. Otherwise,
 clicking the left/right ray zones browses one model per click; a central miss
 does nothing. **N**
 closes without placing), **Delete** removes the selection (model or part),
@@ -82,12 +82,13 @@ buttons and sticks are unchanged:
   palm-up alone does nothing. Choose **Models** to open the carousel.
 - In the carousel, **right pinch** the exact surface of the settled centre
   preview to place it. Otherwise, the left/right ray zones browse one model
-  per pinch; a central miss does nothing. The centre marker identifies the
-  model that can be placed. Desktop and controller use the same hit rules.
+  per pinch; a central miss does nothing. Placing a model closes the menu.
+  The centre marker identifies the model that can be placed. Desktop and controller use the same hit rules.
 - Outside the menu, **right pinch and release** selects the whole model under
   the aim beam. Pinch and hold the selected model again to move it with the
-  palm and rotate it with the wrist. Movement is filtered, 1:1, and includes
-  height; releasing commits one undo step. Hand selection is whole-model only;
+  palm and rotate it with the wrist around the picked surface. Lateral motion is
+  view-relative (larger at greater distance); depth motion remains physical.
+  The grab view is latched; releasing commits one undo step. Hand selection is whole-model only;
   controllers retain grip+trigger part selection.
 - While holding a right-hand grab, pinch and hold with the left hand and vary
   the distance between the palms to scale uniformly about the model's centre.
@@ -135,7 +136,7 @@ rotates
 the ring in and out of view INSTANTLY (decoding runs on a worker thread, so
 a huge model never blocks the switch; each preview is labelled with its filename stem), and the
 trigger places the centred model only when its exact preview surface is hit,
-at natural size on the floor where your aim beam meets it — one undo step
+at natural size on the floor below the centred preview — one undo step
 (undo removes it entirely), and the carousel closes. Otherwise, left/right
 ray zones browse one model per trigger press; a central miss is inert. **A**, a **menu tap** or undo (B) closes without placing. The library folder
 (`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
@@ -153,6 +154,25 @@ session end as controller diagnostics). The view is horizon-locked: the head's p
 roll is stripped (the look direction is kept exactly), so the ground stays
 level with gravity however you move or turn. Desktop keeps its keyboard
 flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
+
+## Animation and rendering status
+
+The first usable glTF node-TRS clip plays automatically and loops on placed
+models and command-line imports. STEP, LINEAR and CUBICSPLINE translation,
+rotation and scale are supported; playback is separate from undoable edits.
+Unsupported clips are logged and skipped. This is **not skinning**: rigged
+characters, morph targets and clips requiring them will not deform. Nodes with
+singular (zero-scale) rest transforms cannot currently be animated. There is no
+clip selector yet.
+
+A comparison with Centre Stage identified the missing PBR materials,
+transmission, emissive, sRGB material pipeline and studio lighting. This change
+only fixes normal transforms and Vulkan blend-upload synchronisation; it does
+not claim Centre Stage appearance parity. Hand meshes and virtual-object contact
+are not implemented: the downloaded hand's library GLB has no skin, while the
+original archive contains a rig; tracked-joint-to-rig retargeting, depth-tested
+hand rendering and collision need further work. Passthrough does not supply real
+room geometry for collision.
 
 ## Design notes
 

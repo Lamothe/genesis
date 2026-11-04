@@ -25,7 +25,20 @@ layout(location = 3) out vec3 vWorldPos;
 void main() {
   vec4 world = push.model * vec4(inPos, 1.0);
   gl_Position = frame.viewProj * world;
-  vNormal = mat3(push.model) * inNormal;
+  mat3 linear = mat3(push.model);
+  // Scaling first avoids a determinant threshold that depends on model size.
+  float scale = max(max(max(abs(linear[0].x), abs(linear[0].y)), abs(linear[0].z)),
+                    max(max(max(abs(linear[1].x), abs(linear[1].y)), abs(linear[1].z)),
+                        max(max(abs(linear[2].x), abs(linear[2].y)), abs(linear[2].z))));
+  vec3 normal = inNormal;
+  if (scale > 0.0) {
+    mat3 scaled = linear / scale;
+    // A singular (or nearly singular) transform has no stable inverse.
+    normal = abs(determinant(scaled)) > 1e-8
+        ? transpose(inverse(scaled)) * inNormal : scaled * inNormal;
+  }
+  // Keep even zero normals and collapsed axes finite for fragment shading.
+  vNormal = dot(normal, normal) > 1e-20 ? normal : vec3(0.0, 0.0, 1.0);
   vColour = inColour * push.tint.rgb;
   vUv = inUv;
   vWorldPos = world.xyz;

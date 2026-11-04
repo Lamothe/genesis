@@ -45,7 +45,16 @@ public:
     return recorded;
   }
 
+  template <typename Predicate>
+  bool anySnapshot(Predicate predicate) const {
+    if (pendingOpen_ && predicate(pending_)) { return true; }
+    for (auto const& value : undo_) { if (predicate(value)) { return true; } }
+    for (auto const& value : redo_) { if (predicate(value)) { return true; } }
+    return false;
+  }
+
   bool canUndo() const { return !undo_.empty(); }
+
   bool canRedo() const { return !redo_.empty(); }
 
   // Moves `current` (the live state) onto the redo stack and pops the top

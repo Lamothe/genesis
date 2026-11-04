@@ -159,6 +159,7 @@ private:
   // the slot unbound.
   void bindTexture(std::size_t textureIndex, std::int32_t& slotOut);
   Transform parseTransform(JsonDocument::NodeId nodeDef);
+  bool buildAnimations(JsonDocument::NodeId animations);
 
   std::vector<std::uint8_t> const& bytes_;
   Model& model_;
@@ -183,6 +184,7 @@ private:
   };
   std::vector<TextureKey> textureCache_; // dedupe on (image, wrap modes)
   std::vector<bool> visited_;
+  std::vector<std::int32_t> nodeMap_;
 };
 
 bool GlbReader::fail(char const* message) {
@@ -302,6 +304,9 @@ bool GlbReader::buildAccessor(JsonDocument::NodeId accessorNode, AccessorView& o
   std::uint32_t components = 0;
   if (!typeComponents(document_.asString(document_.member(accessorNode, "type")), components)) {
     return fail("glb: unsupported accessor type");
+  }
+  if (componentType > UINT32_MAX) {
+    return fail("glb: unsupported componentType");
   }
   std::size_t compSize = componentSize(static_cast<std::uint32_t>(componentType));
   if (compSize == 0U) {
@@ -679,6 +684,7 @@ bool GlbReader::collectNode(std::size_t nodeIndex, std::int32_t parentModel,
   model_.nodes.push_back(node);
   std::int32_t modelIndex = static_cast<std::int32_t>(model_.nodes.size() - 1U);
   modelIndexOut = modelIndex;
+  nodeMap_[nodeIndex] = modelIndex;
   if (parentModel < 0) {
     model_.roots.push_back(modelIndex);
   }
@@ -729,6 +735,166 @@ bool GlbReader::collectNode(std::size_t nodeIndex, std::int32_t parentModel,
   return true;
 }
 
+// Channels outside the selected scene are validated but not emitted. Unused
+// samplers are ignored. Morph weights and sparse accessors are not supported;
+// reject them explicitly rather than silently misinterpreting animation data.
+bool GlbReader::buildAnimations(JsonDocument::NodeId animations) {
+  if (animations == JsonDocument::kInvalid) {
+    return true;
+  }
+  if (document_.type(animations) != JsonDocument::Type::Array) {
+    return fail("glb: animations must be an array");
+  }
+  for (std::size_t a = 0; a < document_.size(animations); ++a) {
+    auto animation = document_.element(animations, a);
+    // A bad or unsupported clip must not discard other playable clips.
+    auto const parseClip = [&]() -> bool {
+
+    auto samplers = document_.member(animation, "samplers");
+    auto channels = document_.member(animation, "channels");
+    if (document_.type(animation) != JsonDocument::Type::Object ||
+        document_.type(samplers) != JsonDocument::Type::Array ||
+        document_.type(channels) != JsonDocument::Type::Array ||
+        document_.size(samplers) == 0 || document_.size(channels) == 0) {
+      return fail("glb: invalid animation");
+    }
+    AnimationClip clip;
+    clip.name = document_.asString(document_.member(animation, "name"));
+    std::vector<std::pair<std::size_t, AnimationPath>> targets;
+    for (std::size_t c = 0; c < document_.size(channels); ++c) {
+      auto channel = document_.element(channels, c);
+      auto target = document_.member(channel, "target");
+      std::size_t samplerIndex = 0, nodeIndex = 0;
+      if (document_.type(channel) != JsonDocument::Type::Object ||
+          document_.type(target) != JsonDocument::Type::Object ||
+          !readSize(document_.member(channel, "sampler"), samplerIndex, "animation sampler") ||
+          !readSize(document_.member(target, "node"), nodeIndex, "animation target node")) {
+        return fail("glb: invalid animation channel");
+      }
+      if (samplerIndex >= document_.size(samplers) || nodeIndex >= nodeMap_.size()) {
+        return fail("glb: animation reference out of range");
+      }
+      auto pathNode = document_.member(target, "path");
+      auto path = document_.asString(pathNode);
+      AnimationChannel result;
+      std::uint32_t components = 3;
+      if (document_.type(pathNode) != JsonDocument::Type::String) {
+        return fail("glb: invalid animation path");
+      } else if (path == "translation") {
+        result.path = AnimationPath::Translation;
+      } else if (path == "rotation") {
+        result.path = AnimationPath::Rotation;
+        components = 4;
+      } else if (path == "scale") {
+        result.path = AnimationPath::Scale;
+      } else {
+        return fail("glb: unsupported animation path");
+      }
+      if (document_.member(document_.element(nodesNode_, nodeIndex), "matrix") !=
+          JsonDocument::kInvalid) {
+        return fail("glb: animated node has matrix");
+      }
+      for (auto const& previous : targets) {
+        if (previous.first == nodeIndex && previous.second == result.path) {
+          return fail("glb: duplicate animation target");
+        }
+      }
+      targets.emplace_back(nodeIndex, result.path);
+      auto sampler = document_.element(samplers, samplerIndex);
+      if (document_.type(sampler) != JsonDocument::Type::Object) {
+        return fail("glb: invalid animation sampler");
+      }
+      auto interpolation = document_.member(sampler, "interpolation");
+      if (interpolation != JsonDocument::kInvalid) {
+        if (document_.type(interpolation) != JsonDocument::Type::String) {
+          return fail("glb: invalid interpolation");
+        }
+        auto const& mode = document_.asString(interpolation);
+        if (mode == "STEP") {
+          result.interpolation = AnimationInterpolation::Step;
+        } else if (mode == "CUBICSPLINE") {
+          result.interpolation = AnimationInterpolation::CubicSpline;
+        } else if (mode != "LINEAR") {
+          return fail("glb: unsupported interpolation");
+        }
+      }
+      std::size_t inputIndex = 0, outputIndex = 0;
+      if (!readSize(document_.member(sampler, "input"), inputIndex, "animation input") ||
+          !readSize(document_.member(sampler, "output"), outputIndex, "animation output")) {
+        return false;
+      }
+      if (document_.type(accessorsNode_) != JsonDocument::Type::Array) {
+        return fail("glb: animation accessors must be an array");
+      }
+      auto inputNode = document_.element(accessorsNode_, inputIndex);
+      auto outputNode = document_.element(accessorsNode_, outputIndex);
+      if (document_.member(inputNode, "sparse") != JsonDocument::kInvalid ||
+          document_.member(outputNode, "sparse") != JsonDocument::kInvalid) {
+        return fail("glb: sparse animation accessor unsupported");
+      }
+      for (auto accessor : {inputNode, outputNode}) {
+        auto offset = document_.member(accessor, "byteOffset");
+        auto normalised = document_.member(accessor, "normalized");
+        if ((offset != JsonDocument::kInvalid && document_.type(offset) != JsonDocument::Type::Number) ||
+            (normalised != JsonDocument::kInvalid && document_.type(normalised) != JsonDocument::Type::Bool)) {
+          return fail("glb: invalid animation accessor field");
+        }
+      }
+      AccessorView input, output;
+      if (!buildAccessor(inputNode, input) || !buildAccessor(outputNode, output)) {
+        return false;
+      }
+      std::size_t factor = result.interpolation == AnimationInterpolation::CubicSpline ? 3U : 1U;
+      if (input.componentType != 5126 || input.components != 1 || input.normalised ||
+          output.componentType != 5126 || output.components != components || output.normalised ||
+          input.count == 0 || input.count > output.count / factor ||
+          output.count != input.count * factor) {
+        return fail("glb: invalid animation accessor format or count");
+      }
+      result.times.reserve(input.count);
+      for (std::size_t i = 0; i < input.count; ++i) {
+        float t = readComponentFloat(input, i, 0);
+        if (!std::isfinite(t) || t < 0 || (i && t <= result.times.back())) {
+          return fail("glb: invalid animation key times");
+        }
+        result.times.push_back(t);
+      }
+      result.values.reserve(output.count);
+      for (std::size_t i = 0; i < output.count; ++i) {
+        AnimationValue value;
+        value.x = readComponentFloat(output, i, 0);
+        value.y = readComponentFloat(output, i, 1);
+        value.z = readComponentFloat(output, i, 2);
+        if (components == 4) {
+          value.w = readComponentFloat(output, i, 3);
+        }
+        if (!std::isfinite(value.x) || !std::isfinite(value.y) ||
+            !std::isfinite(value.z) || !std::isfinite(value.w)) {
+          return fail("glb: non-finite animation value");
+        }
+        if (result.path == AnimationPath::Rotation && (factor == 1U || i % 3U == 1U) &&
+            value.x == 0 && value.y == 0 && value.z == 0 && value.w == 0) {
+          return fail("glb: zero animation quaternion");
+        }
+        result.values.push_back(value);
+      }
+      if (nodeMap_[nodeIndex] >= 0) {
+        result.node = static_cast<std::size_t>(nodeMap_[nodeIndex]);
+        clip.channels.push_back(std::move(result));
+      }
+    }
+    if (!clip.channels.empty()) { model_.clips.push_back(std::move(clip)); }
+    return true;
+    };
+    if (!parseClip()) {
+      std::fprintf(stderr, "glb: animation clip %zu ignored: %s\n", a, error_.c_str());
+      error_.clear();
+    }
+  }
+  return true;
+
+}
+
 bool GlbReader::run() {
   if (!parseContainer()) {
     return false;
@@ -745,6 +911,7 @@ bool GlbReader::run() {
   samplersNode_ = document_.member(root, "samplers");
   imagesNode_ = document_.member(root, "images");
   visited_.assign(document_.size(nodesNode_), false);
+  nodeMap_.assign(document_.size(nodesNode_), -1);
 
   JsonDocument::NodeId scenesNode = document_.member(root, "scenes");
   JsonDocument::NodeId sceneNode = JsonDocument::kInvalid;
@@ -770,7 +937,15 @@ bool GlbReader::run() {
       return false;
     }
   }
+  // Animation is optional: an unsupported clip must not make a previously
+  // viewable model disappear from the library.
+  if (!buildAnimations(document_.member(root, "animations"))) {
+    std::fprintf(stderr, "glb: animation ignored: %s\n", error_.c_str());
+    model_.clips.clear();
+    error_.clear();
+  }
   return true;
+
 }
 
 } // namespace

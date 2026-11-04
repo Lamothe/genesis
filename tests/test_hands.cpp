@@ -160,7 +160,35 @@ void palms() {
   CHECK(!palmFacingUp(pose, true));
 }
 
+void projection() {
+  HandGrabView const view{{0,0,0}, {}, true};
+  Vec3 const hand{.1F, .1F, -.5F};
+  Vec3 const moved{.15F, .08F, -.5F};
+  for (float depth : {1.0F, 10.0F, 100.0F}) {
+    Vec3 const surface{depth*.2F, depth*.1F, -depth};
+    Vec3 const target = projectedGrabPoint(view, hand, moved, surface);
+    CHECK(std::fabs(target.x / depth - surface.x / depth - .1F) < .0001F);
+    CHECK(std::fabs(target.y / depth - surface.y / depth + .04F) < .0001F);
+    HandPose const start{hand, {}, true};
+    HandPose const now{moved, quatFromAxisAngle({0, 1, 0}, .4F), true};
+    auto const delta = projectedHandGrabTransform(view, start, now, surface, Mat4{});
+    CHECK(length(transformPoint(delta, surface) - target) < .0001F);
+  }
+  auto const orientation = quatFromAxisAngle({0, 1, 0}, .7F);
+  HandGrabView const turned{{2,1,3}, orientation, true};
+  auto world = [&](Vec3 v) { return turned.eye + rotate(orientation, v); };
+  auto const target = projectedGrabPoint(turned, world(hand), world(moved), world({2,1,-10}));
+  CHECK(length(target - world({3,.6F,-10})) < .0001F);
+  auto const nearA = projectedGrabPoint(view, hand, {.2F,.1F,-.10001F}, {0,0,-10});
+  auto const nearB = projectedGrabPoint(view, hand, {.2F,.1F,-.09999F}, {0,0,-10});
+  CHECK(length(nearA - nearB) < .01F);
+  auto const fallback = projectedGrabPoint(view, {0,0,0}, {1,0,0}, {0,0,-10});
+
+  CHECK(near(fallback, {1,0,-10}));
+}
+
 void grabs() {
+
   HandPose const start{{1, 2, 3},
                        quatFromAxisAngle({1, 0, 0}, 0.4F) *
                        quatFromAxisAngle({0, 1, 0}, -0.7F), true};
@@ -234,6 +262,7 @@ int main() {
   carouselDirections();
   panels();
   palms();
+  projection();
   grabs();
   std::printf("Hand tests: %d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;

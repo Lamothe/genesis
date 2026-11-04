@@ -330,7 +330,17 @@ XrShell::InitResult XrShell::init() {
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES);
   features13.dynamicRendering = VK_TRUE;
   features13.synchronization2 = VK_TRUE;
+  VkPhysicalDeviceFeatures supported{};
+  vkGetPhysicalDeviceFeatures(physical_, &supported);
+  if (!supported.shaderSampledImageArrayDynamicIndexing) {
+    std::printf("[xr] sampled image dynamic indexing unavailable\n");
+    return InitResult::Failed;
+  }
+  VkPhysicalDeviceFeatures enabled{};
+  enabled.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
   VkDeviceCreateInfo vkDeviceInfo = vkStruct<VkDeviceCreateInfo>(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
+  vkDeviceInfo.pEnabledFeatures = &enabled;
+
   vkDeviceInfo.pNext = &features13;
   vkDeviceInfo.queueCreateInfoCount = 1;
   vkDeviceInfo.pQueueCreateInfos = &queueInfo;

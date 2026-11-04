@@ -24,7 +24,7 @@ layout(push_constant) uniform Push {
 void main() {
   int textureIndex = int(push.params.y + 0.5);
   vec4 texel = texture(uTextures[textureIndex], vUv);
-  vec3 n = normalize(vNormal);
+  vec3 n = dot(vNormal, vNormal) > 1e-20 ? normalize(vNormal) : vec3(0.0, 0.0, 1.0);
   if (push.normalParams.x > 0.5) {
     // Tangent-space normal map with a derivative-based TBN. Solving the 2x2
     // system for dW/du and dW/dv directly (Cramer) is correct in any screen
@@ -48,6 +48,11 @@ void main() {
         n = normalize((t / tLen) * mapN.x + (b / bLen) * mapN.y + n * mapN.z);
       }
     }
+  }
+  // The renderer currently draws every material double-sided. Reverse the
+  // fully mapped normal on back faces, including its tangent-space components.
+  if (!gl_FrontFacing) {
+    n = -n;
   }
   float ndl = abs(dot(n, normalize(vec3(0.35, 0.85, 0.45))));
   float light = mix(1.0, 0.35 + 0.65 * ndl, push.params.x);

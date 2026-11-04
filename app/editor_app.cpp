@@ -26,6 +26,7 @@
 
 #include "xr_shell.h"
 
+#include "animation.h"
 #include "camera.h"
 #include "carousel.h"
 #include "editor_state.h"
@@ -167,9 +168,18 @@ struct App;
 bool smokeHandEditing(App& app, VkRenderer& renderer);
 inline MeshHandle cachedMesh(App& app, VkRenderer& renderer, MeshData const& data);
 
+struct AnimationInstance {
+  Model model; // nodes and clips only; mesh/image payload is not retained
+  std::vector<NodeId> nodes;
+  double elapsed{0};
+  float duration{0};
+};
+
 struct App {
+
   bool xr{false};
   Scene scene;
+  std::vector<AnimationInstance> animations;
   std::vector<NodeVisual> visuals;
   std::vector<NodeId> selection;
   // Model grouping: every node created for one loaded model shares a group id,
@@ -208,6 +218,7 @@ struct App {
   std::array<CarouselSlot, 5> carousel{}; // centre ± 2 ring slots
   std::uint64_t carouselGen{1};           // load generation (stale = dropped)
   AsyncLoad worker{};                     // decode thread (started with the app)
+  std::map<std::uint64_t, TextureHandle> textureCache;
   std::map<std::uint64_t, MeshHandle> meshCache; // content hash -> GPU mesh
   // The ring is STATIONARY in the world: latched at open (eye position and
   // level heading) so turning your head does not spin the carousel around
@@ -227,8 +238,10 @@ struct App {
   bool handScaling{false};
   float scaleStartDistance{0};
   Vec3 grabPivot{};
+  HandGrabView grabView{};
   std::vector<std::pair<NodeId, Mat4>> grabWorlds;
   std::vector<std::pair<NodeId, Transform>> grabLocals;
+  std::vector<std::pair<NodeId, Mat4>> grabPoseStarts;
   HandPanel handPanel{};
   bool handPanelCarousel{false};
   int handHover{-1};
@@ -397,8 +410,19 @@ bool addModelToSceneImpl(App& app,
       textureHandles[t] = 0U;
       continue;
     }
-    textureHandles[t] = renderer.addTexture(model.textures[t].image, model.textures[t].repeatU,
-                                            model.textures[t].repeatV);
+    auto key = hashBytes(1469598103934665603ULL, &image.width, sizeof(image.width));
+    key = hashBytes(key, &image.height, sizeof(image.height));
+    key = hashBytes(key, image.rgba.data(), image.rgba.size());
+    key = hashBytes(key, &model.textures[t].repeatU, sizeof(bool));
+    key = hashBytes(key, &model.textures[t].repeatV, sizeof(bool));
+    auto const cached = app.textureCache.find(key);
+    if (cached != app.textureCache.end()) {
+      textureHandles[t] = cached->second;
+    } else {
+      textureHandles[t] = renderer.addTexture(image, model.textures[t].repeatU, model.textures[t].repeatV);
+      if (textureHandles[t] != kInvalidTexture) { app.textureCache.emplace(key, textureHandles[t]); }
+    }
+
     if (textureHandles[t] == kInvalidTexture) {
       std::printf("texture registration failed for texture %zu\n", t);
       return false;
@@ -447,21 +471,64 @@ bool addModelToSceneImpl(App& app,
       app.visuals.push_back(visual);
     }
   }
-  } catch (...) {
-    // A hostile model can throw MID-insert: the nodes created so far must
-    // not linger as floating geometry (and must not pollute undo snapshots).
-    vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection,
-                           createdRoots);
-    if (rootsOut != nullptr) {
-      rootsOut->clear();
+  auto const playable = std::find_if(model.clips.begin(), model.clips.end(),
+      [](AnimationClip const& clip) { return !clip.channels.empty(); });
+  if (withTextures && playable != model.clips.end()) {
+
+    AnimationInstance instance;
+    instance.model.nodes = model.nodes;
+    instance.model.clips.push_back(*playable);
+    instance.nodes = handles;
+    for (auto const& channel : instance.model.clips.front().channels) {
+      if (!channel.times.empty()) { instance.duration = std::fmax(instance.duration, channel.times.back()); }
     }
+    app.animations.push_back(std::move(instance));
+  }
+  } catch (...) {
+    vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection, createdRoots);
+    if (rootsOut != nullptr) { rootsOut->clear(); }
     std::printf("model insertion failed mid-way — rolled back\n");
     return false;
   }
   return true;
+
+}
+
+void tickAnimations(App& app, float dt) {
+  app.animations.erase(std::remove_if(app.animations.begin(), app.animations.end(),
+      [&](AnimationInstance const& instance) {
+        for (auto id : instance.nodes) { if (app.scene.valid(id)) { return false; } }
+        return !app.undo.anySnapshot([&](EditorSnapshot const& saved) {
+          for (auto const& node : saved.scene.nodes) {
+            if (std::find(instance.nodes.begin(), instance.nodes.end(), node.id) != instance.nodes.end()) {
+              return true;
+            }
+          }
+          return false;
+        });
+      }), app.animations.end());
+  for (auto& instance : app.animations) {
+
+    bool alive = false;
+    for (auto id : instance.nodes) { alive = alive || app.scene.valid(id); }
+    if (!alive) { continue; } // retained so delete/undo can restore playback
+    instance.elapsed += std::fmax(0.0F, dt);
+    float const time = instance.duration > 0 ?
+        static_cast<float>(std::fmod(instance.elapsed, instance.duration)) : 0.0F;
+    std::vector<Transform> pose;
+    if (!evaluateAnimation(instance.model, instance.model.clips.front(), time, pose)) { continue; }
+    for (auto const& channel : instance.model.clips.front().channels) {
+      auto const index = channel.node;
+      if (index >= instance.nodes.size() || index >= pose.size()) { continue; }
+      Mat4 inverseRest;
+      if (!invertAffine(toMatrix(instance.model.nodes[index].local), inverseRest)) { continue; }
+      app.scene.setPoseOffset(instance.nodes[index], mul(inverseRest, toMatrix(pose[index])));
+    }
+  }
 }
 
 bool addModelToScene(App& app,
+
                      VkRenderer& renderer,
                      Model const& model,
                      std::vector<NodeId>* rootsOut = nullptr,
@@ -560,6 +627,7 @@ std::optional<vredit::PickHit> pickNode(App& app, Ray const& ray, NodeId subtree
 // (exact surface pick). The handles are gone; a press only ever SELECTS.
 struct PointerTarget {
   NodeId node{kInvalidNode}; // the picked model/part (exact surface)
+  Vec3 point{};
 };
 
 PointerTarget resolvePointerTarget(App& app, Ray const& ray) {
@@ -569,6 +637,7 @@ PointerTarget resolvePointerTarget(App& app, Ray const& ray) {
   auto body = pickNode(app, ray);
   if (body.has_value()) {
     target.node = body->node;
+    target.point = body->point;
   }
   return target;
 }
@@ -1144,6 +1213,7 @@ void galleryCycle(App& app, VkRenderer& renderer, int dir) {
 // "before" is the PRE-OPEN state, so undoing removes the model entirely — it
 // never returns as a floating preview. The placement closes the carousel.
 bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
+  (void)aimRay;
   if (!app.galleryActive || app.galleryFiles.empty()) {
     return false;
   }
@@ -1186,10 +1256,17 @@ bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
     std::printf("[gallery] cannot place %s\n", file.c_str());
     return false;
   }
-  vredit::placeOnFloor(app.scene, app.visuals, roots, vredit::floorAimPoint(aimRay));
+  // The selection ray hits the preview, not a floor target. Place under the
+  // stationary centre preview instead of extending shallow rays to infinity.
+  tickAnimations(app, 0.0F);
+  auto target = app.ring.slotPose(index, app.ringOrigin, app.ringForward).position;
+  target.y = 0.0F;
+  vredit::placeOnFloor(app.scene, app.visuals, roots, target);
+
   app.selection =
       vredit::expandSelection(app.modelGroups, roots[0], /*partSelect=*/false);
   app.undo.commit(snapshot(app));
+  app.stickArmed = false;
   galleryClose(app);
   std::printf("[gallery] placed %s\n", file.c_str());
   return true;
@@ -2057,6 +2134,14 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     std::printf("SMOKE FAIL: carousel placement\n");
     return 1;
   }
+  Aabb placedBounds;
+  auto const placement = app.ring.slotPose(app.ring.index, app.ringOrigin, app.ringForward).position;
+  if (app.stickArmed || !movingSetBounds(app.scene, app.visuals, app.selection, placedBounds) ||
+      std::fabs((placedBounds.min.x + placedBounds.max.x) * .5F - placement.x) > .001F ||
+      std::fabs((placedBounds.min.z + placedBounds.max.z) * .5F - placement.z) > .001F ||
+      std::fabs(placedBounds.min.y) > .001F) {
+    std::printf("SMOKE FAIL: placement position or stick latch\n"); return 1;
+  }
   // Undo removes the placed model entirely (the pre-open "before" — never
   // a floating preview), and redo brings it back.
   vredit::EditorSnapshot carouselState = snapshot(app);
@@ -2315,7 +2400,7 @@ int runPerfSmoke(char const* shaderDir, std::vector<char const*> const& modelPat
 // Hand-only editing: capture world matrices of the topmost selected nodes.
 // Children ride along once; converting through the current parent keeps part
 // selections correct without applying a hierarchy transform twice.
-void beginHandGrab(App& app, HandPose pose) {
+void beginHandGrab(App& app, HandPose pose, std::optional<Vec3> point = std::nullopt, HandGrabView view = {}) {
   Aabb bounds;
   if (!pose.valid || !movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
     return;
@@ -2324,9 +2409,11 @@ void beginHandGrab(App& app, HandPose pose) {
   app.grabStart = pose;
   app.grabFiltered = pose;
   app.handScaling = false;
-  app.grabPivot = (bounds.min + bounds.max) * 0.5F;
+  app.grabPivot = point.value_or((bounds.min + bounds.max) * 0.5F);
+  app.grabView = view;
   app.grabWorlds.clear();
   app.grabLocals.clear();
+  app.grabPoseStarts.clear();
   for (auto id : app.selection) {
     bool child = false;
     for (auto parent = app.scene.parent(id); parent != kInvalidNode; parent = app.scene.parent(parent)) {
@@ -2338,6 +2425,7 @@ void beginHandGrab(App& app, HandPose pose) {
     if (!child) {
       app.grabWorlds.emplace_back(id, app.scene.world(id));
       app.grabLocals.emplace_back(id, app.scene.local(id));
+      app.grabPoseStarts.emplace_back(id, app.scene.poseOffset(id));
     }
   }
   app.undo.begin(snapshot(app));
@@ -2359,8 +2447,13 @@ void applyHandDelta(App& app, Mat4 const& delta) {
   // matrix sheared. TRS cannot express it: reject the whole sample rather
   // than silently distort one selected subtree.
   std::vector<std::pair<NodeId, Transform>> updates;
-  for (auto const& [id, initial] : app.grabWorlds) {
-    auto world = mul(delta, initial);
+  for (std::size_t i = 0; i < app.grabWorlds.size(); ++i) {
+    auto const& [id, initial] = app.grabWorlds[i];
+    Mat4 inverseStartPose;
+    if (!invertAffine(app.grabPoseStarts[i].second, inverseStartPose)) { return; }
+    auto const animatedBaseline = mul(initial, mul(inverseStartPose, app.scene.poseOffset(id)));
+    auto world = mul(delta, animatedBaseline);
+
 
     auto parent = app.scene.parent(id);
     if (parent != kInvalidNode) {
@@ -2368,7 +2461,11 @@ void applyHandDelta(App& app, Mat4 const& delta) {
       if (!invertAffine(app.scene.world(parent), parentInverse)) { return; }
       world = mul(parentInverse, world);
     }
+    Mat4 poseInverse;
+    if (!invertAffine(app.scene.poseOffset(id), poseInverse)) { return; }
+    world = mul(world, poseInverse);
     auto const local = toTransform(world);
+
     auto const reconstructed = toMatrix(local);
     for (int i = 0; i < 16; ++i) {
       float const tolerance = 1e-4F * std::fmax(1.0F, std::fabs(world.m[i]));
@@ -2389,6 +2486,7 @@ void beginHandScale(App& app, HandPose left, HandPose right) {
   app.scaleStartDistance = distance;
   for (auto& [id, world] : app.grabWorlds) { world = app.scene.world(id); }
   for (auto& [id, local] : app.grabLocals) { local = app.scene.local(id); }
+  for (auto& [id, pose] : app.grabPoseStarts) { pose = app.scene.poseOffset(id); }
   Aabb bounds;
   if (!movingSetBounds(app.scene, app.visuals, app.selection, bounds)) { return; }
   app.grabPivot = (bounds.min + bounds.max) * .5F;
@@ -2406,7 +2504,7 @@ void updateHandScale(App& app, HandPose left, HandPose right, float dt) {
 }
 
 void updateHandGrab(App& app, HandPose pose) {
-  applyHandDelta(app, handGrabTransform(app.grabStart, pose, app.grabPivot, Mat4{}));
+  applyHandDelta(app, projectedHandGrabTransform(app.grabView, app.grabStart, pose, app.grabPivot, Mat4{}));
 }
 
 // Freeze a live controller edit while choosing a tool. Its snapshot stays
@@ -2521,6 +2619,21 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   if (!check(sameSnapshot(snapshot(app), after) && !app.undo.canRedo(), "redo restores grab")) {
     return false;
   }
+
+  // Motion changes editable placement without cancelling live node animation.
+  app.scene.setPoseOffset(cube, translationMatrix({.3F,0,0}));
+  auto const posedBefore = snapshot(app);
+  auto const animatedBase = transformPoint(mul(toMatrix(app.scene.local(cube)), translationMatrix({.6F,0,0})), {});
+  beginHandGrab(app, start);
+  app.scene.setPoseOffset(cube, translationMatrix({.6F,0,0}));
+  HandPose translated = start;
+  translated.position.x += .2F;
+  updateHandGrab(app, translated);
+  if (!check(nearVector(app.scene.worldPosition(cube), animatedBase + Vec3{.2F,0,0}), "grab keeps live animation") ||
+      !check(endEdits(app), "animated grab commits")) { return false; }
+  applySnapshot(app, posedBefore);
+  app.scene.setPoseOffset(cube, Mat4{});
+  app.undo.clear();
 
   // Tiny initial separations must not overwrite the right-hand grab filter.
   beginHandGrab(app, start);
@@ -2895,6 +3008,8 @@ int runXr(char const* shaderDir,
     lastFrameTime = now;
     dt = dt > 0.1F ? 0.1F : dt;
 
+    tickAnimations(app, dt);
+
     // No flight controls: passthrough means you walk in the real world with
     // the models placed in it — the sticks' flight/turn bindings were removed
     // at the user's request ("I can now move in the real world"). Grip is the
@@ -3103,6 +3218,7 @@ int runXr(char const* shaderDir,
         // The carousel owns the trigger: it places the staged model at the
         // floor point under the aim ray.
         galleryPointerPress(app, renderer, worldRay);
+        if (!app.galleryActive) { handMenuOpen = false; }
         if (handRight) { app.handUiOwned = true; }
       } else {
         // Grip + trigger selects a single part; trigger alone the whole model.
@@ -3111,7 +3227,7 @@ int runXr(char const* shaderDir,
         bool const selectedHit = target.node != kInvalidNode &&
             std::find(app.selection.begin(), app.selection.end(), target.node) != app.selection.end();
         if (handTracked && selectionLatch.startsGrab(selectedHit)) {
-          beginHandGrab(app, worldHands[1]);
+          beginHandGrab(app, worldHands[1], target.point, {headWorld, normalized(cameraOrientation(rig) * input.headOrient), true});
         } else {
           pointerPress(app, target, partSelect);
           selectionLatch.selected(handTracked && !app.selection.empty());
@@ -3574,6 +3690,7 @@ int runInteractive(char const* shaderDir,
     if (dt > 0.1F) {
       dt = 0.1F; // tab stalls must not teleport the camera
     }
+    tickAnimations(app, dt);
     updateFlight(app, dt);
     updateArrowEdit(app, dt); // arrow keys mirror the sticks (edit the selection)
     galleryTick(app, renderer, dt, app.camera.position, cameraForward(app.camera));

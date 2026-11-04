@@ -140,7 +140,23 @@ void Scene::setLocal(NodeId id, Transform const& t) {
   ++epoch_;
 }
 
+Mat4 Scene::poseOffset(NodeId id) const {
+  return valid(id) ? slots_[id].poseOffset : Mat4{};
+}
+
+void Scene::setPoseOffset(NodeId id, Mat4 const& offset) {
+  if (!valid(id)) { return; }
+  for (int i = 0; i < 16; ++i) {
+    if (slots_[id].poseOffset.m[i] != offset.m[i]) {
+      slots_[id].poseOffset = offset;
+      markSubtreeDirty(id);
+      return;
+    }
+  }
+}
+
 Mat4 Scene::world(NodeId id) {
+
   if (!valid(id)) {
     return Mat4{};
   }
@@ -244,7 +260,7 @@ void Scene::ensureWorld(NodeId id) {
   if (!slot.worldDirty) {
     return;
   }
-  Mat4 localMatrix = toMatrix(slot.local);
+  Mat4 localMatrix = mul(toMatrix(slot.local), slot.poseOffset);
   if (slot.parent != kInvalidNode && valid(slot.parent)) {
     ensureWorld(slot.parent);
     slot.world = mul(slots_[slot.parent].world, localMatrix);
