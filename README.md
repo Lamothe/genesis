@@ -72,35 +72,31 @@ does nothing. **N**
 closes without placing), **Delete** removes the selection (model or part),
 **Esc** quits. The selection is marked by a thin warm rim in the shader (a
 part selection marks the part) and the current mode's name shows as
-line-font text floating in front of the camera.
+sans-serif text floating in front of the camera.
 
 In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
 Bare hands (Quest through WiVRn) use a separate control path; controller
 buttons and sticks are unchanged:
 
-- **Left pinch while the left palm faces up** explicitly toggles the hand
-  menu. Opening it initially shows the carousel; palm-up alone never opens
-  anything. After placing a model, the stationary, head-facing tools panel
-  remains available until the menu is toggled off. Lowering the palm does
-  not close the menu.
-- In the carousel, **right pinch** on the exact surface of the centred
-  preview places it. Otherwise, the left/right ray zones browse one model
-  per pinch; a central miss does nothing. These same surface-hit and ray-zone
-  rules apply to desktop clicks and controller triggers.
-- Outside the menu, **right pinch** selects the whole model under the right
-  aim beam, even when grasping: hand pinches never select individual parts
-  (controllers retain grip+trigger part selection). Hold to grab: moving the
-  palm translates the whole model at **2× hand movement**, and turning the
-  hand rotates it by the same relative orientation change around the model's
-  bounds centre. Releasing keeps the pose and records one undo step. All
-  three rotation axes are tracked; there is no floor clamp during a hand
-  grab, so models can be lifted and tipped freely.
-- On the tools panel, point and right-pinch a labelled button:
-  **SMALLER/BIGGER**, **LOWER/RAISE**, **TURN LEFT/RIGHT** run while held;
-  **UNDO**, **REDO** and **BACKDROP** fire once. **DELETE** requires a 0.6 s
-  hold, with the existing red charge feedback. Release before full charge
-  to cancel deletion. A held tool stays captured until release and cannot
-  accidentally grab a model behind it.
+- **Left pinch while the left palm faces up** toggles the stationary hand menu;
+  palm-up alone does nothing. Choose **Models** to open the carousel.
+- In the carousel, **right pinch** the exact surface of the settled centre
+  preview to place it. Otherwise, the left/right ray zones browse one model
+  per pinch; a central miss does nothing. The centre marker identifies the
+  model that can be placed. Desktop and controller use the same hit rules.
+- Outside the menu, **right pinch and release** selects the whole model under
+  the aim beam. Pinch and hold the selected model again to move it with the
+  palm and rotate it with the wrist. Movement is filtered, 1:1, and includes
+  height; releasing commits one undo step. Hand selection is whole-model only;
+  controllers retain grip+trigger part selection.
+- While holding a right-hand grab, pinch and hold with the left hand and vary
+  the distance between the palms to scale uniformly about the model's centre.
+  Releasing either hand ends the edit; release the right hand before another
+  edit. Both hands' tracked joints are drawn as overlay skeletons so models
+  cannot hide them.
+- The hand menu offers **Models**, **Undo**, **Redo**, **Delete** and
+  **Backdrop**. Delete requires a 0.6 s hold with red charge feedback.
+  A held menu interaction stays captured until release.
 - Opening the tools panel pauses an active controller-stick edit; choosing
   UNDO/REDO cancels it without discarding the existing redo branch. Closing
   the panel or choosing another edit commits it.
@@ -170,9 +166,10 @@ flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
 - **Gizmo drags are cumulative from drag start**, not incremental per event:
   every update recomputes the total delta and re-applies it to captured start
   transforms, so rounding cannot accumulate.
+- Text uses pre-rasterised DejaVu Sans glyphs (licence in `app/DEJAVU-LICENSE.txt`); unsupported Unicode characters display as `?`.
 - **Scene transforms are TRS only.** Nested non-uniform scale under rotation can
   introduce shear that TRS cannot represent; the gizmo maths assumes shear-free
-  hierarchies. Fine for editor content; revisit if a rig ever needs it.
+  hierarchies. Hand edits reject samples that cannot be represented as local TRS rather than distorting the hierarchy; revisit if a rig needs arbitrary affine transforms.
 - **Discontinuity**: any transform or structural change bumps `Scene::epoch()`;
   the seam maps that to `reset = 1` for the temporal loop. Selection changes do
   not bump it.

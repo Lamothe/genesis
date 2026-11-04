@@ -100,10 +100,11 @@ void panels() {
   auto front = [](Vec3 point) { return Ray{point + Vec3{0, 0, 1}, {0, 0, -1}}; };
   CHECK(panel.hit(front(handPanelButtonCentre(0))) == -1);
   panel.visible = true;
-  for (int i = 0; i < 12; ++i) {
+  for (int i : {0, 8, 9, 10, 11}) {
     auto const centre = handPanelButtonCentre(i);
-    CHECK(near(centre, {(i % 2 == 0) ? -0.115F : 0.115F,
-                        -0.065F * (static_cast<float>(i / 2) + 0.5F), 0}));
+    int const slot = i == 0 ? 0 : i - 7;
+    CHECK(near(centre, {(slot % 2 == 0) ? -0.115F : 0.115F,
+                        -0.065F * (static_cast<float>(slot / 2) + 0.5F), 0}));
     CHECK(panel.hit(front(centre)) == i);
     CHECK(panel.hit({centre - Vec3{0, 0, 1}, {0, 0, 1}}) == -1);
     CHECK(panel.hit({centre - Vec3{0, 0, 1}, {0, 0, -1}}) == -1);
@@ -133,7 +134,7 @@ void panels() {
   panel.origin = {3, 2, -4};
   panel.orientation = quatFromAxisAngle({0, 1, 0}, 1.1F) *
                       quatFromAxisAngle({1, 0, 0}, 0.4F);
-  for (int i = 0; i < 12; ++i) {
+  for (int i : {0, 8, 9, 10, 11}) {
     auto const world = panel.origin + rotate(panel.orientation, handPanelButtonCentre(i));
     auto const normal = rotate(panel.orientation, {0, 0, 1});
     CHECK(panel.hit({world + normal, -normal}) == i);
@@ -166,6 +167,11 @@ void grabs() {
   Vec3 const pivot{2, -1, 0.5F};
   Mat4 const initial = trs({4, 2, -3}, quatFromAxisAngle({0, 0, 1}, 0.3F), {2, 3, 4});
   CHECK(near(handGrabTransform(start, start, pivot, initial), initial));
+  auto slight = start;
+  slight.orientation = quatFromAxisAngle({0, 1, 0}, .0002F) * start.orientation;
+  auto const slightResult = handGrabTransform(start, slight, pivot, initial);
+  CHECK(length(transformVector(slightResult, {1, 0, 0}) - transformVector(initial, {1, 0, 0})) > .0001F);
+
   for (Vec3 const axis : {Vec3{0, 1, 0}, Vec3{1, 0, 0}, Vec3{0, 0, 1}}) {
     auto const delta = quatFromAxisAngle(axis, 1.2F);
     HandPose current = start;
@@ -176,7 +182,7 @@ void grabs() {
     // translation order, and preservation of initial orientation/scale.
     for (Vec3 const point : {Vec3{}, Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}}) {
       CHECK(near(transformPoint(result, point),
-                 pivot + (current.position - start.position) * 2.0F +
+                 pivot + (current.position - start.position) +
                  rotate(delta, transformPoint(initial, point) - pivot)));
     }
     CHECK(near(transformVector(result, {1, 2, 3}),
@@ -184,7 +190,7 @@ void grabs() {
   }
   HandPose current = start;
   current.position = start.position + Vec3{0.25F, -0.5F, 1.5F};
-  auto const expected = mul(translationMatrix((current.position - start.position) * 2.0F), initial);
+  auto const expected = mul(translationMatrix((current.position - start.position)), initial);
   for (int i = 0; i < 10000; ++i) {
     CHECK(near(handGrabTransform(start, current, pivot, initial), expected));
   }
@@ -203,7 +209,28 @@ void grabs() {
 } // namespace
 
 int main() {
+  HandSelectionLatch latch;
+  HandGesture deliberate;
+  CHECK(!deliberate.update(true, 0));
+  CHECK(deliberate.update(true, 1));
+  CHECK(!latch.startsGrab(true)); // first press selects, never moves
+  latch.selected(true);
+  CHECK(!deliberate.update(true, 1)); // a held first press cannot grab
+  CHECK(!deliberate.update(true, 0));
+  CHECK(deliberate.update(true, 1));
+  CHECK(latch.startsGrab(true));
+  CHECK(!latch.startsGrab(false)); // a different hit selects instead
+  latch.reset();
+  CHECK(!latch.startsGrab(true));
+  HandPose const origin{{0,0,0}, {}, true};
+  HandPose const tiny{{.001F,0,0}, {}, true};
+  auto const smoothed = smoothHandPose(origin, tiny, .01F);
+  CHECK(smoothed.position.x > 0 && smoothed.position.x < .001F);
+  CHECK(smoothHandPose(smoothed, tiny, .01F).position.x > smoothed.position.x);
+  CHECK(handScaleRatio(.2F, .4F) == 2.0F);
+  CHECK(handScaleRatio(.0F, .4F) == 1.0F);
   gestures();
+
   carouselDirections();
   panels();
   palms();

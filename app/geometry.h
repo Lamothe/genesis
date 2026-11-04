@@ -39,19 +39,11 @@ void appendGrid(std::vector<RendererVertex>& out, float extent, float step);
 // cross marking the tip so the aimed point is visible on plain surfaces.
 void appendRayBeam(std::vector<RendererVertex>& out, Ray const& ray, float length, Vec3 colour);
 
-// Line-font text into an overlay line list (the VR mode HUD and the carousel
-// labels): uppercase stroke glyphs on a unit cell (baseline y = 0, cap height
-// y = 1), drawn through `place` — text occupies its XY plane and faces +Z
-// toward the viewer — at `height` metres. Accented letters fall back to their
-// base letter. Unknown characters render as spaces. No font files, no
-// textures; the strokes are ordinary line vertices.
+// Rasterised DejaVu Sans text drawn as overlay line runs. Unsupported UTF-8
+// characters render as a question mark. Height and width are in metres.
 void appendTextLines(std::vector<RendererVertex>& out, std::string_view text, Mat4 const& place,
                      float height, Vec3 colour);
 
-// Width in metres of `text` at `height`, i.e. the pen advance the loop above
-// makes. Every character advances the same step, so this is exact and lets a
-// caller CENTRE text (start the pen at -width/2) or fit a long name into a
-// fixed width (height = maxWidth / width-at-1-metre).
 float textLineWidth(std::string_view text, float height);
 
 } // namespace vredit

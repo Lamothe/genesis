@@ -2,6 +2,8 @@
 
 #include "vecmath.h"
 
+#include <initializer_list>
+
 namespace vredit {
 
 struct HandPose {
@@ -41,6 +43,8 @@ class HandGesture {
     return false;
   }
 
+  bool pressed() const { return pressed_; }
+
   void reset() {
     armed_ = false;
     pressed_ = false;
@@ -51,14 +55,43 @@ class HandGesture {
   bool pressed_{false};
 };
 
+// Only a second released-and-repressed pinch on the selected surface starts a grab.
+class HandSelectionLatch {
+ public:
+  bool startsGrab(bool hitSelection) const { return primed_ && hitSelection; }
+  void selected(bool hasSelection) { primed_ = hasSelection; }
+  void reset() { primed_ = false; }
+ private:
+  bool primed_{false};
+};
+
+// Exponential low-pass filtering preserves sub-millimetre motion rather than
+// quantising it. Quaternion hemisphere correction prevents sign flips.
+inline HandPose smoothHandPose(HandPose previous, HandPose sample, float dt) {
+  if (!previous.valid || !sample.valid) { return sample; }
+  float const alpha = 1.0F - std::exp(-std::fmax(0.0F, dt) / .045F);
+  auto q = sample.orientation;
+  auto const& p = previous.orientation;
+  if (p.x*q.x + p.y*q.y + p.z*q.z + p.w*q.w < 0) { q = {-q.x,-q.y,-q.z,-q.w}; }
+  return {previous.position + (sample.position - previous.position) * alpha,
+          normalized(Quat{p.x + (q.x-p.x)*alpha, p.y + (q.y-p.y)*alpha,
+                          p.z + (q.z-p.z)*alpha, p.w + (q.w-p.w)*alpha}), true};
+}
+
+inline float handScaleRatio(float initialDistance, float distance) {
+  if (!std::isfinite(initialDistance) || !std::isfinite(distance) || initialDistance < .04F) {
+    return 1.0F;
+  }
+  return std::fmax(.05F, std::fmin(20.0F, distance / initialDistance));
+}
+
 // Panel-local coordinates, with the origin at the top centre. Invalid indices
 // return the origin (which is not inside any button).
 inline constexpr Vec3 handPanelButtonCentre(int index) {
-  if (index < 0 || index >= 12) {
-    return {};
-  }
-  return {(index % 2 == 0) ? -0.115F : 0.115F,
-          -0.065F * (static_cast<float>(index / 2) + 0.5F), 0.0F};
+  int const slot = index == 0 ? 0 : index >= 8 && index <= 11 ? index - 7 : -1;
+  if (slot < 0) { return {}; }
+  return {(slot % 2 == 0) ? -0.115F : 0.115F,
+          -0.065F * (static_cast<float>(slot / 2) + 0.5F), 0.0F};
 }
 
 struct HandPanel {
@@ -81,7 +114,7 @@ struct HandPanel {
     }
     auto const local = rotate(conjugate(orientation),
                               ray.origin + ray.direction * distance - origin);
-    for (int index = 0; index < 12; ++index) {
+    for (int index : {0, 8, 9, 10, 11}) {
       auto const centre = handPanelButtonCentre(index);
       if (std::fabs(local.x - centre.x) <= 0.105F &&
           std::fabs(local.y - centre.y) <= 0.028F) {
@@ -104,8 +137,16 @@ inline Mat4 handGrabTransform(HandPose start, HandPose current, Vec3 pivot, Mat4
   if (!start.valid || !current.valid) {
     return initialWorld;
   }
+  auto const& a = start.orientation;
+  auto const& b = current.orientation;
+  if (current.position.x == start.position.x && current.position.y == start.position.y &&
+      current.position.z == start.position.z && a.x == b.x && a.y == b.y &&
+      a.z == b.z && a.w == b.w) {
+    return initialWorld;
+  }
   auto const delta = normalized(current.orientation * conjugate(start.orientation));
-  auto const translation = (current.position - start.position) * 2.0F;
+
+  auto const translation = (current.position - start.position);
   return mul(translationMatrix(pivot + translation),
              mul(rotationMatrix(delta), mul(translationMatrix(-pivot), initialWorld)));
 }

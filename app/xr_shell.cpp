@@ -57,6 +57,8 @@ struct XrShell::ImplData {
   XrSpace space{XR_NULL_HANDLE};
   XrActionSet actionSet{XR_NULL_HANDLE};
   XrAction triggerAction{XR_NULL_HANDLE};
+  XrAction pinchAction{XR_NULL_HANDLE};
+  XrAction pinchReadyAction{XR_NULL_HANDLE};
   XrAction leftStickAction{XR_NULL_HANDLE};
   XrAction rightStickAction{XR_NULL_HANDLE};
   XrAction menuAction{XR_NULL_HANDLE};
@@ -473,7 +475,7 @@ bool XrShell::createActions() {
     return xrOk(xrCreateAction(xr_->actionSet, &info, out), name);
   };
 
-  if (!makeFloat("trigger", &xr_->triggerAction) || !makeVec2("leftstick", &xr_->leftStickAction) ||
+  if (!makeFloat("trigger", &xr_->triggerAction) || !makeFloat("pinch", &xr_->pinchAction) || !makeBool("pinch_ready", &xr_->pinchReadyAction) || !makeVec2("leftstick", &xr_->leftStickAction) ||
       !makeVec2("rightstick", &xr_->rightStickAction) || !makeBool("menu", &xr_->menuAction) ||
       !makeBool("undo", &xr_->undoAction) || !makeBool("redo", &xr_->redoAction) ||
       !makeBool("spawn", &xr_->spawnAction) || !makeBool("delete", &xr_->deleteAction) ||
@@ -525,18 +527,18 @@ bool XrShell::createActions() {
         {"/user/hand/left/input/trackpad/click", xr_->redoAction}}},
   };
   if (xr_->handInteraction) {
-    // Hands: the aim pose for both hands (the drawn pointers), and the right
-    // hand's AIM-ACTIVATE pinch as the select input. aim_activate_ext is the
-    // aim-ray activation gesture (paired with aim/pose); pinch_ext is the
-    // separate manipulation pinch and would be the wrong feel for the
-    // existing trigger-as-select semantics. grasp_ext is the grip. Hands have
-    // no face buttons or sticks; the app supplies hand-only tools and grabbing.
+    // Preserve aim activation for the existing trigger path, but use the
+    // explicit pinch action for hand interactions and two-hand manipulation.
     bindings.push_back(
         {"/interaction_profiles/ext/hand_interaction_ext",
          {{"/user/hand/right/input/aim/pose", xr_->aimAction},
           {"/user/hand/left/input/aim/pose", xr_->aimAction},
           {"/user/hand/left/input/aim_activate_ext/value", xr_->triggerAction},
           {"/user/hand/right/input/aim_activate_ext/value", xr_->triggerAction},
+          {"/user/hand/left/input/pinch_ext/value", xr_->pinchAction},
+          {"/user/hand/right/input/pinch_ext/value", xr_->pinchAction},
+          {"/user/hand/left/input/pinch_ext/ready_ext", xr_->pinchReadyAction},
+          {"/user/hand/right/input/pinch_ext/ready_ext", xr_->pinchReadyAction},
           {"/user/hand/right/input/grasp_ext/value", xr_->gripAction}}});
   }
 
@@ -856,10 +858,14 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
         XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_->session, xr_->handPaths[hand], &profile)) &&
         profile.interactionProfile == handProfile;
     auto pinch = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
-    getInfo.action = xr_->triggerAction;
+    getInfo.action = xr_->pinchAction;
     getInfo.subactionPath = xr_->handPaths[hand];
     xrGetActionStateFloat(xr_->session, &getInfo, &pinch);
-    input.pinchActive[hand] = pinch.isActive;
+    auto ready = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
+    getInfo.action = xr_->pinchReadyAction;
+    xrGetActionStateBoolean(xr_->session, &getInfo, &ready);
+    input.pinchActive[hand] = pinch.isActive && ready.isActive && ready.currentState;
+
     input.pinch[hand] = pinch.isActive ? pinch.currentState : 0.0F;
     if (!input.handActive[hand] || xr_->trackers[hand] == XR_NULL_HANDLE) {
       continue;
@@ -873,7 +879,17 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
     locate.time = static_cast<XrTime>(displayTime);
     if (XR_SUCCEEDED(xr_->locateHandJoints(xr_->trackers[hand], &locate, &locations)) &&
         locations.isActive) {
+      static_assert(XR_HAND_JOINT_COUNT_EXT == 26);
+      for (int joint = 0; joint < XR_HAND_JOINT_COUNT_EXT; ++joint) {
+        constexpr auto flags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+        if ((joints[joint].locationFlags & flags) == flags) {
+          auto const& p = joints[joint].pose.position;
+          input.handJoints[hand][joint] = {p.x, p.y, p.z};
+          input.handJointValid[hand][joint] = true;
+        }
+      }
       int extended = 0;
+
       for (int finger = 0; finger < 4; ++finger) {
         int const proximal = XR_HAND_JOINT_INDEX_PROXIMAL_EXT + finger * 5;
         auto const& a = joints[proximal];

@@ -1,6 +1,8 @@
 #include "geometry.h"
 
-#include <cctype>
+#include "sans_glyphs.h"
+
+#include <cstdint>
 
 namespace vredit {
 
@@ -77,259 +79,49 @@ void appendRayBeam(std::vector<RendererVertex>& out, Ray const& ray, float lengt
 }
 
 namespace {
-
-// Stroke glyphs on a unit cell (baseline y = 0, cap height y = 1, advance
-// 0.72). Segments are x1,y1,x2,y2 quads. A HUD font for short words and
-// model names — deliberately simple, deliberately typed.
-constexpr int kMaxSegs = 12;
-struct LineGlyph {
-  char c;
-  int count;
-  float segs[kMaxSegs][4];
-};
-
-constexpr LineGlyph kGlyphs[] = {
-    {'A', 3, {{0.0F, 0.0F, 0.31F, 1.0F}, {0.31F, 1.0F, 0.62F, 0.0F}, {0.13F, 0.42F, 0.49F, 0.42F}}},
-    {'B', 7,
-     {{0.0F, 0.0F, 0.0F, 1.0F},
-      {0.0F, 1.0F, 0.5F, 0.9F},
-      {0.5F, 0.9F, 0.5F, 0.62F},
-      {0.5F, 0.62F, 0.0F, 0.55F},
-      {0.0F, 0.55F, 0.55F, 0.45F},
-      {0.55F, 0.45F, 0.55F, 0.12F},
-      {0.55F, 0.12F, 0.0F, 0.0F}}},
-    {'C', 5,
-     {{0.62F, 0.85F, 0.3F, 1.0F},
-      {0.3F, 1.0F, 0.0F, 0.75F},
-      {0.0F, 0.75F, 0.0F, 0.25F},
-      {0.0F, 0.25F, 0.3F, 0.0F},
-      {0.3F, 0.0F, 0.62F, 0.15F}}},
-    {'D', 6,
-     {{0.0F, 0.0F, 0.0F, 1.0F},
-      {0.0F, 1.0F, 0.35F, 1.0F},
-      {0.35F, 1.0F, 0.62F, 0.75F},
-      {0.62F, 0.75F, 0.62F, 0.25F},
-      {0.62F, 0.25F, 0.35F, 0.0F},
-      {0.35F, 0.0F, 0.0F, 0.0F}}},
-    {'E', 4, {{0.62F, 1.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.62F, 0.0F},
-              {0.0F, 0.52F, 0.45F, 0.52F}}},
-    {'F', 3, {{0.62F, 1.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.0F, 0.0F}, {0.0F, 0.52F, 0.45F, 0.52F}}},
-    {'G', 7,
-     {{0.62F, 0.85F, 0.3F, 1.0F},
-      {0.3F, 1.0F, 0.0F, 0.75F},
-      {0.0F, 0.75F, 0.0F, 0.25F},
-      {0.0F, 0.25F, 0.3F, 0.0F},
-      {0.3F, 0.0F, 0.62F, 0.2F},
-      {0.62F, 0.2F, 0.62F, 0.45F},
-      {0.62F, 0.45F, 0.35F, 0.45F}}},
-    {'H', 3, {{0.0F, 0.0F, 0.0F, 1.0F}, {0.62F, 0.0F, 0.62F, 1.0F}, {0.0F, 0.52F, 0.62F, 0.52F}}},
-    {'I', 3, {{0.31F, 0.0F, 0.31F, 1.0F}, {0.12F, 1.0F, 0.5F, 1.0F}, {0.12F, 0.0F, 0.5F, 0.0F}}},
-    {'J', 4,
-     {{0.5F, 1.0F, 0.5F, 0.2F},
-      {0.5F, 0.2F, 0.35F, 0.0F},
-      {0.35F, 0.0F, 0.12F, 0.08F},
-      {0.12F, 0.08F, 0.0F, 0.3F}}},
-    {'K', 3, {{0.0F, 0.0F, 0.0F, 1.0F}, {0.62F, 1.0F, 0.0F, 0.45F}, {0.18F, 0.58F, 0.62F, 0.0F}}},
-    {'L', 2, {{0.0F, 1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.62F, 0.0F}}},
-    {'M', 4,
-     {{0.0F, 0.0F, 0.0F, 1.0F},
-      {0.0F, 1.0F, 0.31F, 0.5F},
-      {0.31F, 0.5F, 0.62F, 1.0F},
-      {0.62F, 1.0F, 0.62F, 0.0F}}},
-    {'N', 3, {{0.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 1.0F, 0.62F, 0.0F}, {0.62F, 0.0F, 0.62F, 1.0F}}},
-    {'O', 8,
-     {{0.0F, 0.15F, 0.15F, 0.0F},
-      {0.15F, 0.0F, 0.47F, 0.0F},
-      {0.47F, 0.0F, 0.62F, 0.15F},
-      {0.62F, 0.15F, 0.62F, 0.85F},
-      {0.62F, 0.85F, 0.47F, 1.0F},
-      {0.47F, 1.0F, 0.15F, 1.0F},
-      {0.15F, 1.0F, 0.0F, 0.85F},
-      {0.0F, 0.85F, 0.0F, 0.15F}}},
-    {'P', 5,
-     {{0.0F, 0.0F, 0.0F, 1.0F},
-      {0.0F, 1.0F, 0.5F, 1.0F},
-      {0.5F, 1.0F, 0.62F, 0.82F},
-      {0.62F, 0.82F, 0.5F, 0.58F},
-      {0.5F, 0.58F, 0.0F, 0.55F}}},
-    {'Q', 9,
-     {{0.0F, 0.15F, 0.15F, 0.0F},
-      {0.15F, 0.0F, 0.47F, 0.0F},
-      {0.47F, 0.0F, 0.62F, 0.15F},
-      {0.62F, 0.15F, 0.62F, 0.85F},
-      {0.62F, 0.85F, 0.47F, 1.0F},
-      {0.47F, 1.0F, 0.15F, 1.0F},
-      {0.15F, 1.0F, 0.0F, 0.85F},
-      {0.0F, 0.85F, 0.0F, 0.15F},
-      {0.4F, 0.28F, 0.62F, 0.0F}}},
-    {'R', 6,
-     {{0.0F, 0.0F, 0.0F, 1.0F},
-      {0.0F, 1.0F, 0.5F, 1.0F},
-      {0.5F, 1.0F, 0.62F, 0.82F},
-      {0.62F, 0.82F, 0.5F, 0.58F},
-      {0.5F, 0.58F, 0.0F, 0.55F},
-      {0.35F, 0.55F, 0.62F, 0.0F}}},
-    {'S', 7,
-     {{0.6F, 0.9F, 0.15F, 1.0F},
-      {0.15F, 1.0F, 0.0F, 0.75F},
-      {0.0F, 0.75F, 0.15F, 0.55F},
-      {0.15F, 0.55F, 0.5F, 0.45F},
-      {0.5F, 0.45F, 0.62F, 0.25F},
-      {0.62F, 0.25F, 0.45F, 0.0F},
-      {0.45F, 0.0F, 0.0F, 0.1F}}},
-    {'T', 2, {{0.31F, 0.0F, 0.31F, 1.0F}, {0.0F, 1.0F, 0.62F, 1.0F}}},
-    {'U', 5,
-     {{0.0F, 1.0F, 0.0F, 0.2F},
-      {0.0F, 0.2F, 0.15F, 0.0F},
-      {0.15F, 0.0F, 0.47F, 0.0F},
-      {0.47F, 0.0F, 0.62F, 0.2F},
-      {0.62F, 0.2F, 0.62F, 1.0F}}},
-    {'V', 2, {{0.0F, 1.0F, 0.31F, 0.0F}, {0.31F, 0.0F, 0.62F, 1.0F}}},
-    {'W', 4,
-     {{0.0F, 1.0F, 0.15F, 0.0F},
-      {0.15F, 0.0F, 0.31F, 0.6F},
-      {0.31F, 0.6F, 0.47F, 0.0F},
-      {0.47F, 0.0F, 0.62F, 1.0F}}},
-    {'X', 2, {{0.0F, 0.0F, 0.62F, 1.0F}, {0.0F, 1.0F, 0.62F, 0.0F}}},
-    {'Y', 3, {{0.0F, 1.0F, 0.31F, 0.5F}, {0.62F, 1.0F, 0.31F, 0.5F}, {0.31F, 0.5F, 0.31F, 0.0F}}},
-    {'Z', 3, {{0.0F, 1.0F, 0.62F, 1.0F}, {0.62F, 1.0F, 0.0F, 0.0F}, {0.0F, 0.0F, 0.62F, 0.0F}}},
-    {'0', 9,
-     {{0.0F, 0.15F, 0.15F, 0.0F},
-      {0.15F, 0.0F, 0.47F, 0.0F},
-      {0.47F, 0.0F, 0.62F, 0.15F},
-      {0.62F, 0.15F, 0.62F, 0.85F},
-      {0.62F, 0.85F, 0.47F, 1.0F},
-      {0.47F, 1.0F, 0.15F, 1.0F},
-      {0.15F, 1.0F, 0.0F, 0.85F},
-      {0.0F, 0.85F, 0.0F, 0.15F},
-      {0.05F, 0.12F, 0.57F, 0.88F}}},
-    {'1', 3, {{0.15F, 0.8F, 0.35F, 1.0F}, {0.35F, 1.0F, 0.35F, 0.0F}, {0.15F, 0.0F, 0.55F, 0.0F}}},
-    {'2', 5,
-     {{0.0F, 0.8F, 0.15F, 1.0F},
-      {0.15F, 1.0F, 0.45F, 1.0F},
-      {0.45F, 1.0F, 0.62F, 0.8F},
-      {0.62F, 0.8F, 0.0F, 0.0F},
-      {0.0F, 0.0F, 0.62F, 0.0F}}},
-    {'3', 6,
-     {{0.0F, 1.0F, 0.62F, 1.0F},
-      {0.62F, 1.0F, 0.25F, 0.55F},
-      {0.25F, 0.55F, 0.5F, 0.5F},
-      {0.5F, 0.5F, 0.62F, 0.28F},
-      {0.62F, 0.28F, 0.45F, 0.0F},
-      {0.45F, 0.0F, 0.0F, 0.0F}}},
-    {'4', 3, {{0.45F, 0.0F, 0.45F, 1.0F}, {0.45F, 1.0F, 0.0F, 0.32F}, {0.0F, 0.32F, 0.62F, 0.32F}}},
-    {'5', 6,
-     {{0.62F, 1.0F, 0.0F, 1.0F},
-      {0.0F, 1.0F, 0.0F, 0.55F},
-      {0.0F, 0.55F, 0.45F, 0.55F},
-      {0.45F, 0.55F, 0.62F, 0.3F},
-      {0.62F, 0.3F, 0.45F, 0.0F},
-      {0.45F, 0.0F, 0.0F, 0.05F}}},
-    {'6', 8,
-     {{0.55F, 1.0F, 0.15F, 1.0F},
-      {0.15F, 1.0F, 0.0F, 0.5F},
-      {0.0F, 0.5F, 0.0F, 0.15F},
-      {0.0F, 0.15F, 0.15F, 0.0F},
-      {0.15F, 0.0F, 0.47F, 0.0F},
-      {0.47F, 0.0F, 0.62F, 0.18F},
-      {0.62F, 0.18F, 0.5F, 0.42F},
-      {0.5F, 0.42F, 0.12F, 0.42F}}},
-    {'7', 2, {{0.0F, 1.0F, 0.62F, 1.0F}, {0.62F, 1.0F, 0.25F, 0.0F}}},
-    {'8', 7,
-     {{0.0F, 0.52F, 0.0F, 1.0F},
-      {0.0F, 1.0F, 0.62F, 1.0F},
-      {0.62F, 1.0F, 0.62F, 0.52F},
-      {0.62F, 0.52F, 0.0F, 0.52F},
-      {0.0F, 0.52F, 0.0F, 0.0F},
-      {0.0F, 0.0F, 0.62F, 0.0F},
-      {0.62F, 0.0F, 0.62F, 0.52F}}},
-    {'9', 8,
-     {{0.07F, 0.0F, 0.45F, 0.0F},
-      {0.45F, 0.0F, 0.62F, 0.5F},
-      {0.62F, 0.5F, 0.62F, 0.85F},
-      {0.62F, 0.85F, 0.45F, 1.0F},
-      {0.45F, 1.0F, 0.13F, 1.0F},
-      {0.13F, 1.0F, 0.0F, 0.82F},
-      {0.0F, 0.82F, 0.12F, 0.58F},
-      {0.12F, 0.58F, 0.5F, 0.58F}}},
-    {'-', 1, {{0.08F, 0.5F, 0.54F, 0.5F}}},
-    {'.', 1, {{0.27F, 0.0F, 0.35F, 0.0F}}},
-    {'/', 1, {{0.0F, 0.0F, 0.62F, 1.0F}}},
-    {'_', 1, {{0.05F, -0.12F, 0.57F, -0.12F}}},
-};
-
-// Latin-1 letters with diacritics fold to their base letter: the stroke font
-// has no accents, and a dropped letter would make a name unreadable.
-char foldAccent(unsigned char c) {
-  switch (c) {
-    case 0xC0: case 0xC1: case 0xC2: case 0xC3: case 0xC4: case 0xC5:
-    case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5:
-      return 'A';
-    case 0xC7: case 0xE7:
-      return 'C';
-    case 0xC8: case 0xC9: case 0xCA: case 0xCB:
-    case 0xE8: case 0xE9: case 0xEA: case 0xEB:
-      return 'E';
-    case 0xCC: case 0xCD: case 0xCE: case 0xCF:
-    case 0xEC: case 0xED: case 0xEE: case 0xEF:
-      return 'I';
-    case 0xD1: case 0xF1:
-      return 'N';
-    case 0xD2: case 0xD3: case 0xD4: case 0xD5: case 0xD6: case 0xD8:
-    case 0xF2: case 0xF3: case 0xF4: case 0xF5: case 0xF6: case 0xF8:
-      return 'O';
-    case 0xD9: case 0xDA: case 0xDB: case 0xDC:
-    case 0xF9: case 0xFA: case 0xFB: case 0xFC:
-      return 'U';
-    case 0xDD: case 0xFD: case 0xFF:
-      return 'Y';
-    default:
-      return static_cast<char>(c);
+// Decode UTF-8 once per character; unsupported glyphs use a visible '?'.
+unsigned nextGlyph(std::string_view text, std::size_t& offset) {
+  unsigned const first = static_cast<unsigned char>(text[offset++]);
+  if (first < 128) { return first; }
+  unsigned count = first >= 0xF0 && first <= 0xF4 ? 3 :
+                   first >= 0xE0 && first <= 0xEF ? 2 :
+                   first >= 0xC2 && first <= 0xDF ? 1 : 0;
+  while (count > 0 && offset < text.size() &&
+         (static_cast<unsigned char>(text[offset]) & 0xC0) == 0x80) {
+    ++offset;
+    --count;
   }
+  return '?';
 }
-
-LineGlyph const* findGlyph(char c) {
-  // Names are ASCII apart from the odd accented letter ("Mégane_Blender"):
-  // fold those to their base letter so a name never renders with a hole.
-  char const u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  char const base = foldAccent(static_cast<unsigned char>(u));
-  for (auto const& g : kGlyphs) {
-    if (g.c == base) {
-      return &g;
-    }
-  }
-  return nullptr;
-}
-
 } // namespace
 
 void appendTextLines(std::vector<RendererVertex>& out, std::string_view text, Mat4 const& place,
                      float height, Vec3 colour) {
-  Vec3 const up{0.0F, 1.0F, 0.0F};
   float pen = 0.0F;
-  for (char const c : text) {
-    LineGlyph const* glyph = findGlyph(c);
-    if (glyph == nullptr) {
-      pen += 0.72F * height; // spaces and unknown characters
-      continue;
+  for (std::size_t offset = 0; offset < text.size();) {
+    unsigned c = nextGlyph(text, offset);
+    if (c < 32 || c > 126) { c = '?'; }
+    for (int y = 0; y < 32; ++y) {
+      auto const row = kSansGlyphs[c - 32][y];
+      for (int x = 0; x < 24;) {
+        if ((row & (1u << x)) == 0) { ++x; continue; }
+        int const begin = x;
+        while (x < 24 && (row & (1u << x)) != 0) { ++x; }
+        float const py = (27.0F - static_cast<float>(y)) * height / 24.0F;
+        Vec3 const a = transformPoint(place, {pen + begin * height / 24.0F, py, 0});
+        Vec3 const b = transformPoint(place, {pen + x * height / 24.0F, py, 0});
+        out.push_back({a, {0,1,0}, colour, {0,0}});
+        out.push_back({b, {0,1,0}, colour, {0,0}});
+      }
     }
-    for (int s = 0; s < glyph->count; ++s) {
-      Vec3 const a = transformPoint(place, {pen + glyph->segs[s][0] * height,
-                                            glyph->segs[s][1] * height, 0.0F});
-      Vec3 const b = transformPoint(place, {pen + glyph->segs[s][2] * height,
-                                            glyph->segs[s][3] * height, 0.0F});
-      out.push_back({a, up, colour, {0.0F, 0.0F}});
-      out.push_back({b, up, colour, {0.0F, 0.0F}});
-    }
-    pen += 0.72F * height;
+    pen += height;
   }
 }
 
 float textLineWidth(std::string_view text, float height) {
-  // Every character — drawn or not — advances exactly one 0.72 cell, so the
-  // width is the character count times that step. Keeping the step in one
-  // place is why callers can centre text exactly rather than by eye.
-  return static_cast<float>(text.size()) * 0.72F * height;
+  std::size_t count = 0;
+  for (std::size_t offset = 0; offset < text.size(); ++count) { (void)nextGlyph(text, offset); }
+  return static_cast<float>(count) * height;
 }
 
 } // namespace vredit

@@ -17,6 +17,8 @@ namespace vredit {
 // yawed head produces phantom roll otherwise).
 struct XrFrameInput {
   bool handOpen[2] = {false, false}; // at least three tracked extended fingers
+  Vec3 handJoints[2][26]{};
+  bool handJointValid[2][26]{};
   HandPose hands[2]; // palm joint poses, not runtime-filtered aim orientations
   bool handActive[2] = {false, false}; // actual hand-interaction profile
   bool pinchActive[2] = {false, false};
