@@ -92,9 +92,10 @@ struct XrShell::ImplData {
   bool spawnPending{false};
   bool menuPending{false}; // latched menu press (the tap/hold start)
   bool handInteraction{false}; // XR_EXT_hand_interaction enabled at instance creation
-  XrPath rightHandPath{XR_NULL_PATH}; // "/user/hand/right" (profile diagnostics)
-  XrPath rightProfile{XR_NULL_PATH};  // last active profile seen for the right hand
-  int profileCheckIn{0};              // frames until the next profile poll
+  XrPath handPaths[2]{XR_NULL_PATH, XR_NULL_PATH};    // "/user/hand/left|right" (diagnostics)
+  XrPath handProfiles[2]{XR_NULL_PATH, XR_NULL_PATH}; // last active profile seen per hand
+  int profileCheckIn{0};                              // frames until the next profile poll
+  int menuSigPrev{-1}; // last menu (active, down) pair printed; -1 prints once at startup
 
   // XR_KHR_vulkan_enable2 entry points.
   PFN_xrCreateVulkanInstanceKHR pfnCreateVulkanInstance{nullptr};
@@ -394,7 +395,8 @@ bool XrShell::createActions() {
     return false;
   }
   XrPath hands[2] = {leftPath, rightPath};
-  xr_->rightHandPath = rightPath;
+  xr_->handPaths[0] = leftPath;
+  xr_->handPaths[1] = rightPath;
 
   auto makeFloat = [&](char const* name, XrAction* out) {
     XrActionCreateInfo info = xrStruct<XrActionCreateInfo>(XR_TYPE_ACTION_CREATE_INFO);
@@ -747,6 +749,18 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   xr_->menuPrev = menuNow;
   input.menuPressed = xr_->menuPending;
   input.menuHeld = menuNow;
+  // "The menu button does nothing" has two very different causes: the button
+  // never reaches us (the runtime has the hand on a profile without a menu
+  // binding, or reserved the button), or it reaches us and the app drops it.
+  // Print every change of (active, down) so the console says which — the
+  // startup line shows whether the binding is live before you even press it.
+  int const menuSig = (menuLeft.isActive ? 2 : 0) + (menuLeft.currentState ? 1 : 0);
+  if (menuSig != xr_->menuSigPrev) {
+    std::printf("[xr] left menu: %s, button %s\n",
+                menuLeft.isActive ? "active" : "inactive (no menu binding on this profile)",
+                menuLeft.currentState ? "down" : "up");
+    xr_->menuSigPrev = menuSig;
+  }
 
   // Undo/redo: face buttons on Touch (B = undo, Y = redo), trackpad click on
   // Vive. The press is latched until a frame actually renders, so a
@@ -813,24 +827,30 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
     input.pointerRay = rayFromPose(xr_->correctedViews[0].pose);
   }
 
-  // Which input device is actually driving the right hand? A profile change
-  // is the difference between "hands are being tracked" and "the runtime is
-  // ignoring them", so say it once per change instead of leaving it a guess.
+  // Which input device is actually driving each hand? A profile change is the
+  // difference between "hands are being tracked" and "the runtime is ignoring
+  // them" — and a dead menu button is usually the runtime having moved the
+  // hand onto a profile that has no menu binding, which looks identical to
+  // "never pressed" from here. Say it once per change instead of guessing.
   if (--xr_->profileCheckIn <= 0) {
     xr_->profileCheckIn = 60; // ~1 s at headset frame rates
-    XrInteractionProfileState profile =
-        xrStruct<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
-    if (XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_->session, xr_->rightHandPath, &profile)) &&
-        profile.interactionProfile != xr_->rightProfile) {
-      xr_->rightProfile = profile.interactionProfile;
+    static char const* const kHandNames[2] = {"left", "right"};
+    for (int hand = 0; hand < 2; ++hand) {
+      XrInteractionProfileState profile =
+          xrStruct<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
+      if (XR_FAILED(xrGetCurrentInteractionProfile(xr_->session, xr_->handPaths[hand], &profile)) ||
+          profile.interactionProfile == xr_->handProfiles[hand]) {
+        continue;
+      }
+      xr_->handProfiles[hand] = profile.interactionProfile;
       char name[XR_MAX_PATH_LENGTH]{};
       std::uint32_t written = 0;
       if (profile.interactionProfile == XR_NULL_PATH ||
           XR_FAILED(xrPathToString(xr_->instance, profile.interactionProfile, sizeof(name), &written,
                                    name))) {
-        std::printf("[xr] right hand input: none\n");
+        std::printf("[xr] %s hand input: none\n", kHandNames[hand]);
       } else {
-        std::printf("[xr] right hand input: %s\n", name);
+        std::printf("[xr] %s hand input: %s\n", kHandNames[hand], name);
       }
     }
   }

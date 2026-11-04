@@ -1197,9 +1197,7 @@ void toggleBackdrop(App& app, VkRenderer& renderer, XrShell* shell) {
 void assembleFrame(App& app,
                    std::vector<DrawItem>& items,
                    std::vector<RendererVertex>& depthLines,
-                   std::vector<RendererVertex>& overlayLines,
-                   Vec3 const* hudPos = nullptr,
-                   Quat const* hudOrient = nullptr) {
+                   std::vector<RendererVertex>& overlayLines) {
   if (app.showBackdrop) {
     appendGrid(depthLines, 8.0F, 1.0F);
   }
@@ -1242,15 +1240,14 @@ void assembleFrame(App& app,
     }
   }
   // The mode HUD: the current mode's name in the line font, view-locked in
-  // front of the camera/head (XR passes the head pose; desktop uses the
-  // camera), so "which mode is this" is readable in the headset. The carousel
-  // names the MODELS instead (see below), so the mode text is hidden there.
-  std::string hudText = app.mode == EditMode::move ? "MOVE" : "ROTATE";
-  // No HUD over the carousel ("You still have the words MOVE in the
-  // carousel"): the mode text is only for normal editing.
+  // front of the camera (desktop only — VR has no mode switch any more, so the
+  // word would be a permanent lie in the headset; it comes back with the
+  // gestures). The carousel names the MODELS instead (see below), so the mode
+  // text is hidden there too.
   if (!app.galleryActive) {
-    Vec3 const hudEye = hudPos != nullptr ? *hudPos : app.camera.position;
-    Quat const hudFace = hudOrient != nullptr ? *hudOrient : cameraOrientation(app.camera);
+    std::string hudText = app.mode == EditMode::move ? "MOVE" : "ROTATE";
+    Vec3 const hudEye = app.camera.position;
+    Quat const hudFace = cameraOrientation(app.camera);
     Vec3 const hudFwd = rotate(hudFace, Vec3{0.0F, 0.0F, -1.0F});
     Vec3 const hudUp = rotate(hudFace, Vec3{0.0F, 1.0F, 0.0F});
     Vec3 const hudAt = hudEye + hudFwd * 0.55F + hudUp * 0.17F;
@@ -2602,11 +2599,7 @@ int runXr(char const* shaderDir,
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;
-    // The HUD faces the horizon-locked head — the same correction the eyes
-    // get (gravityAlign(headTotal) is the corrected orientation exactly), so
-    // the text stays level like everything else.
-    Quat const hudHead = gravityAlign(cameraOrientation(rig) * input.headOrient);
-    assembleFrame(app, items, depthLines, overlayLines, &headWorld, &hudHead);
+    assembleFrame(app, items, depthLines, overlayLines);
     // Controller pointers: one beam per tracked hand, always on top so the
     // aimed point is visible even against the model. Left is cool, right (the
     // manipulation pointer) is warm.
