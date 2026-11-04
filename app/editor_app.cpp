@@ -55,7 +55,7 @@ constexpr float kVrPickThresholdPx = 24.0F; // aim rays jitter: 3x the mouse
 constexpr float kStickDeadZone = 0.12F; // a gesture STARTS past this deflection
 constexpr float kStickEndZone = 0.06F;  // ...and ENDS below this (hysteresis, so one
                                         // physical gesture is one undo step)
-constexpr float kStickMoveMps = 1.5F;    // metres per second at full deflection
+constexpr float kStickMoveMps = 3.0F;    // metres per second at full deflection
 constexpr float kStickTurnRadps = 1.75F; // ~100 degrees per second at full
 constexpr float kStickHeightMps = 1.0F;  // move mode: metres/second up/down
 constexpr float kStickScalePerS = 1.0F;  // move mode: e-fold growth per second
@@ -512,9 +512,14 @@ Ray appRay(App const& app, Vec2 pixel) {
 // through gaps). The bounding box is not a click target — a ray that misses
 // the triangles hits nothing, so empty space never selects a model. Returns
 // the hit with its along-ray distance.
-std::optional<vredit::PickHit> pickNode(App& app, Ray const& ray) {
+std::optional<vredit::PickHit> pickNode(App& app, Ray const& ray, NodeId subtree = kInvalidNode) {
   std::vector<vredit::PickCandidate> candidates;
   for (NodeVisual const& visual : app.visuals) {
+    if (subtree != kInvalidNode) {
+      auto node = visual.id;
+      while (node != kInvalidNode && node != subtree) { node = app.scene.parent(node); }
+      if (node != subtree) { continue; }
+    }
     Mat4 world = app.scene.world(visual.id);
     Aabb box{};
     bool first = true;
@@ -1183,6 +1188,22 @@ bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
   return true;
 }
 
+// A model surface is the only placement target. Empty left/right space
+// browses relative to the stationary ring, never the changing head heading.
+int galleryPointerAction(App& app, Ray const& ray) {
+  for (auto const& slot : app.carousel) {
+    if (app.ring.atRest() && slot.index == app.ring.index && slot.hasModel &&
+        pickNode(app, ray, slot.wrapper).has_value()) { return 2; }
+  }
+  return carouselPinchDirection(ray, app.ringOrigin, app.ringForward);
+}
+
+void galleryPointerPress(App& app, VkRenderer& renderer, Ray const& ray) {
+  int const action = galleryPointerAction(app, ray);
+  if (action == 2) { (void)galleryPick(app, renderer, ray); }
+  else if (action != 0) { galleryCycle(app, renderer, action); }
+}
+
 // "Show the model without the background": the grid goes and the clear
 // becomes a plain void — in VR that void is the real world (alpha 0 lets the
 // passthrough cameras show through), on desktop it is just black. This is the
@@ -1394,7 +1415,7 @@ void handleEvent(App& app,
       if (app.galleryActive) {
         // The carousel owns clicks: the click places the staged model at the
         // floor point under the pointer.
-        (void)galleryPick(app, renderer, mouseRay);
+        galleryPointerPress(app, renderer, mouseRay);
         break;
       }
       bool const partSelect = (press->state & (XCB_MOD_MASK_SHIFT | XCB_MOD_MASK_CONTROL)) != 0U;
@@ -1968,6 +1989,34 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     std::printf("SMOKE carousel labels: %d vertices over %d slots -> .build/carousel-labels.ppm\n",
                 labelVerts, staged());
   }
+  // Let the animation settle before testing a centred surface target.
+  for (int i = 0; i < 120; ++i) { galleryTick(app, renderer, 1.0F / 60, hudPos, {0,0,-1}); }
+  bool previewHit = false;
+  for (auto const& slot : app.carousel) {
+    if (slot.index != app.ring.index || !slot.hasModel) { continue; }
+    for (auto const& visual : app.visuals) {
+      auto node = visual.id;
+      while (node != kInvalidNode && node != slot.wrapper) { node = app.scene.parent(node); }
+      if (node != slot.wrapper || !visual.pickGeometry || visual.pickGeometry->indices.size() < 3) { continue; }
+      auto const& geometry = *visual.pickGeometry;
+      Vec3 centre{};
+      for (int i = 0; i < 3; ++i) { centre = centre + geometry.positions[geometry.indices[i]]; }
+      centre = transformPoint(app.scene.world(visual.id), centre / 3.0F);
+      Ray const ray{hudPos, normalized(centre - hudPos)};
+      if (galleryPointerAction(app, ray) == 2) {
+        auto const settledAngle = app.ring.angle;
+        app.ring.angle += .4F;
+        if (galleryPointerAction(app, ray) == 2) {
+          std::printf("SMOKE FAIL: moving preview cannot place\n"); return 1;
+        }
+        app.ring.angle = settledAngle;
+        previewHit = true; break;
+      }
+    }
+  }
+  if (!previewHit || galleryPointerAction(app, {hudPos, {0,1,0}}) != 0) {
+    std::printf("SMOKE FAIL: preview surface-only placement target\n"); return 1;
+  }
   int const centredBefore = app.ring.index;
   galleryCycle(app, renderer, 1);
   pump();
@@ -1981,6 +2030,10 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   if (app.ring.index != centredBefore) {
     std::printf("SMOKE FAIL: carousel ring did not wrap back\n");
     return 1;
+  }
+  if (galleryPointerAction(app, {hudPos, normalized(Vec3{-1,0,-1})}) != -1 ||
+      galleryPointerAction(app, {hudPos, normalized(Vec3{1,0,-1})}) != 1) {
+    std::printf("SMOKE FAIL: carousel side pinch zones\n"); return 1;
   }
   Ray const placeAim{hudPos, normalized(Vec3{0.0F, -1.0F, -0.2F})};
   if (!galleryPick(app, renderer, placeAim) || app.galleryActive) {
@@ -2285,6 +2338,15 @@ void updateHandGrab(App& app, HandPose pose) {
   }
 }
 
+// Freeze a live controller edit while choosing a tool. Its snapshot stays
+// pending so UNDO/REDO can cancel it without destroying an existing redo branch.
+void prepareHandPanel(App& app) {
+  if (app.handGrab || app.handTool >= 0) {
+    endEdits(app);
+  }
+  app.stickArmed = false;
+}
+
 // History buttons must leave a pending edit intact for the shared cancellation
 // path; committing here would discard an existing redo branch.
 void prepareHandTool(App& app, int button) {
@@ -2354,7 +2416,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   }
   updateHandGrab(app, current);
   auto const movedWorld = app.scene.world(cube);
-  if (!check(nearVector(transformPoint(movedWorld, {}), pivot + displacement),
+  if (!check(nearVector(transformPoint(movedWorld, {}), pivot + displacement * 2.0F),
              "bounds pivot follows palm displacement") ||
       !check(nearVector(transformVector(movedWorld, {1, 0, 0}),
                         rotate(turn, transformVector(initialWorld, {1, 0, 0}))) &&
@@ -2401,7 +2463,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   beginHandGrab(app, start);
   auto const hierarchyPivot = app.grabPivot;
   auto expectedWorld = [&](Mat4 const& world, Vec3 centre) {
-    return mul(translationMatrix(centre + displacement),
+    return mul(translationMatrix(centre + displacement * 2.0F),
                mul(rotationMatrix(turn), mul(translationMatrix(-centre), world)));
   };
   if (!check(app.grabWorlds.size() == 1 && app.grabWorlds.front().first == parent,
@@ -2487,6 +2549,10 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
     app.undo.begin(snapshot(app));
     app.stickSession = true;
     moveSelectionVertical(app.scene, app.selection, .1F);
+    prepareHandPanel(app);
+    if (!check(app.stickSession && app.undo.canRedo(), "panel opening preserves live history")) {
+      return false;
+    }
     prepareHandTool(app, button);
     if (!check(app.stickSession && app.undo.canRedo(), "history tool preserves live edit for cancellation")) {
       return false;
@@ -2604,7 +2670,7 @@ int runXr(char const* shaderDir,
 
   App app;
   app.xr = true;
-  std::printf("[xr] Genesis: swipe carousel; no VR mode HUD or carousel buttons\n");
+  std::printf("[xr] Genesis: point-and-pinch carousel; palm-up left-pinch menu\n");
   app.width = shell.eyeWidth();
   app.height = shell.eyeHeight();
   app.libraryDir = libraryDir;
@@ -2651,14 +2717,11 @@ int runXr(char const* shaderDir,
 
   bool running = true;
   int framesRendered = 0;
-  HandSwipe carouselSwipe;
-  float swipePlacementGuard = 0.0F;
-  float swipeDiagnosticTime = 0.0F;
+  bool handMenuOpen = false;
   HandGesture leftPinch;
   HandGesture rightPinch;
   bool palmUp = false;
   int jointSignature = -1;
-  float palmCharge = 0.0F;
   bool rightWasHand = false;
   int skipsInARow = 0;
   double frameMsTotal = 0.0;
@@ -2678,14 +2741,11 @@ int runXr(char const* shaderDir,
       if (app.handGrab || app.handTool >= 0) {
         endEdits(app);
       }
-      carouselSwipe.reset();
-      swipePlacementGuard = 0.0F;
       leftPinch.reset();
       rightPinch.reset();
       app.handUiOwned = true;
       app.handPanel.visible = false;
       palmUp = false;
-      palmCharge = 0.0F;
     }
     if (status == XrShell::FrameStatus::Pump) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5)); // session still starting
@@ -2741,8 +2801,8 @@ int runXr(char const* shaderDir,
       jointSignature = jointsNow;
     }
     bool const handRight = input.handActive[1];
-    bool const handTracked = handRight && input.aimValid[1];
-    bool const leftPressed = leftPinch.update(input.handActive[0] && input.aimValid[0], input.pinch[0]);
+    bool const handTracked = handRight && input.aimValid[1] && input.pinchActive[1];
+    bool const leftPressed = leftPinch.update(input.handActive[0] && input.aimValid[0] && input.pinchActive[0], input.pinch[0]);
     bool const rightPressed = rightPinch.update(handTracked, input.pinch[1]);
     bool const handHeld = handTracked && input.pinch[1] > .4F;
     if (handRight || rightWasHand) {
@@ -2752,10 +2812,12 @@ int runXr(char const* shaderDir,
     }
     rightWasHand = handRight;
     bool handCarouselToggled = false;
-    if (leftPressed) {
+    palmUp = input.handActive[0] && palmFacingUp(worldHands[0], palmUp);
+    if (leftPressed && palmUp) {
+      handMenuOpen = !handMenuOpen;
       endEdits(app);
       app.handUiOwned = true;
-      if (app.galleryActive) {
+      if (!handMenuOpen) {
         galleryClose(app);
       } else {
         galleryOpen(app, renderer);
@@ -2763,42 +2825,13 @@ int runXr(char const* shaderDir,
       handCarouselToggled = true;
       std::printf("[hands] left pinch: carousel %s\n", app.galleryActive ? "open" : "closed");
     }
-    palmUp = input.handActive[0] && palmFacingUp(worldHands[0], palmUp);
-    palmCharge = palmUp ? palmCharge + dt : 0.0F;
     // Latch the stationary carousel anchor on its opening frame.
     if (app.galleryActive && !app.ringLatched) {
       galleryTick(app, renderer, 0.0F, headWorld, headForward);
     }
-    swipePlacementGuard = std::max(0.0F, swipePlacementGuard - dt);
-    if (!app.galleryActive || handCarouselToggled) {
-      carouselSwipe.reset();
-      swipePlacementGuard = 0.0F;
-    } else {
-      auto const right = normalized(cross(Vec3{headForward.x, 0, headForward.z}, Vec3{0,1,0}));
-      // Subtract head position: walking must not browse the library.
-      swipeDiagnosticTime += dt;
-      if (swipeDiagnosticTime >= 1.0F) {
-        std::printf("[hands] swipe input: profile=%d palm=%d open=%d pinch=%.2f armed=%d\n",
-            handRight, worldHands[1].valid, input.handOpen[1], input.pinch[1], carouselSwipe.armed());
-        swipeDiagnosticTime = 0;
-      }
-      int const step = carouselSwipe.update(handRight && worldHands[1].valid,
-          input.handOpen[1] && input.pinch[1] <= .4F,
-          worldHands[1].position - headWorld, right, dt);
-      if (step != 0) {
-        galleryCycle(app, renderer, step);
-        swipePlacementGuard = .4F;
-        std::printf("[hands] carousel swipe: %s\n", step > 0 ? "next" : "previous");
-      }
-    }
-    // A pinch during the swipe settling interval must be released, not queued.
-    if (handRight && swipePlacementGuard > 0 && input.selectPressed) {
-      app.handUiOwned = true;
-      input.selectPressed = false;
-    }
-    bool const panelWanted = handRight && !app.galleryActive && palmCharge >= .25F;
+    bool const panelWanted = handRight && handMenuOpen && !app.galleryActive;
     if (panelWanted && (!app.handPanel.visible || app.handPanelCarousel != app.galleryActive)) {
-      endEdits(app);
+      prepareHandPanel(app);
       app.handPanelCarousel = app.galleryActive;
       app.handPanel.orientation = quatFromAxisAngle({0,1,0}, std::atan2(-headForward.x, -headForward.z));
       app.handPanel.origin = headWorld + headForward * .65F + Vec3{0,.08F,0};
@@ -2935,11 +2968,11 @@ int runXr(char const* shaderDir,
       if (app.galleryActive) {
         // The carousel owns the trigger: it places the staged model at the
         // floor point under the aim ray.
-        (void)galleryPick(app, renderer, worldRay);
+        galleryPointerPress(app, renderer, worldRay);
         if (handRight) { app.handUiOwned = true; }
       } else {
         // Grip + trigger selects a single part; trigger alone the whole model.
-        bool const partSelect = input.gripHeld > 0.5F;
+        bool const partSelect = !handRight && input.gripHeld > 0.5F;
         PointerTarget target = resolvePointerTarget(app, worldRay);
         pointerPress(app, target, partSelect);
         if (handTracked) {
@@ -3005,7 +3038,7 @@ int runXr(char const* shaderDir,
     if (!sticksActive) {
       app.stickArmed = true;
     }
-    if (sticksActive && !app.stickSession && !app.handGrab && app.handTool < 0 && !app.galleryActive &&
+    if (!panelWanted && sticksActive && !app.stickSession && !app.handGrab && app.handTool < 0 && !app.galleryActive &&
         !app.selection.empty() && app.stickArmed) {
       app.undo.begin(snapshot(app));
       app.stickSession = true;
@@ -3023,7 +3056,7 @@ int runXr(char const* shaderDir,
         app.stickPivot = app.scene.worldPosition(app.selection.front());
       }
     }
-    if (app.stickSession && !app.galleryActive) {
+    if (app.stickSession && !app.galleryActive && !panelWanted) {
       if (gestureAlive && !app.selection.empty()) {
         Vec3 const moveDelta = (headRightFlat * leftX + headForwardFlat * leftY) *
                                (kStickMoveMps * app.stickFineRate * dt);

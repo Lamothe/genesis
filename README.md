@@ -65,8 +65,10 @@ the arrows at quarter speed (fine). Nothing rotates outside rotate mode. Each
 arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
 **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (the
 ring of models rotates in/out of view around the camera; **[** **]** cycle
-the library, a click places the
-staged model at the floor point under the cursor as one undo step; **N**
+the library; clicking the exact surface of the centred preview places the
+staged model at the floor point under the cursor as one undo step. Otherwise,
+clicking the left/right ray zones browses one model per click; a central miss
+does nothing. **N**
 closes without placing), **Delete** removes the selection (model or part),
 **Esc** quits. The selection is marked by a thin warm rim in the shader (a
 part selection marks the part) and the current mode's name shows as
@@ -76,31 +78,37 @@ In VR the trigger only *selects* — whole model, or a single part with grip+tri
 Bare hands (Quest through WiVRn) use a separate control path; controller
 buttons and sticks are unchanged:
 
-- **Left pinch** opens/closes the carousel. With the right hand open, pause
-  briefly then **swipe left for next / right for previous** (about 16 cm,
-  one model per swipe). Pause for 0.25 s between strokes; the return movement
-  does not immediately reverse the carousel. There are no carousel buttons.
-  **Right pinch** places the centred model on the floor under the aim ray;
-  pinches in the 0.4 s settling interval after a swipe are ignored until released.
-  Swiping requires tracked palm/finger joints; controller stick browsing is unchanged.
-- **Right pinch** selects the model under the right aim beam (grasp + pinch
-  selects a part). Hold to grab: moving the palm translates the selection,
-  and turning the hand rotates it by the same relative orientation change
-  around the moving subtree's bounds centre. Releasing keeps the pose and
-  records one undo step. All three rotation axes are tracked; there is no
-  floor clamp during a hand grab, so models can be lifted and tipped freely.
-- **Left palm facing up** for 0.25 s shows a stationary, head-facing tool
-  panel. Point and right-pinch a labelled button: **SMALLER/BIGGER**,
-  **LOWER/RAISE**, **TURN LEFT/RIGHT** run while held; **UNDO**, **REDO** and
-  **BACKDROP** fire once. **DELETE** requires a 0.6 s hold, with the existing
-  red charge feedback. Release before full charge or lower the left palm
+- **Left pinch while the left palm faces up** explicitly toggles the hand
+  menu. Opening it initially shows the carousel; palm-up alone never opens
+  anything. After placing a model, the stationary, head-facing tools panel
+  remains available until the menu is toggled off. Lowering the palm does
+  not close the menu.
+- In the carousel, **right pinch** on the exact surface of the centred
+  preview places it. Otherwise, the left/right ray zones browse one model
+  per pinch; a central miss does nothing. These same surface-hit and ray-zone
+  rules apply to desktop clicks and controller triggers.
+- Outside the menu, **right pinch** selects the whole model under the right
+  aim beam, even when grasping: hand pinches never select individual parts
+  (controllers retain grip+trigger part selection). Hold to grab: moving the
+  palm translates the whole model at **2× hand movement**, and turning the
+  hand rotates it by the same relative orientation change around the model's
+  bounds centre. Releasing keeps the pose and records one undo step. All
+  three rotation axes are tracked; there is no floor clamp during a hand
+  grab, so models can be lifted and tipped freely.
+- On the tools panel, point and right-pinch a labelled button:
+  **SMALLER/BIGGER**, **LOWER/RAISE**, **TURN LEFT/RIGHT** run while held;
+  **UNDO**, **REDO** and **BACKDROP** fire once. **DELETE** requires a 0.6 s
+  hold, with the existing red charge feedback. Release before full charge
   to cancel deletion. A held tool stays captured until release and cannot
-  accidentally grab a model behind it. Lower the palm to hide the panel.
+  accidentally grab a model behind it.
+- Opening the tools panel pauses an active controller-stick edit; choosing
+  UNDO/REDO cancels it without discarding the existing redo branch. Closing
+  the panel or choosing another edit commits it.
 - Tracking loss or a skipped/paused XR frame ends the current hand edit;
   release the pinch before starting again. Aim-and-pinch select/place remains
-  available without joint tracking, but grab/rotation and palm-up tools need
-  tracked palm joints. The console reports joint availability and tracking,
-  left-pinch carousel actions and tool activations.
+  available without joint tracking, but grab/rotation and the palm-up menu
+  toggle need tracked palm joints. The console reports joint availability
+  and tracking, left-pinch menu actions and tool activations.
 
 **Verification status:** build, automated hand/core tests and offscreen hand
 editing/panel smoke checks are available; these do **not** verify the runtime
@@ -109,7 +117,8 @@ is still required for every feature above.
 
 Movement and editing are the **sticks** (controller aim is too jittery for
 accurate placement): the **left stick** slides the selection across the floor
-relative to your head (pushing forward walks it away from you; it never lifts
+relative to your head at **3 m/s** at full deflection (previously 1.5 m/s;
+pushing forward walks it away from you; it never lifts
 off the floor), and the **right stick** scales it (X, right = bigger) and
 raises it (Y, up = lift). The **left controller's menu** is two controls:
 **tap** = the model carousel, **hold** = the backdrop (thumbstick clicks do
@@ -129,10 +138,10 @@ stick X**
 rotates
 the ring in and out of view INSTANTLY (decoding runs on a worker thread, so
 a huge model never blocks the switch; each preview is labelled with its filename stem), and the
-trigger places the centred model at natural size on the floor where your aim
-beam
-meets it — one undo step (undo removes it entirely), and the carousel
-closes. **A**, a **menu tap** or undo (B) closes without placing. The library folder
+trigger places the centred model only when its exact preview surface is hit,
+at natural size on the floor where your aim beam meets it — one undo step
+(undo removes it entirely), and the carousel closes. Otherwise, left/right
+ray zones browse one model per trigger press; a central miss is inert. **A**, a **menu tap** or undo (B) closes without placing. The library folder
 (`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
 opens — drop a file in and place it without restarting. **Hold X** to
 delete: the selection ramps red and the delete fires at full charge (0.6 s);

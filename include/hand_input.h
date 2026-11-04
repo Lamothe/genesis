@@ -10,75 +10,18 @@ struct HandPose {
   bool valid{false};
 };
 
-// Viewer-relative swipe, one step per stroke. A short stationary pause rearms;
-// the return stroke cannot immediately cycle back. No velocity-only triggers.
-class HandSwipe {
- public:
-  void reset() { *this = HandSwipe{}; }
-  bool armed() const { return armed_; }
-  int update(bool valid, bool open, Vec3 position, Vec3 viewerRight, float dt) {
-    if (!valid || !open || !std::isfinite(dt) || dt <= 0.0F || dt > .15F ||
-        !std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) {
-      reset();
-      return 0;
-    }
-    if (!haveSample_) {
-      haveSample_ = true;
-      quietAnchor_ = start_ = last_ = position;
-      right_ = normalized(viewerRight);
-      return 0;
-    }
-    last_ = position;
-    // A spatial pause tolerates high-frequency tracking jitter; requiring
-    // every frame's velocity to be tiny can prevent acquisition forever.
-    bool const insidePause = length(position - quietAnchor_) <= .025F;
-    if (insidePause) {
-      quiet_ += dt;
-    } else {
-      quiet_ = 0;
-      quietAnchor_ = position;
-    }
-    if (armed_ && length(position - start_) > .025F) {
-      departed_ = true;
-    }
-    if (quiet_ >= .25F && !departed_) {
-      if (!armed_) {
-        start_ = quietAnchor_;
-      }
-      armed_ = true;
-      right_ = normalized(viewerRight);
-      elapsed_ = 0;
-      return 0; // keep the acquired origin; jitter cannot walk it along a stroke
-    }
-    if (!armed_) { return 0; }
-    elapsed_ += dt;
-    auto const travel = position - start_;
-    auto const horizontal = dot(travel, right_);
-    auto const offAxis = travel - right_ * horizontal;
-    if (length(offAxis) > .10F || elapsed_ > .80001F) {
-      armed_ = false;
-      departed_ = false;
-      quiet_ = 0;
-      quietAnchor_ = position;
-      return 0;
-    }
-    if (std::fabs(horizontal) >= .16F) {
-      armed_ = false;
-      departed_ = false;
-      quiet_ = 0;
-      quietAnchor_ = position;
-      // Swipe left pulls the next model into the centre, like a touch carousel.
-      return horizontal < 0 ? 1 : -1;
-    }
-    return 0;
-  }
- private:
-  bool haveSample_{false};
-  bool armed_{false};
-  bool departed_{false};
-  Vec3 start_{}, last_{}, right_{}, quietAnchor_{};
-  float quiet_{0}, elapsed_{0};
-};
+// The centre is deliberately inert unless an exact preview surface was hit.
+// Intersect the ring-facing plane so hand-ray origin does not skew side zones.
+inline int carouselPinchDirection(Ray const& ray, Vec3 origin, Vec3 forward) {
+  forward.y = 0;
+  forward = normalized(forward);
+  auto const denominator = dot(ray.direction, forward);
+  if (!(denominator > .0001F)) { return 0; }
+  float const distance = dot(origin + forward * 1.25F - ray.origin, forward) / denominator;
+  if (!(distance > 0)) { return 0; }
+  float const side = dot(ray.origin + ray.direction * distance - origin, cross(forward, Vec3{0,1,0}));
+  return side < -.22F ? -1 : side > .22F ? 1 : 0;
+}
 
 class HandGesture {
  public:
@@ -162,7 +105,7 @@ inline Mat4 handGrabTransform(HandPose start, HandPose current, Vec3 pivot, Mat4
     return initialWorld;
   }
   auto const delta = normalized(current.orientation * conjugate(start.orientation));
-  auto const translation = current.position - start.position;
+  auto const translation = (current.position - start.position) * 2.0F;
   return mul(translationMatrix(pivot + translation),
              mul(rotationMatrix(delta), mul(translationMatrix(-pivot), initialWorld)));
 }

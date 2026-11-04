@@ -859,6 +859,7 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
     getInfo.action = xr_->triggerAction;
     getInfo.subactionPath = xr_->handPaths[hand];
     xrGetActionStateFloat(xr_->session, &getInfo, &pinch);
+    input.pinchActive[hand] = pinch.isActive;
     input.pinch[hand] = pinch.isActive ? pinch.currentState : 0.0F;
     if (!input.handActive[hand] || xr_->trackers[hand] == XR_NULL_HANDLE) {
       continue;

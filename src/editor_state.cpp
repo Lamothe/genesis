@@ -347,7 +347,7 @@ bool scaleSelectionUniform(Scene& scene,
     return false;
   }
   Aabb bounds{};
-  if (!nodesBounds(scene, visuals, selection, bounds)) {
+  if (!movingSetBounds(scene, visuals, selection, bounds)) {
     return false;
   }
   Vec3 const pivot = aabbCentre(bounds);

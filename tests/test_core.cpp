@@ -1496,6 +1496,36 @@ void testScaleSelectionUniform() {
   CHECK_NEAR(vredit::length(vredit::Vec3{world.m[4], world.m[5], world.m[6]}), 2.0F, 1e-5F);
   CHECK_NEAR(vredit::length(vredit::Vec3{world.m[8], world.m[9], world.m[10]}), 2.0F, 1e-5F);
 
+  // Parent-only edits move the whole subtree, including offset visuals.
+  // A meshless parent must use its child visual rather than its bare origin.
+  for (bool const meshlessParent : {false, true}) {
+    scene.setLocal(parent, parentStart);
+    childStart.translation = {4.0F, 2.0F, -3.0F};
+    scene.setLocal(child, childStart);
+    vc.localBounds = {{-1.0F, -0.5F, -2.0F}, {1.0F, 0.5F, 2.0F}};
+    visuals = {vc};
+    if (!meshlessParent) {
+      visuals.push_back(vp);
+    }
+
+    vredit::Aabb movingBefore{};
+    vredit::Aabb childBefore{};
+    CHECK(vredit::movingSetBounds(scene, visuals, {parent}, movingBefore));
+    CHECK(vredit::nodesBounds(scene, visuals, {child}, childBefore));
+    Vec3 const pivot = vredit::aabbCentre(movingBefore);
+    CHECK(vredit::scaleSelectionUniform(scene, visuals, {parent}, 2.0F));
+
+    vredit::Aabb movingAfter{};
+    vredit::Aabb childAfter{};
+    CHECK(vredit::movingSetBounds(scene, visuals, {parent}, movingAfter));
+    CHECK(vredit::nodesBounds(scene, visuals, {child}, childAfter));
+    CHECK_NEAR3(vredit::aabbCentre(movingAfter), pivot);
+    CHECK_NEAR3(childAfter.min - pivot, (childBefore.min - pivot) * 2.0F);
+    CHECK_NEAR3(childAfter.max - pivot, (childBefore.max - pivot) * 2.0F);
+    CHECK_NEAR3(scene.local(child).translation, childStart.translation);
+    CHECK_NEAR3(scene.local(child).scale, childStart.scale);
+  }
+
   // Guards: zero/negative factors and an empty selection change nothing.
   vredit::Vec3 const before = scene.worldPosition(parent);
   CHECK(!vredit::scaleSelectionUniform(scene, visuals, {parent}, 0.0F));
