@@ -168,6 +168,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer);
 inline MeshHandle cachedMesh(App& app, VkRenderer& renderer, MeshData const& data);
 
 struct App {
+  bool xr{false};
   Scene scene;
   std::vector<NodeVisual> visuals;
   std::vector<NodeId> selection;
@@ -1258,7 +1259,7 @@ void assembleFrame(App& app,
   // word would be a permanent lie in the headset; it comes back with the
   // gestures). The carousel names the MODELS instead (see below), so the mode
   // text is hidden there too.
-  if (!app.galleryActive) {
+  if (!app.xr && !app.galleryActive) {
     std::string hudText = app.mode == EditMode::move ? "MOVE" : "ROTATE";
     Vec3 const hudEye = app.camera.position;
     Quat const hudFace = cameraOrientation(app.camera);
@@ -2497,6 +2498,22 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
     }
   }
 
+  // Rendering-level regression: VR must never inherit the desktop MOVE HUD.
+  {
+    App hud;
+    std::vector<DrawItem> items;
+    std::vector<RendererVertex> depth, overlay;
+    assembleFrame(hud, items, depth, overlay);
+    if (!check(!overlay.empty(), "desktop retains mode HUD")) { return false; }
+    hud.xr = true;
+    overlay.clear();
+    assembleFrame(hud, items, depth, overlay);
+    if (!check(overlay.empty(), "VR has no mode HUD")) { return false; }
+    hud.galleryActive = true;
+    assembleFrame(hud, items, depth, overlay);
+    if (!check(overlay.empty(), "VR carousel has no mode HUD")) { return false; }
+  }
+
   app.handPanel = {{0, .195F, 0}, quatFromAxisAngle({0, 1, 0}, .3F), true};
   auto const normal = rotate(app.handPanel.orientation, {0, 0, 1});
   for (int index = 0; index < 12; ++index) {
@@ -2586,6 +2603,8 @@ int runXr(char const* shaderDir,
   }
 
   App app;
+  app.xr = true;
+  std::printf("[xr] Genesis: swipe carousel; no VR mode HUD or carousel buttons\n");
   app.width = shell.eyeWidth();
   app.height = shell.eyeHeight();
   app.libraryDir = libraryDir;
@@ -2634,6 +2653,7 @@ int runXr(char const* shaderDir,
   int framesRendered = 0;
   HandSwipe carouselSwipe;
   float swipePlacementGuard = 0.0F;
+  float swipeDiagnosticTime = 0.0F;
   HandGesture leftPinch;
   HandGesture rightPinch;
   bool palmUp = false;
@@ -2745,7 +2765,7 @@ int runXr(char const* shaderDir,
     }
     palmUp = input.handActive[0] && palmFacingUp(worldHands[0], palmUp);
     palmCharge = palmUp ? palmCharge + dt : 0.0F;
-    // Latch the carousel anchor before positioning its arrows on the opening frame.
+    // Latch the stationary carousel anchor on its opening frame.
     if (app.galleryActive && !app.ringLatched) {
       galleryTick(app, renderer, 0.0F, headWorld, headForward);
     }
@@ -2756,6 +2776,12 @@ int runXr(char const* shaderDir,
     } else {
       auto const right = normalized(cross(Vec3{headForward.x, 0, headForward.z}, Vec3{0,1,0}));
       // Subtract head position: walking must not browse the library.
+      swipeDiagnosticTime += dt;
+      if (swipeDiagnosticTime >= 1.0F) {
+        std::printf("[hands] swipe input: profile=%d palm=%d open=%d pinch=%.2f armed=%d\n",
+            handRight, worldHands[1].valid, input.handOpen[1], input.pinch[1], carouselSwipe.armed());
+        swipeDiagnosticTime = 0;
+      }
       int const step = carouselSwipe.update(handRight && worldHands[1].valid,
           input.handOpen[1] && input.pinch[1] <= .4F,
           worldHands[1].position - headWorld, right, dt);

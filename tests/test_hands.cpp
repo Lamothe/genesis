@@ -138,10 +138,10 @@ void swipes() {
     HandSwipe swipe;
     swipeAcquire(swipe);
     for (int i = 1; i < frames; ++i) {
-      CHECK(swipe.update(true, true, {static_cast<float>(i) * .02F, 0, 0},
+      CHECK(swipe.update(true, true, {static_cast<float>(i) * .026F, 0, 0},
                          right, .125F) == 0);
     }
-    CHECK(swipe.update(true, true, {.16F, 0, 0}, right, .125F) ==
+    CHECK(swipe.update(true, true, {.19F, 0, 0}, right, .125F) ==
           (frames == 6 ? -1 : 0));
   }
   // Continuous slow drift exceeds the quiet-speed cutoff but cannot reach
@@ -326,6 +326,39 @@ void grabs() {
 }
 } // namespace
 
+void swipeSlowStart() {
+  HandSwipe swipe;
+  swipeAcquire(swipe);
+  for (int i = 1; i <= 16; ++i) {
+    CHECK(swipe.update(true, true, {-.01001F * i,0,0}, {1,0,0}, .125F) == 0);
+  }
+}
+
+void swipeSmoothStart() {
+  HandSwipe swipe;
+  swipeAcquire(swipe);
+  for (int i = 1; i <= 16; ++i) {
+    CHECK(swipe.update(true, true, {-.01001F * i,0,0}, {1,0,0}, .05F) == (i == 16 ? 1 : 0));
+  }
+}
+
+void swipeJitter() {
+  for (int rate : {30, 60, 90, 120}) {
+    HandSwipe swipe;
+    float const dt = 1.0F / rate;
+    for (int i = 0; i < rate; ++i) {
+      float const noise = i % 2 ? .006F : -.006F;
+      CHECK(swipe.update(true, true, {noise, -noise, noise}, {1,0,0}, dt) == 0);
+    }
+    CHECK(swipe.armed());
+    int events = 0;
+    for (int i = 1; i <= rate / 2; ++i) {
+      events += swipe.update(true, true, {-.20F * i / (rate / 2),0,0}, {1,0,0}, dt);
+    }
+    CHECK(events == 1);
+  }
+}
+
 void swipeTimingBoundary() {
   for (int hz : {10, 30, 60, 90, 120}) {
     for (bool over : {false, true}) {
@@ -334,10 +367,12 @@ void swipeTimingBoundary() {
       for (int i = 0; i < hz; ++i) {
         CHECK(swipe.update(true, true, {}, {1,0,0}, dt) == 0);
       }
+      // First sample leaves the 2.5 cm pause envelope; subsequent samples
+      // complete the stroke within (or just beyond) its time allowance.
       int const frames = hz * 4 / 5 + (over ? 1 : 0);
       int fired = 0;
       for (int i = 1; i <= frames; ++i) {
-        fired += swipe.update(true, true, {-.16001F * static_cast<float>(i) / frames,0,0}, {1,0,0}, dt);
+        fired += swipe.update(true, true, {-.03F - .13001F * static_cast<float>(i - 1) / (frames - 1),0,0}, {1,0,0}, dt);
       }
       CHECK(fired == (over ? 0 : 1));
     }
@@ -345,6 +380,9 @@ void swipeTimingBoundary() {
 }
 
 int main() {
+  swipeSlowStart();
+  swipeSmoothStart();
+  swipeJitter();
   swipeTimingBoundary();
   gestures();
   swipes();
