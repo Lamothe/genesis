@@ -213,38 +213,132 @@ void selectionGraceAndTracking() {
   CHECK(!handPinchSignal(false, true, .8F));
 }
 
-void carouselDirections() {
-  // Ring-relative zones must stay correct as the viewer turns and moves.
+void carouselActions() {
+  Vec3 const origin{0.0F, 0.0F, 0.0F};
+  Vec3 const forward{0.0F, 0.0F, -1.0F};
+  Vec3 const right{1.0F, 0.0F, 0.0F};
+  Vec3 const centre{0.0F, 0.0F, -1.25F};
+  auto const nan = std::numeric_limits<float>::quiet_NaN();
+
+  // ANY side browses: the old +-0.22 central dead zone is gone. The crossing
+  // point at ring depth decides, so the pointer origin never skews the zones.
+  for (float const side : {-.5F, -.219F, -.001F, .001F, .219F, .5F}) {
+    for (Vec3 const pointer : {origin, right * .7F + Vec3{0, -.3F, 0}}) {
+      Ray const ray{pointer, normalized(centre + right * side - pointer)};
+      CHECK(carouselPointerAction(false, ray, origin, forward) == (side < 0.0F ? -1 : 1));
+    }
+    // The exact hit on the settled centre preview places and has PRIORITY
+    // over the side rules, wherever on the surface it lands.
+    Ray const hitRay{origin, normalized(centre + right * side - origin)};
+    CHECK(carouselPointerAction(true, hitRay, origin, forward) == 2);
+  }
+
+  // Ring-relative zones stay correct as the viewer turns and moves.
   for (float const yaw : {0.0F, 1.1F, -2.3F}) {
     auto const orientation = quatFromAxisAngle({0, 1, 0}, yaw);
-    auto const forward = rotate(orientation, {0, 0, -1});
-    auto const right = rotate(orientation, {1, 0, 0});
-    Vec3 const origin{2, 1, -3};
-    auto const centre = origin + forward * 1.25F;
-    for (Vec3 const rayOrigin : {origin, origin + right * .7F + Vec3{0, -.3F, 0}}) {
-      for (float const side : {-.5F, -.219F, 0.0F, .219F, .5F}) {
-        auto const target = centre + right * side;
-        Ray const ray{rayOrigin, normalized(target - rayOrigin)};
-        CHECK(carouselPinchDirection(ray, origin, forward) ==
-              (side < -.22F ? -1 : side > .22F ? 1 : 0));
+    auto const fwd = rotate(orientation, {0, 0, -1});
+    auto const rgt = rotate(orientation, {1, 0, 0});
+    Vec3 const eye{2, 1, -3};
+    Vec3 const ring = eye + fwd * 1.25F;
+    for (Vec3 const pointer : {eye, eye + rgt * .7F + Vec3{0, -.3F, 0}}) {
+      for (float const side : {-.5F, -.001F, .001F, .5F}) {
+        Ray const ray{pointer, normalized(ring + rgt * side - pointer)};
+        CHECK(carouselPointerAction(false, ray, eye, fwd) == (side < 0.0F ? -1 : 1));
+        CHECK(carouselPointerAction(true, ray, eye, fwd) == 2);
       }
     }
-    // No forward intersection: away-facing, parallel, or beyond the ring.
-    CHECK(carouselPinchDirection({origin, -forward}, origin, forward) == 0);
-    CHECK(carouselPinchDirection({origin, right}, origin, forward) == 0);
-    CHECK(carouselPinchDirection({centre + forward + right, forward},
-                                origin, forward) == 0);
-    CHECK(carouselPinchDirection({origin, {}}, origin, forward) == 0);
-    CHECK(carouselPinchDirection({origin, forward}, origin, {}) == 0);
   }
-  // Strict zone boundaries: centre misses, including the edges, are inert.
-  for (float const side : {-.22F, .22F}) {
-    CHECK(carouselPinchDirection({{side, 0, 0}, {0, 0, -1}}, {}, {0, 0, -1}) == 0);
-  }
-  auto const nan = std::numeric_limits<float>::quiet_NaN();
-  CHECK(carouselPinchDirection({{}, {nan, 0, -1}}, {}, {0, 0, -1}) == 0);
-  CHECK(carouselPinchDirection({{nan, 0, 0}, {0, 0, -1}}, {}, {0, 0, -1}) == 0);
-  CHECK(carouselPinchDirection({{}, {0, 0, -1}}, {}, {nan, 0, -1}) == 0);
+
+  // Exact-centre crossings (exact binary arithmetic) break the tie by where
+  // the ray POINTS: crossing dead centre while aiming right browses next,
+  // aiming left browses previous...
+  Ray const centreAimingRight{{-0.5F, 0.0F, -0.25F}, {0.5F, 0.0F, -1.0F}};
+  Ray const centreAimingLeft{{0.5F, 0.0F, -0.25F}, {-0.5F, 0.0F, -1.0F}};
+  CHECK(carouselPointerAction(false, centreAimingRight, origin, forward) == 1);
+  CHECK(carouselPointerAction(false, centreAimingLeft, origin, forward) == -1);
+  // ...and exactly centred aim from a centred pointer is the single point
+  // where left and right meet: inert (or place, on the exact hit).
+  Ray const deadCentre{{0.0F, 0.0F, -0.25F}, {0.0F, 0.0F, -1.0F}};
+  CHECK(carouselPointerAction(false, deadCentre, origin, forward) == 0);
+  CHECK(carouselPointerAction(true, deadCentre, origin, forward) == 2);
+
+  // A parallel ray never crosses the ring plane, so it browses by where it
+  // points; a vertical one (pointing nowhere sideways) falls back to where
+  // the pointer SITS relative to the ring centre.
+  Ray const parallelRight{origin + forward * .25F, right};
+  Ray const parallelLeft{origin + forward * .25F, -right};
+  CHECK(carouselPointerAction(false, parallelRight, origin, forward) == 1);
+  CHECK(carouselPointerAction(false, parallelLeft, origin, forward) == -1);
+  Ray const verticalFromRight{right * .4F + forward * .25F, {0.0F, 1.0F, 0.0F}};
+  Ray const verticalFromLeft{-right * .4F + forward * .25F, {0.0F, 1.0F, 0.0F}};
+  CHECK(carouselPointerAction(false, verticalFromRight, origin, forward) == 1);
+  CHECK(carouselPointerAction(false, verticalFromLeft, origin, forward) == -1);
+  CHECK(carouselPointerAction(false, Ray{forward * .25F, {0.0F, 1.0F, 0.0F}},
+                              origin, forward) == 0);
+
+  // Backward rays and pointers that have walked past the ring plane are
+  // handled by the same fallback, and a grazing surface clip from ANY of
+  // them is never an inadvertent placement.
+  Ray const backward{origin + forward * .25F, -forward};
+  Ray const backwardFromRight{right * .4F + forward * .25F, -forward};
+  CHECK(carouselPointerAction(false, backward, origin, forward) == 0);
+  CHECK(carouselPointerAction(false, backwardFromRight, origin, forward) == 1);
+  CHECK(carouselPointerAction(true, backwardFromRight, origin, forward) == 0);
+  Ray const beyondRing{centre + forward * .75F, forward};
+  Ray const beyondRingRight{right * .4F + centre + forward * .75F, forward};
+  CHECK(carouselPointerAction(false, beyondRing, origin, forward) == 0);
+  CHECK(carouselPointerAction(true, beyondRing, origin, forward) == 0);
+  CHECK(carouselPointerAction(false, beyondRingRight, origin, forward) == 1);
+  CHECK(carouselPointerAction(true, beyondRingRight, origin, forward) == 0);
+  CHECK(carouselPointerAction(true, parallelRight, origin, forward) == 0);
+  CHECK(carouselPointerAction(true, backward, origin, forward) == 0);
+  // A zero-length direction is no aim at all.
+  CHECK(carouselPointerAction(false, {origin + forward * .25F, {}}, origin, forward) == 0);
+  CHECK(carouselPointerAction(true, {origin + forward * .25F, {}}, origin, forward) == 0);
+  // A zero-length direction is inert even when the pointer is OFF-CENTRE:
+  // the centred case above passes through the pointer-side tie-break.
+  CHECK(carouselPointerAction(false, {right * .4F + forward * .25F, {}}, origin, forward) == 0);
+  CHECK(carouselPointerAction(true, {right * .4F + forward * .25F, {}}, origin, forward) == 0);
+
+  // The zone frame is LEVEL: a pitched ring forward is flattened to its
+  // horizontal heading (the caller latches `ringForward` level already, but
+  // the rule belongs to this function).
+  Vec3 const pitched{0.0F, 0.7F, -0.7F};
+  CHECK(carouselPointerAction(false, parallelRight, origin, pitched) == 1);
+  CHECK(carouselPointerAction(false, parallelLeft, origin, pitched) == -1);
+  CHECK(carouselPointerAction(true, {origin, pitched}, origin, pitched) == 2);
+
+  // Near-parallel aims resolve the same way on both sides of the crossing
+  // threshold: just below it the fallback says next, just above it the
+  // crossing point (far away laterally) agrees.
+  Ray const justBelow{{0.0F, 0.0F, -0.25F}, {1.0F, 0.0F, -5e-5F}};
+  Ray const justAbove{{0.0F, 0.0F, -0.25F}, {1.0F, 0.0F, -1.5e-4F}};
+  CHECK(carouselPointerAction(false, justBelow, origin, forward) == 1);
+  CHECK(carouselPointerAction(false, justAbove, origin, forward) == 1);
+
+  // Non-unit directions are rays too (the caller never normalises them).
+  Ray const fastForward{origin + forward * .25F, forward * 2.0F};
+  CHECK(carouselPointerAction(true, fastForward, origin, forward) == 2);
+  Ray const fastRight{origin + forward * .25F, (right + forward) * 2.0F};
+  CHECK(carouselPointerAction(false, fastRight, origin, forward) == 1);
+
+  // Vertical offsets never change the horizontal zones.
+  Ray const highRay{{0.0F, 1.3F, -0.25F}, {0.0F, 0.0F, -1.0F}};
+  Ray const highSide{{0.0F, 1.3F, -0.25F}, normalized(right * .5F + forward)};
+  CHECK(carouselPointerAction(true, highRay, origin, forward) == 2);
+  CHECK(carouselPointerAction(false, highSide, origin, forward) == 1);
+
+  // Non-finite and degenerate frames are inert — never a placement.
+  CHECK(carouselPointerAction(false, {{}, {nan, 0, -1}}, origin, forward) == 0);
+  CHECK(carouselPointerAction(false, {{nan, 0, 0}, {0, 0, -1}}, origin, forward) == 0);
+  CHECK(carouselPointerAction(false, {{}, {0, 0, -1}}, {nan, 0, 0}, forward) == 0);
+  CHECK(carouselPointerAction(false, {{}, {0, 0, -1}}, origin, {nan, 0, -1}) == 0);
+  CHECK(carouselPointerAction(true, {{}, {nan, 0, -1}}, origin, forward) == 0);
+  CHECK(carouselPointerAction(false, {{}, {0, 0, -1}}, origin, {}) == 0);
+  CHECK(carouselPointerAction(true, {{}, {0, 0, -1}}, origin, {}) == 0);
+  // A vertical "forward" leaves the ring frame undefined.
+  CHECK(carouselPointerAction(false, {{}, {0, 0, -1}}, origin, {0, 1, 0}) == 0);
+  CHECK(carouselPointerAction(true, {{}, {0, 0, -1}}, origin, {0, 1, 0}) == 0);
 }
 
 void panels() {
@@ -456,7 +550,7 @@ int main() {
   gestures();
   selectionGraceAndTracking();
 
-  carouselDirections();
+  carouselActions();
   panels();
   palms();
   projection();

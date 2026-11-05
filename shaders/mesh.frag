@@ -68,12 +68,22 @@ void main() {
   if (mode < 1.5) {
     base.a = 1.0;
   }
-  // State highlight: 5 = selected (a THIN warm rim on grazing-angle pixels
-  // — the model's own shading is untouched; the user rejected fill tints as
-  // too heavy), 3..4 = delete charge (red ramp: 3.0 means charge 0, 4.0
-  // means "about to delete").
+  // State highlight: 6 = the carousel's placeable centre preview (a subtle
+  // COOL rim on grazing-angle pixels plus a faint wash so flat faces read
+  // too — no banner, no heavy fill tint), 5 = selected (a THIN warm rim on grazing-angle
+  // pixels — the model's own shading is untouched; the user rejected fill
+  // tints as too heavy), 3..4 = delete charge (red ramp: 3.0 means charge
+  // 0, 4.0 means "about to delete").
   float highlight = push.normalParams.w;
-  if (highlight > 4.5) {
+  if (highlight > 5.5) {
+    vec3 toCamera = normalize(frame.cameraPos.xyz - vWorldPos);
+    float rim = pow(1.0 - abs(dot(n, toCamera)), 2.5);
+    // A rim alone vanishes on flat, camera-facing geometry (a billboard-like
+    // preview would never light), so pair it with a faint uniform cool
+    // wash: subtle on every surface, readable anywhere.
+    base.rgb = mix(base.rgb, vec3(0.55, 0.85, 1.0), 0.10) +
+               vec3(0.55, 0.85, 1.0) * rim * 0.55;
+  } else if (highlight > 4.5) {
     vec3 toCamera = normalize(frame.cameraPos.xyz - vWorldPos);
     float rim = pow(1.0 - abs(dot(n, toCamera)), 3.0);
     base.rgb += vec3(0.95, 0.62, 0.25) * rim * 0.55;

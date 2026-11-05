@@ -66,9 +66,10 @@ arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
 **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (the
 ring of models rotates in/out of view around the camera; **[** **]** cycle
 the library; clicking the exact surface of the centred preview places the
-staged model below the centred preview as one undo step. Otherwise,
-clicking the left/right ray zones browses one model per click; a central miss
-does nothing. **N**
+staged model below the centred preview as one undo step and takes priority
+over browsing. Otherwise, clicking anywhere left or right of centre browses
+one model per click (previous on the left, next on the right — there is no
+central dead zone). **N**
 closes without placing), **Delete** removes the selection (model or part),
 **Esc** quits. The selection is marked by a thin warm rim in the shader (a
 part selection marks the part) and the current mode's name shows as
@@ -81,9 +82,16 @@ buttons and sticks are unchanged:
 - **Left pinch while the left palm faces up** toggles the stationary hand menu;
   palm-up alone does nothing. Choose **Models** to open the carousel.
 - In the carousel, **right pinch** the exact surface of the settled centre
-  preview to place it. Otherwise, the left/right ray zones browse one model
-  per pinch; a central miss does nothing. Placing a model closes the menu.
-  The centre marker identifies the model that can be placed. Desktop and controller use the same hit rules.
+  preview to place it (an exact hit has priority over browsing). Otherwise,
+  pinching anywhere left or right of centre browses one model (previous on
+  the left, next on the right — there is no central dead zone). A grazing
+  clip from a backward or plane-parallel ray never places, and a pinch with
+  an untracked aim (the head-gaze fallback) neither browses nor places.
+  Placing a model closes the menu. While the aim rests exactly on the
+  placeable preview's surface it wears a subtle rim highlight; the
+  highlight never appears while the ring is moving or the aim is untracked.
+  The centre marker identifies the model that can be placed. Desktop and
+  controller use the same hit rules.
 - Outside the menu, **right pinch and release** selects the whole model under
   the aim beam. Pinch and hold the selected model again to move it with the
   palm and rotate it with the wrist around the picked surface. Lateral motion is
@@ -112,9 +120,11 @@ buttons and sticks are unchanged:
   and tracking, left-pinch menu actions and tool activations.
 
 **Verification status:** build, automated hand/core tests and offscreen hand
-editing/panel smoke checks are available; these do **not** verify the runtime
-bindings or gesture usability in the headset. Michael's headset confirmation
-is still required for every feature above.
+editing/panel smoke checks are available; the carousel's placeable-highlight
+is additionally covered by an offscreen with/without pixel-difference render
+check. These do **not** verify the runtime bindings or gesture usability in
+the headset. Michael's headset confirmation is still required for every
+feature above.
 
 Movement and editing are the **sticks** (controller aim is too jittery for
 accurate placement): the **left stick** slides the selection across the floor
@@ -141,8 +151,10 @@ the ring in and out of view INSTANTLY (decoding runs on a worker thread, so
 a huge model never blocks the switch; each preview is labelled with its filename stem), and the
 trigger places the centred model only when its exact preview surface is hit,
 at natural size on the floor below the centred preview — one undo step
-(undo removes it entirely), and the carousel closes. Otherwise, left/right
-ray zones browse one model per trigger press; a central miss is inert. **A**, a **menu tap** or undo (B) closes without placing. The library folder
+(undo removes it entirely), and the carousel closes. Otherwise, a trigger
+with a tracked right aim anywhere left or right of centre browses one model
+(previous on the left, next on the right — there is no central dead zone).
+**A**, a **menu tap** or undo (B) closes without placing. The library folder
 (`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
 opens — drop a file in and place it without restarting. **Hold X** to
 delete: the selection ramps red and the delete fires at full charge (0.6 s);

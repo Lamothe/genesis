@@ -937,15 +937,22 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   input.grasp = grasp.isActive ? grasp.currentState : 0.0F;
   // Per-hand aim rays for the drawn pointers; the right-hand aim doubles as
   // the manipulation pointer (head gaze fallback when it is untracked).
-  uint32_t tracked = XR_SPACE_LOCATION_POSITION_VALID_BIT |
-                     XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+  // VALID means the pose is usable; TRACKED means it is actively observed.
+  // OpenXR keeps VALID set while clearing TRACKED for an inferred or
+  // last-known pose, so the carousel's press and highlight require both.
+  uint32_t const aimValidFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                 XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+  uint32_t const aimTrackedFlags = aimValidFlags |
+                                   XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                                   XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
   for (int hand = 0; hand < 2; ++hand) {
     XrSpaceLocation location = xrStruct<XrSpaceLocation>(XR_TYPE_SPACE_LOCATION);
     XrResult locate = xrLocateSpace(xr_->aimSpaces[hand], xr_->space,
                                     static_cast<XrTime>(displayTime), &location);
-    if (XR_SUCCEEDED(locate) && (location.locationFlags & tracked) == tracked) {
+    if (XR_SUCCEEDED(locate) && (location.locationFlags & aimValidFlags) == aimValidFlags) {
       input.aimRays[hand] = rayFromXrPose(location.pose);
       input.aimValid[hand] = true;
+      input.aimTracked[hand] = (location.locationFlags & aimTrackedFlags) == aimTrackedFlags;
     }
   }
   // Head gaze fallback uses the same raw eye pose as the rendered view.

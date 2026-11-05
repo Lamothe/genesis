@@ -230,6 +230,10 @@ struct App {
   Vec3 ringForward{0.0F, 0.0F, -1.0F};
   vredit::EditorSnapshot galleryBefore{}; // undo "before" for the placement
   double galleryCycleCooldown{0.0}; // stick-held cycling: one step per 0.25 s
+  // The placeable centre preview's rim highlight: true exactly while a press
+  // on the current aim would place (see galleryAimHighlight). Held per frame
+  // so assembleFrame can light the preview's grazing edges.
+  bool galleryAimPlaceable{false};
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
   // first deflection past the dead zone, committed when the sticks settle.
   bool handGrab{false};
@@ -1004,6 +1008,7 @@ void galleryClose(App& app) {
   }
   galleryEvict(app);
   app.galleryActive = false;
+  app.galleryAimPlaceable = false;
   std::printf("[gallery] closed\n");
 }
 
@@ -1277,14 +1282,28 @@ bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
   return true;
 }
 
-// A model surface is the only placement target. Empty left/right space
-// browses relative to the stationary ring, never the changing head heading.
+// The single press decision for hands, controllers and the desktop mouse.
+// An exact surface hit on the SETTLED centre preview places and has
+// priority; anywhere else the aim's side of the stationary ring's centre
+// browses one model per press — any side, no central dead zone. Grazing
+// clips from parallel/backward rays never place (see carouselPointerAction).
 int galleryPointerAction(App& app, Ray const& ray) {
+  bool centreSurfaceHit = false;
   for (auto const& slot : app.carousel) {
     if (app.ring.atRest() && slot.index == app.ring.index && slot.hasModel &&
-        pickNode(app, ray, slot.wrapper).has_value()) { return 2; }
+        pickNode(app, ray, slot.wrapper).has_value()) {
+      centreSurfaceHit = true;
+      break;
+    }
   }
-  return carouselPinchDirection(ray, app.ringOrigin, app.ringForward);
+  return carouselPointerAction(centreSurfaceHit, ray, app.ringOrigin, app.ringForward);
+}
+
+// The placeable preview's rim highlight is exactly "would a press place
+// right now?" with the tracked-aim gate on top: an untracked aim (the head
+// gaze fallback) must never light the preview.
+bool galleryAimHighlight(App& app, Ray const& ray, bool aimValid) {
+  return app.galleryActive && aimValid && galleryPointerAction(app, ray) == 2;
 }
 
 void galleryPointerPress(App& app, VkRenderer& renderer, Ray const& ray) {
@@ -1329,8 +1348,23 @@ void assembleFrame(App& app,
   auto isSelected = [&app](NodeId id) {
     return std::find(app.selection.begin(), app.selection.end(), id) != app.selection.end();
   };
+  // The centre preview subtree is the one whose exact surface places: it is
+  // the only preview that ever lights up (highlight 6).
+  auto centrePreview = [&app](NodeId id) {
+    for (auto const& slot : app.carousel) {
+      if (slot.index != app.ring.index || !slot.hasModel || slot.wrapper == kInvalidNode) {
+        continue;
+      }
+      for (auto node = id; node != kInvalidNode; node = app.scene.parent(node)) {
+        if (node == slot.wrapper) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
   // Build the draw items: opaque and mask items first, blended last.
-  auto appendItem = [&app, &items, &isSelected](NodeVisual const& visual) {
+  auto appendItem = [&app, &items, &isSelected, &centrePreview](NodeVisual const& visual) {
     DrawItem item;
     item.mesh = visual.mesh;
     item.texture = visual.texture;
@@ -1348,6 +1382,11 @@ void assembleFrame(App& app,
     // delete charges, the selection ramps red (3 + charge).
     if (isSelected(visual.id)) {
       item.highlight = app.deleteCharge > 0.0F ? 3.0F + app.deleteCharge : 5.0F;
+    } else if (app.galleryAimPlaceable && centrePreview(visual.id)) {
+      // The placeable centre preview wears a subtle cool rim (6) exactly
+      // while a press would place it — a readable surface affordance, never
+      // a banner, never while the ring moves or the aim is untracked.
+      item.highlight = 6.0F;
     } else {
       item.highlight = 0.0F;
     }
@@ -2091,6 +2130,7 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   // Let the animation settle before testing a centred surface target.
   for (int i = 0; i < 120; ++i) { galleryTick(app, renderer, 1.0F / 60, hudPos, {0,0,-1}); }
   bool previewHit = false;
+  Ray aimRay{hudPos, {0.0F, 0.0F, -1.0F}};
   for (auto const& slot : app.carousel) {
     if (slot.index != app.ring.index || !slot.hasModel) { continue; }
     for (auto const& visual : app.visuals) {
@@ -2109,12 +2149,99 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
           std::printf("SMOKE FAIL: moving preview cannot place\n"); return 1;
         }
         app.ring.angle = settledAngle;
+        aimRay = ray;
         previewHit = true; break;
       }
     }
   }
   if (!previewHit || galleryPointerAction(app, {hudPos, {0,1,0}}) != 0) {
     std::printf("SMOKE FAIL: preview surface-only placement target\n"); return 1;
+  }
+  // The placeable preview's rim is exactly "would a press place?": lit on
+  // the settled exact hit, never while the ring eases between slots, never
+  // with an untracked aim, never on a miss.
+  if (!galleryAimHighlight(app, aimRay, true)) {
+    std::printf("SMOKE FAIL: placeable preview not highlighted on the exact hit\n");
+    return 1;
+  }
+  if (galleryAimHighlight(app, aimRay, false)) {
+    std::printf("SMOKE FAIL: highlight survived an invalid aim\n");
+    return 1;
+  }
+  {
+    float const settledAngle = app.ring.angle;
+    app.ring.angle += .2F;
+    if (galleryAimHighlight(app, aimRay, true)) {
+      std::printf("SMOKE FAIL: highlight while the ring is moving\n");
+      return 1;
+    }
+    app.ring.angle = settledAngle;
+  }
+  if (galleryAimHighlight(app, Ray{hudPos, {0.0F, 1.0F, 0.0F}}, true)) {
+    std::printf("SMOKE FAIL: highlight on a miss\n");
+    return 1;
+  }
+  // The affordance must be VISIBLE, not merely flagged: render the aimed
+  // frame with and without it and require a real pixel difference (subtle
+  // and readable, never a banner).
+  {
+    app.camera.position = hudPos;
+    app.camera.yaw = 0.0F;
+    app.camera.pitch = -0.25F;
+    app.galleryAimPlaceable = false;
+    items.clear();
+    depthLines.clear();
+    overlayLines.clear();
+    assembleFrame(app, items, depthLines, overlayLines);
+    if (!renderer.draw(app.camera, items, depthLines, overlayLines) ||
+        !renderer.readback(pixels)) {
+      std::printf("SMOKE FAIL: carousel highlight base render\n");
+      return 1;
+    }
+    std::vector<std::uint8_t> const plain = pixels;
+    app.galleryAimPlaceable = true;
+    items.clear();
+    depthLines.clear();
+    overlayLines.clear();
+    assembleFrame(app, items, depthLines, overlayLines);
+    int flagged = 0;
+    for (DrawItem const& item : items) {
+      if (item.highlight == 6.0F) {
+        ++flagged;
+      }
+    }
+    if (!renderer.draw(app.camera, items, depthLines, overlayLines) ||
+        !renderer.readback(pixels)) {
+      std::printf("SMOKE FAIL: carousel highlight render\n");
+      return 1;
+    }
+    // Count changed PIXELS and require the change to be COOL (blue-dominant):
+    // a shader regression that routed 6 into the warm selection rim or the red
+    // delete ramp would still change pixels, so direction is the assertion.
+    int changed = 0;
+    int cooled = 0;
+    for (std::size_t i = 0; i + 2 < plain.size(); i += 3) {
+      int const dr = static_cast<int>(pixels[i]) - static_cast<int>(plain[i]);
+      int const dg = static_cast<int>(pixels[i + 1]) - static_cast<int>(plain[i + 1]);
+      int const db = static_cast<int>(pixels[i + 2]) - static_cast<int>(plain[i + 2]);
+      if (std::abs(dr) > 2 || std::abs(dg) > 2 || std::abs(db) > 2) {
+        ++changed;
+      }
+      if (db > 2 && db > dr && db > dg) {
+        ++cooled;
+      }
+    }
+    app.galleryAimPlaceable = false;
+    if (flagged == 0 || changed < 500 || cooled < 100) {
+      std::printf("SMOKE FAIL: carousel highlight not visible/cool "
+                  "(%d flagged items, %d changed pixels, %d cooled)\n",
+                  flagged, changed, cooled);
+      return 1;
+    }
+    writePpm(".build/carousel-highlight.ppm", pixels, config.width, config.height);
+    std::printf("SMOKE carousel highlight: %d flagged items, %d changed pixels, "
+                "%d cool -> .build/carousel-highlight.ppm\n",
+                flagged, changed, cooled);
   }
   int const centredBefore = app.ring.index;
   galleryCycle(app, renderer, 1);
@@ -2130,13 +2257,38 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     std::printf("SMOKE FAIL: carousel ring did not wrap back\n");
     return 1;
   }
-  if (galleryPointerAction(app, {hudPos, normalized(Vec3{-1,0,-1})}) != -1 ||
-      galleryPointerAction(app, {hudPos, normalized(Vec3{1,0,-1})}) != 1) {
+  Ray const browseLeftRay{hudPos, normalized(Vec3{-1.0F, 0.0F, -1.0F})};
+  Ray const browseRightRay{hudPos, normalized(Vec3{1.0F, 0.0F, -1.0F})};
+  if (galleryPointerAction(app, browseLeftRay) != -1 ||
+      galleryPointerAction(app, browseRightRay) != 1) {
     std::printf("SMOKE FAIL: carousel side pinch zones\n"); return 1;
   }
-  Ray const placeAim{hudPos, normalized(Vec3{0.0F, -1.0F, -0.2F})};
-  if (!galleryPick(app, renderer, placeAim) || app.galleryActive) {
-    std::printf("SMOKE FAIL: carousel placement\n");
+  // The press path itself — what the right pinch/trigger call — must browse
+  // one model on either side and leave the carousel open, then place on the
+  // settled exact centre hit (the hit has priority over browsing).
+  auto settle = [&]() {
+    for (int i = 0; i < 180; ++i) { galleryTick(app, renderer, 1.0F / 60.0F, hudPos, hudFwd); }
+  };
+  int const libraryCount = static_cast<int>(app.galleryFiles.size());
+  int const browseStart = app.ring.index;
+  galleryPointerPress(app, renderer, browseLeftRay);
+  settle();
+  if (!app.galleryActive || libraryCount <= 0 ||
+      app.ring.index != (browseStart + libraryCount - 1) % libraryCount) {
+    std::printf("SMOKE FAIL: left press did not browse one model\n"); return 1;
+  }
+  galleryPointerPress(app, renderer, browseRightRay);
+  settle();
+  if (!app.galleryActive || app.ring.index != browseStart) {
+    std::printf("SMOKE FAIL: right press did not browse back\n"); return 1;
+  }
+  if (!galleryAimHighlight(app, aimRay, true)) {
+    std::printf("SMOKE FAIL: placeable highlight did not return after browsing\n");
+    return 1;
+  }
+  galleryPointerPress(app, renderer, aimRay);
+  if (app.galleryActive || app.selection.empty()) {
+    std::printf("SMOKE FAIL: exact centre press did not place\n");
     return 1;
   }
   Aabb placedBounds;
@@ -3028,6 +3180,7 @@ int runXr(char const* shaderDir,
   bool running = true;
   int framesRendered = 0;
   bool handMenuOpen = false;
+  bool carouselAimWarned = false;
   HandGesture leftPinch;
   HandGesture rightPinch;
   HandGesture rightGrasp;
@@ -3328,6 +3481,21 @@ int runXr(char const* shaderDir,
     // hit on another object always wins over the grace; never use gaze fallback.
     PointerTarget handTarget;
     bool const handCanTarget = handSignal && input.aimValid[1];
+    // The carousel press and highlight share one strict aim gate: VALID
+    // is not enough, because an inferred/last-known aim must not act spatially.
+    bool const carouselAimTracked = input.aimValid[1] && input.aimTracked[1];
+    // A usable-but-untracked right aim silently disables the carousel press
+    // and highlight. Say so once per episode so a headset user and the log
+    // can tell "no aim" from "tracking lost".
+    if (app.galleryActive && input.aimValid[1] && !input.aimTracked[1]) {
+      if (!carouselAimWarned) {
+        std::printf("[hands] right aim is valid but untracked; carousel press/highlight "
+                    "disabled until tracking returns\n");
+        carouselAimWarned = true;
+      }
+    } else {
+      carouselAimWarned = false;
+    }
     bool const sceneHandTargeting = handCanTarget && !app.handUiOwned &&
         !panelWanted && !app.galleryActive && !app.stickSession;
     if (app.handUiOwned || panelWanted || app.galleryActive || app.stickSession) {
@@ -3372,10 +3540,11 @@ int runXr(char const* shaderDir,
       app.physicalGrab = app.handGrab;
       if (app.physicalGrab) { input.selectPressed = false; rightPinch.reset(); }
     }
-    if (input.selectPressed && !handCarouselToggled) {
+    if (input.selectPressed && !carouselToggled) {
       if (app.galleryActive) {
-        // A hand without a valid aim must never act on the gaze fallback.
-        if (!handRight || handCanTarget) { galleryPointerPress(app, renderer, worldRay); }
+        // The carousel is a spatial target: neither a hand nor a controller
+        // acts through the head-gaze fallback. This is the highlight gate too.
+        if (carouselAimTracked) { galleryPointerPress(app, renderer, worldRay); }
         graspGate.reset();
         rightGrasp.reset();
         if (!app.galleryActive) { handMenuOpen = false; }
@@ -3577,6 +3746,10 @@ int runXr(char const* shaderDir,
       // The carousel owns the pointer: the trigger places the staged model
       // at the aim point (handled at the trigger press).
     }
+
+    // The placeable preview's rim is exactly "would this press place?" with
+    // the tracked-aim gate on top: the head-gaze fallback never lights it.
+    app.galleryAimPlaceable = galleryAimHighlight(app, worldRay, carouselAimTracked);
 
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
@@ -3854,6 +4027,9 @@ int runInteractive(char const* shaderDir,
       std::this_thread::sleep_for(std::chrono::milliseconds(8)); // minimised: no busy spin
       continue;
     }
+    // Best-effort desktop mirror of the XR highlight: the mouse ray is the
+    // aim and is always valid here.
+    app.galleryAimPlaceable = galleryAimHighlight(app, appRay(app, app.lastMouse), true);
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;

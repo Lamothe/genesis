@@ -28,7 +28,10 @@ struct XrFrameInput {
   Quat headOrient{};     // raw left-eye orientation (tracking space)
   Ray pointerRay;        // right-controller aim ray (head gaze fallback)
   Ray aimRays[2];        // per-hand aim rays in XR local space (left, right)
-  bool aimValid[2] = {false, false}; // aimRays[i] is tracked this frame
+  bool aimValid[2] = {false, false}; // aimRays[i] has a usable (VALID) pose
+  // aimRays[i] is ACTIVELY tracked (VALID and TRACKED): a pose that is only
+  // VALID may be inferred/last-known and must not drive spatial actions.
+  bool aimTracked[2] = {false, false};
   Vec3 headPosition{0.0F, 0.0F, 0.0F}; // midpoint of the eyes (tracking space)
   Vec2 leftStick{0.0F, 0.0F};  // left stick: stick-driven MOVE of the selection
   Vec2 rightStick{0.0F, 0.0F}; // right stick: mode-driven edit of the selection

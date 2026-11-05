@@ -27,7 +27,8 @@ struct DrawItem {
   float alphaCutoff{0.5F};
   AlphaMode alpha{AlphaMode::Opaque};
   bool lit{true};
-  float highlight{0.0F}; // 5 = selected (thin warm shader rim),
+  float highlight{0.0F}; // 6 = carousel placeable preview (subtle cool
+                         // rim + faint wash), 5 = selected (thin warm rim),
                          // 3 + charge = delete ramp (red; charge 0..1)
                          // 0 = plain
 };

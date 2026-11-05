@@ -2,6 +2,7 @@
 
 #include "vecmath.h"
 #include "picking.h"
+#include "carousel.h"
 
 #include <initializer_list>
 #include <map>
@@ -16,17 +17,69 @@ struct HandPose {
   bool valid{false};
 };
 
-// The centre is deliberately inert unless an exact preview surface was hit.
-// Intersect the ring-facing plane so hand-ray origin does not skew side zones.
-inline int carouselPinchDirection(Ray const& ray, Vec3 origin, Vec3 forward) {
-  forward.y = 0;
-  forward = normalized(forward);
-  auto const denominator = dot(ray.direction, forward);
-  if (!(denominator > .0001F)) { return 0; }
-  float const distance = dot(origin + forward * 1.25F - ray.origin, forward) / denominator;
-  if (!(distance > 0)) { return 0; }
-  float const side = dot(ray.origin + ray.direction * distance - origin, cross(forward, Vec3{0,1,0}));
-  return side < -.22F ? -1 : side > .22F ? 1 : 0;
+// The carousel's press decision — and the highlight question ("would a press
+// place right now?"), so the hand, controller and desktop paths share one
+// answer: 2 = place, 1 = next, -1 = previous, 0 = inert.
+//
+// `centreSurfaceHit` is an EXACT surface hit on the SETTLED centre preview
+// (the caller checks that the ring is at rest and the preview is staged).
+// That hit PLACES and has priority over browsing, but only for a well-aimed
+// ray: it must cross the ring plane (kRadius out from the latched ring frame,
+// facing the viewer) strictly in FRONT of the pointer. A parallel, backward
+// or ring-behind ray that merely clips the preview's surface is a grazing
+// contact, not a point at it — it never places (no inadvertent placement)
+// and is inert on a surface hit.
+//
+// Everything else browses by which side of the ring centre the aim crosses:
+// ANY side, with no central dead zone. The crossing point decides (so the
+// pointer's origin does not skew the zones); an exactly-centred crossing is
+// broken by where the ray POINTS, then by where the pointer SITS. Rays that
+// never cross the ring plane in front fall back to the same tie-breaks, so
+// pinching left/right still resolves at extreme origins and angles. Exactly
+// centred aim from a centred pointer is the single point where left and
+// right meet: inert.
+inline int carouselPointerAction(bool centreSurfaceHit, Ray const& ray, Vec3 origin, Vec3 forward) {
+  auto const finite = [](Vec3 const& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+  };
+  if (!finite(ray.origin) || !finite(ray.direction) || !finite(origin) || !finite(forward)) {
+    return 0;
+  }
+  if (!(dot(ray.direction, ray.direction) > 1e-12F)) {
+    return 0; // a zero-length direction is no aim at all
+  }
+  forward.y = 0.0F;
+  float const forwardLength2 = dot(forward, forward);
+  if (!(forwardLength2 > 1e-12F)) {
+    return 0; // the ring frame is undefined: no zone can be named
+  }
+  forward = forward * (1.0F / std::sqrt(forwardLength2));
+  Vec3 const right = cross(forward, Vec3{0.0F, 1.0F, 0.0F});
+  Vec3 const centre = origin + forward * CarouselRing::kRadius;
+  float const lateralDirection = dot(ray.direction, right);
+  float const lateralPointer = dot(ray.origin - centre, right);
+  float const denominator = dot(ray.direction, forward);
+  float const toPlane = dot(centre - ray.origin, forward);
+  if (denominator > 1e-4F && toPlane > 0.0F) {
+    float const distance = toPlane / denominator;
+    float const side = dot(ray.origin + ray.direction * distance - centre, right);
+    if (std::isfinite(side)) {
+      if (centreSurfaceHit) {
+        return 2; // the exact hit has priority over any side
+      }
+      if (side < 0.0F) {
+        return -1;
+      }
+      if (side > 0.0F) {
+        return 1;
+      }
+    }
+  }
+  if (centreSurfaceHit) {
+    return 0; // grazing clip from a ray that cannot aim at the ring: never places
+  }
+  float const lateral = lateralDirection != 0.0F ? lateralDirection : lateralPointer;
+  return lateral < 0.0F ? -1 : lateral > 0.0F ? 1 : 0;
 }
 
 class HandGesture {
