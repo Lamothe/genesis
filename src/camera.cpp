@@ -138,6 +138,14 @@ Mat4 cameraViewFromPose(Vec3 const& position, Quat const& orientation) {
   return view;
 }
 
+bool composeStereoEye(Mat4 const& rigWorld, Vec3 const& eyePosition, Quat const& eyeOrientation,
+                      Vec3& eyeWorld, Mat4& view) {
+  Mat4 const eyeInTracking = mul(translationMatrix(eyePosition), rotationMatrix(eyeOrientation));
+  Mat4 const eyeInWorld = mul(rigWorld, eyeInTracking);
+  eyeWorld = transformPoint(rigWorld, eyePosition);
+  return invertAffine(eyeInWorld, view);
+}
+
 namespace {
 
 // Maps NDC (x, y) at view-space distance d along the view axis to view space.

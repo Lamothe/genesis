@@ -154,9 +154,9 @@ back). There are no flight controls in VR by design: passthrough means you
 walk around the real world with the
 models placed in it, so locomotion is physical — you walk, turn and crouch.
 The sticks are for EDITING, not locomotion (their output is still logged at
-session end as controller diagnostics). The view is horizon-locked: the head's physical
-roll is stripped (the look direction is kept exactly), so the ground stays
-level with gravity however you move or turn. Desktop keeps its keyboard
+session end as controller diagnostics). The view uses the headset's located
+eye poses, including head roll, while the world rig remains level with gravity.
+Desktop keeps its keyboard
 flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
 
 ## Animation and rendering status

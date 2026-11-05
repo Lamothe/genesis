@@ -10,11 +10,8 @@
 
 namespace vredit {
 
-// Per-frame state the app consumes, filled by XrShell::beginFrame. The eye
-// poses are the corrected (roll-stripped) ones in TRACKING space; the app
-// composes them with its rig into the final views, which is where the
-// combined basis gets its own horizon lock (a pitched rig composed with a
-// yawed head produces phantom roll otherwise).
+// Per-frame state the app consumes, filled by XrShell::beginFrame. Eye poses
+// are the raw located poses in tracking space, composed with the app's rig.
 struct XrFrameInput {
   bool handOpen[2] = {false, false}; // at least three tracked extended fingers
   Vec3 handJoints[2][26]{};
@@ -26,9 +23,9 @@ struct XrFrameInput {
   bool graspActive{false}; // right hand grasp value and ready actions are active
   float grasp{0.0F};
   Mat4 eyeProj[2];       // per-eye projection from the runtime fov tangents
-  Vec3 eyePos[2];        // corrected eye positions (tracking space)
-  Quat eyeOrient[2];     // corrected eye orientations (tracking space)
-  Quat headOrient{};     // roll-stripped head orientation (tracking space)
+  Vec3 eyePos[2];        // located eye positions (tracking space)
+  Quat eyeOrient[2];     // located eye orientations (tracking space)
+  Quat headOrient{};     // raw left-eye orientation (tracking space)
   Ray pointerRay;        // right-controller aim ray (head gaze fallback)
   Ray aimRays[2];        // per-hand aim rays in XR local space (left, right)
   bool aimValid[2] = {false, false}; // aimRays[i] is tracked this frame

@@ -3614,17 +3614,15 @@ int runXr(char const* shaderDir,
     }
 
     bool drew = true;
-    // Compose the rig with the head as ONE basis and horizon-lock the whole:
-    // a pitched rig multiplied by a yawed head view produces phantom roll
-    // (the world tilts as you turn), and the roll has to be stripped from the
-    // composition, not from the parts. One correction serves both eyes so the
-    // stereo pair stays rigid relative to each other.
-    Quat const headTotal = cameraOrientation(rig) * input.headOrient;
-    Quat const horizonLock = gravityAlign(headTotal) * conjugate(normalized(headTotal));
+    // Render each raw located eye in the same rig as hands and controllers.
     for (int eye = 0; eye < 2; ++eye) {
-      Vec3 const eyeWorld = transformPoint(rigWorld, input.eyePos[eye]);
-      Quat const totalOrient = horizonLock * (cameraOrientation(rig) * input.eyeOrient[eye]);
-      Mat4 const view = cameraViewFromPose(eyeWorld, totalOrient);
+      Vec3 eyeWorld{};
+      Mat4 view{};
+      if (!composeStereoEye(rigWorld, input.eyePos[eye], input.eyeOrient[eye], eyeWorld, view)) {
+        std::printf("[xr] eye pose is singular\n");
+        drew = false;
+        break;
+      }
       Mat4 viewProj = mul(input.eyeProj[eye], view);
       if (!renderer.drawToView(shell.eyeView(eye), shell.eyeImage(eye), view, viewProj, eyeWorld,
                                items, depthLines, overlayLines)) {

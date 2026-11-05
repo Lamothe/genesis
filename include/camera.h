@@ -38,16 +38,17 @@ Mat4 cameraProjectionFromTangents(float tanLeft, float tanRight, float tanUp, fl
 // (view forward is -Z).
 Mat4 cameraViewFromPose(Vec3 const& position, Quat const& orientation);
 
+// Compose a raw tracked eye pose with the rigid tracking-to-world rig.
+// Returns its world position and world-to-eye view; false if the rig is singular.
+bool composeStereoEye(Mat4 const& rigWorld, Vec3 const& eyePosition, Quat const& eyeOrientation,
+                      Vec3& eyeWorld, Mat4& view);
+
 // The camera's orientation as a quaternion, matching cameraForward's basis
 // convention exactly (positive yaw turns toward +X).
 Quat cameraOrientation(Camera const& camera);
 
-// Horizon lock: strip the roll from a tracked head orientation, keeping the
-// look direction exactly where the user points it. Everyone carries a few
-// degrees of physical head roll; composed with turning or a stick pitch it
-// makes the horizon swing ("the viewer is tilted... not level with the ground
-// as they turn"). The correction is a pure rotation about the head's forward
-// axis: forward is preserved exactly and only the roll goes.
+// Produce a gravity-aligned orientation while preserving its look direction.
+// This is an independent utility; tracked stereo eye poses must remain raw.
 Quat gravityAlign(Quat orientation);
 
 // Ray through a pixel; direction is normalised and points into the scene.

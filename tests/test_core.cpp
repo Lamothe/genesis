@@ -1106,13 +1106,6 @@ void testGravityAlign() {
   CHECK_NEAR(rotate(gravityAlign(level), {0.0F, 1.0F, 0.0F}).y, rotate(level, {0.0F, 1.0F, 0.0F}).y,
              1e-6F);
 
-  // The shell's composition: the correction preserves the forward exactly and
-  // rigidly rotates eye offsets (length preserved) about the head centre.
-  Quat const correction = aligned * conjugate(normalized(head));
-  Vec3 const offset{0.032F, 0.0F, 0.0F};
-  Vec3 const rotatedOffset = rotate(correction, offset);
-  CHECK_NEAR(dot(rotatedOffset, rotatedOffset), dot(offset, offset), 1e-6F);
-
   // Idempotent, and a degenerate look direction stays finite.
   CHECK_NEAR3(rotate(gravityAlign(aligned), {0.0F, 1.0F, 0.0F}),
               rotate(aligned, {0.0F, 1.0F, 0.0F}));
@@ -1132,31 +1125,55 @@ void testGravityAlign() {
   CHECK_NEAR(rotate(faded, {0.0F, 1.0F, 0.0F}).y, rotate(nearVertical, {0.0F, 1.0F, 0.0F}).y,
              1e-3F);
 
-  // Phantom roll: a PITCHED rig composed with a YAWED head produces roll in
-  // the total view even though each part is individually roll-free — that is
-  // what tilted the world as the user turned. The app's fix strips the roll
-  // from the composition (gravityAlign(cameraOrientation(rig) * eyeOrient));
-  // this test pins that the result is level and that the test detects roll.
-  Camera rigCam;
-  rigCam.yaw = 0.8F;
-  rigCam.pitch = 0.5F;
-  Quat const rigQuat = cameraOrientation(rigCam);
-  // cameraOrientation must match cameraForward's convention exactly (a
-  // positive yaw turns toward +X): this is the sign bug the review caught.
-  CHECK_NEAR3(rotate(rigQuat, {0.0F, 0.0F, -1.0F}), cameraForward(rigCam));
-  Quat const headPose = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 1.0F) *
-                        quatFromAxisAngle({1.0F, 0.0F, 0.0F}, 0.2F);
-  Quat const total = rigQuat * headPose;
-  // World up in eye space = the view rotation's first row (column-major
-  // m[0], m[4], m[8]... no: the eye-right row is m[0]/m[4]/m[8]; the
-  // world-up x in eye space is m[4]); roll shows up as a non-zero x there.
-  Mat4 const rolledView = cameraViewFromPose({0.0F, 0.0F, 0.0F}, total);
-  CHECK(std::abs(rolledView.m[4]) > 0.05F); // the un-fixed composition IS rolled
-  Mat4 const levelView = cameraViewFromPose({0.0F, 0.0F, 0.0F}, gravityAlign(total));
-  CHECK_NEAR(levelView.m[4], 0.0F, 1e-4F);  // the fix leaves the horizon level
-  // The look direction is preserved through the lock.
-  CHECK_NEAR3(rotate(gravityAlign(total), {0.0F, 0.0F, -1.0F}),
-              rotate(total, {0.0F, 0.0F, -1.0F}));
+
+}
+
+void testStereoEyeComposition() {
+  Camera rig;
+  rig.position = {2.3F, -0.7F, 4.1F};
+  rig.yaw = 0.65F;
+  rig.pitch = 0.0F; // XR rig retains yaw and translation only.
+  Mat4 rigWorld{};
+  CHECK(invertAffine(cameraView(rig), rigWorld));
+  CHECK_NEAR3(rotate(cameraOrientation(rig), {0.0F, 0.0F, -1.0F}), cameraForward(rig));
+
+  for (float roll : {-0.45F, 0.38F}) {
+    Quat const head = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 0.72F) *
+                      quatFromAxisAngle({1.0F, 0.0F, 0.0F}, -0.28F) *
+                      quatFromAxisAngle({0.0F, 0.0F, -1.0F}, roll);
+    Vec3 const centre{0.24F, 1.61F, -0.37F};
+    Vec3 const eyePos[2] = {centre + rotate(head, {-0.031F, 0.001F, 0.002F}),
+                            centre + rotate(head, {0.033F, -0.001F, -0.001F})};
+    Quat const eyeOrient[2] = {
+        head * quatFromAxisAngle({0.0F, 1.0F, 0.0F}, 0.025F),
+        head * quatFromAxisAngle({0.0F, 1.0F, 0.0F}, -0.019F)};
+    Vec3 eyeWorld[2]{};
+    Mat4 views[2]{};
+    Vec3 const hand{0.51F, 1.28F, -0.91F};
+    Vec3 const controllerAim = normalized(Vec3{-0.13F, 0.09F, -1.0F});
+    for (int eye = 0; eye < 2; ++eye) {
+      CHECK(composeStereoEye(rigWorld, eyePos[eye], eyeOrient[eye], eyeWorld[eye], views[eye]));
+      CHECK_NEAR3(eyeWorld[eye], transformPoint(rigWorld, eyePos[eye]));
+      CHECK_NEAR3(transformPoint(views[eye], eyeWorld[eye]), Vec3{});
+      // Independent tracking-space inverse: eye, opposite eye, hand and aim
+      // must all share exactly the same uncorrected tracking-to-world rig.
+      Quat const inverseEye = conjugate(eyeOrient[eye]);
+      CHECK_NEAR3(transformPoint(views[eye], transformPoint(rigWorld, eyePos[1 - eye])),
+                  rotate(inverseEye, eyePos[1 - eye] - eyePos[eye]));
+      CHECK_NEAR3(transformPoint(views[eye], transformPoint(rigWorld, hand)),
+                  rotate(inverseEye, hand - eyePos[eye]));
+      CHECK_NEAR3(transformVector(views[eye], transformVector(rigWorld, controllerAim)),
+                  rotate(inverseEye, controllerAim));
+      CHECK_NEAR3(transformVector(views[eye], transformVector(rigWorld, {0.0F, 1.0F, 0.0F})),
+                  rotate(inverseEye, {0.0F, 1.0F, 0.0F}));
+      // Gravity remains tilted in eye space rather than being horizon-locked.
+      CHECK(std::abs(transformVector(views[eye], {0.0F, 1.0F, 0.0F}).x) > 0.2F);
+    }
+    Vec3 const baseline = eyePos[1] - eyePos[0];
+    CHECK(std::abs(baseline.y) > 0.01F); // a rolled baseline is not horizontal
+    CHECK_NEAR3(eyeWorld[1] - eyeWorld[0], transformVector(rigWorld, baseline));
+    CHECK_NEAR(length(eyeWorld[1] - eyeWorld[0]), length(baseline), 1e-5F);
+  }
 }
 
 void testCameraLookPivot() {
@@ -2729,6 +2746,7 @@ int main() {
   testCameraManipulation();
   testCameraLookPivot();
   testGravityAlign();
+  testStereoEyeComposition();
   testXrMath();
   testUpscaleToPot();
   testFitToBudget();
