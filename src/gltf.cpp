@@ -16,6 +16,10 @@ constexpr std::uint32_t kGlbMagic = 0x46546C67U; // 'glTF'
 constexpr std::uint32_t kChunkJson = 0x4E4F534AU;
 constexpr std::uint32_t kChunkBin = 0x004E4942U;
 constexpr std::uint32_t kMaxNodeDepth = 1024U;
+// JOINTS_0 is unsigned short at most (65535 is the largest legal joint
+// index), so a skin can never usefully exceed 65536 joints. The cap also
+// bounds the inverse-bind matrix allocation from a hostile file.
+constexpr std::size_t kMaxSkinJoints = 65536U;
 
 std::uint32_t readU32(std::uint8_t const* p) {
   std::uint32_t value = 0;
@@ -64,6 +68,8 @@ bool typeComponents(std::string const& type, std::uint32_t& components) {
     components = 3;
   } else if (type == "VEC4") {
     components = 4;
+  } else if (type == "MAT4") {
+    components = 16; // inverse bind matrices are column-major like Mat4
   } else {
     return false;
   }
@@ -108,8 +114,17 @@ float readComponentFloat(AccessorView const& view, std::size_t element, std::uin
   }
 }
 
+std::uint32_t readIndexComponent(AccessorView const& view, std::size_t element,
+                                 std::uint32_t component);
+
 std::uint32_t readIndexScalar(AccessorView const& view, std::size_t element) {
-  std::uint8_t const* p = view.data + element * view.byteStride;
+  return readIndexComponent(view, element, 0U);
+}
+
+std::uint32_t readIndexComponent(AccessorView const& view, std::size_t element,
+                                 std::uint32_t component) {
+  std::uint8_t const* p = view.data + element * view.byteStride +
+                          component * componentSize(view.componentType);
   switch (view.componentType) {
   case 5125: {
     std::uint32_t value = 0;
@@ -154,6 +169,10 @@ private:
   // texture references and undecodable images degrade to untextured with a
   // warning (geometry is still useful); only geometry-maths errors fail.
   bool buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mesh);
+  // Parses skins after the node hierarchy is mapped. A bad skin becomes an
+  // empty entry (and any node referring to it renders rigid) rather than
+  // discarding the whole model.
+  bool buildSkins(JsonDocument::NodeId skinsNode);
   // Binds glTF texture `textureIndex` (image + sampler wrap modes) into a mesh
   // slot, decoding and deduping on (image, wrap modes). Bad references leave
   // the slot unbound.
@@ -165,6 +184,10 @@ private:
   Model& model_;
   std::string& error_;
   bool withImages_{true}; // false = geometry-only preview load (no image decode)
+  // Only parse JOINTS_0/WEIGHTS_0 when the file actually defines skins. The
+  // real library GLBs carry unused joint attributes on 109 static exports;
+  // parsing them would add ~24 bytes per vertex for no benefit.
+  bool hasSkinDefinitions_{false};
   JsonDocument document_;
   std::uint8_t const* bin_{nullptr};
   std::size_t binLength_{0};
@@ -578,7 +601,10 @@ bool GlbReader::addPrimitive(JsonDocument::NodeId primitiveNode, std::int32_t& m
     if (!buildAccessor(document_.element(accessorsNode_, colourIndex), colours)) {
       return false;
     }
-    hasColours = colours.components >= 3U && colours.count == positions.count;
+    // VEC3/VEC4 only: MAT4 is a supported accessor type for inverse bind
+    // matrices and must not be scooped up as colours.
+    hasColours = (colours.components == 3U || colours.components == 4U) &&
+                 colours.count == positions.count;
   }
 
   AccessorView texcoords{};
@@ -590,10 +616,103 @@ bool GlbReader::addPrimitive(JsonDocument::NodeId primitiveNode, std::int32_t& m
     if (!buildAccessor(document_.element(accessorsNode_, texcoordIndex), texcoords)) {
       return false;
     }
-    hasUvs = texcoords.components >= 2U && texcoords.count == positions.count;
+    hasUvs = texcoords.components == 2U && texcoords.count == positions.count;
   }
 
   ModelMesh mesh;
+
+  // JOINTS_0 / WEIGHTS_0: only meaningful when the file defines skins. Both
+  // attributes must be present; malformed skin data degrades this primitive to
+  // rigid rather than hiding the model. JOINTS_1+ (more than four influences)
+  // is outside this MVP and is ignored.
+  if (hasSkinDefinitions_) {
+    JsonDocument::NodeId jointsAttr = document_.member(attributes, "JOINTS_0");
+    JsonDocument::NodeId weightsAttr = document_.member(attributes, "WEIGHTS_0");
+    bool const hasJoints = document_.type(jointsAttr) == JsonDocument::Type::Number;
+    bool const hasWeights = document_.type(weightsAttr) == JsonDocument::Type::Number;
+    if (hasJoints != hasWeights) {
+      std::printf("glb: JOINTS_0/WEIGHTS_0 must appear together; primitive stays rigid\n");
+    } else if (hasJoints) {
+      std::size_t jointsIndex = 0;
+      std::size_t weightsIndex = 0;
+      // A broken skin attribute degrades this primitive to rigid; it must not
+      // fail the whole model (the geometry and every other part stay usable).
+      bool const indexesOk =
+          readSize(jointsAttr, jointsIndex, "JOINTS_0 accessor") &&
+          readSize(weightsAttr, weightsIndex, "WEIGHTS_0 accessor") &&
+          document_.type(accessorsNode_) == JsonDocument::Type::Array &&
+          jointsIndex < document_.size(accessorsNode_) &&
+          weightsIndex < document_.size(accessorsNode_);
+      if (!indexesOk) {
+        std::printf("glb: bad JOINTS_0/WEIGHTS_0 accessor; primitive stays rigid\n");
+        error_.clear();
+      }
+      JsonDocument::NodeId jointsNode =
+          indexesOk ? document_.element(accessorsNode_, jointsIndex) : JsonDocument::kInvalid;
+      JsonDocument::NodeId weightsNode =
+          indexesOk ? document_.element(accessorsNode_, weightsIndex) : JsonDocument::kInvalid;
+      AccessorView joints{};
+      AccessorView weights{};
+      bool accessorsOk = indexesOk;
+      if (accessorsOk &&
+          (document_.member(jointsNode, "sparse") != JsonDocument::kInvalid ||
+           document_.member(weightsNode, "sparse") != JsonDocument::kInvalid)) {
+        std::printf("glb: sparse skin accessor unsupported; primitive stays rigid\n");
+        accessorsOk = false;
+      }
+      if (accessorsOk &&
+          (!buildAccessor(jointsNode, joints) || !buildAccessor(weightsNode, weights))) {
+        std::printf("glb: unusable JOINTS_0/WEIGHTS_0 accessor (%s); primitive stays rigid\n",
+                    error_.c_str());
+        error_.clear();
+        accessorsOk = false;
+      }
+      if (accessorsOk) {
+        bool const jointsOk =
+            joints.components == 4U && joints.count == positions.count &&
+            !joints.normalised &&
+            (joints.componentType == 5121U || joints.componentType == 5123U);
+        bool const weightsOk =
+            weights.components == 4U && weights.count == positions.count &&
+            (weights.componentType == 5126U ||
+             ((weights.componentType == 5121U || weights.componentType == 5123U) &&
+              weights.normalised));
+        if (!jointsOk || !weightsOk) {
+          std::printf("glb: invalid JOINTS_0/WEIGHTS_0 format; primitive stays rigid\n");
+        } else {
+          mesh.skinWeights.resize(positions.count);
+          bool anyWeight = false;
+          for (std::size_t v = 0; v < positions.count; ++v) {
+            SkinVertexWeight& skin = mesh.skinWeights[v];
+            double sum = 0.0;
+            for (std::uint32_t k = 0; k < 4U; ++k) {
+              std::uint32_t const joint = readIndexComponent(joints, v, k);
+              float weight = readComponentFloat(weights, v, k);
+              if (!std::isfinite(weight) || weight < 0.0F) {
+                weight = 0.0F;
+              }
+              skin.joints[k] = static_cast<std::uint16_t>(joint); // u8/u16 source: exact
+              skin.weights[k] = weight;
+              sum += weight;
+            }
+            if (sum > 1e-8 && std::isfinite(sum)) {
+              float const scale = static_cast<float>(1.0 / sum);
+              for (std::uint32_t k = 0; k < 4U; ++k) {
+                skin.weights[k] *= scale;
+              }
+              anyWeight = true;
+            } else {
+              skin = SkinVertexWeight{}; // rest position for this vertex
+            }
+          }
+          if (!anyWeight) {
+            mesh.skinWeights.clear();
+            std::printf("glb: all-zero skin weights; primitive stays rigid\n");
+          }
+        }
+      }
+    }
+  }
   if (!buildMaterial(primitiveNode, mesh)) {
     return false;
   }
@@ -681,6 +800,15 @@ bool GlbReader::collectNode(std::size_t nodeIndex, std::int32_t parentModel,
   node.name = document_.asString(document_.member(nodeDef, "name"));
   node.local = parseTransform(nodeDef);
   node.parent = parentModel;
+  JsonDocument::NodeId skinIndexNode = document_.member(nodeDef, "skin");
+  if (document_.type(skinIndexNode) == JsonDocument::Type::Number) {
+    std::size_t skinIndex = 0;
+    if (!readSize(skinIndexNode, skinIndex, "skin index") || skinIndex > INT32_MAX) {
+      return false;
+    }
+    node.skin = static_cast<std::int32_t>(skinIndex);
+  }
+  node.skinNode = static_cast<std::int32_t>(model_.nodes.size()); // patched below
   model_.nodes.push_back(node);
   std::int32_t modelIndex = static_cast<std::int32_t>(model_.nodes.size() - 1U);
   modelIndexOut = modelIndex;
@@ -708,14 +836,20 @@ bool GlbReader::collectNode(std::size_t nodeIndex, std::int32_t parentModel,
     }
     if (primitiveMeshes.size() == 1U) {
       model_.nodes[static_cast<std::size_t>(modelIndex)].mesh = primitiveMeshes[0];
+      model_.nodes[static_cast<std::size_t>(modelIndex)].skinNode = modelIndex;
     } else {
       // Multi-primitive mesh: wrapper node keeps the transform, one child per
-      // primitive shares it.
+      // primitive shares it. A skin belongs to the glTF wrapper node, so the
+      // children inherit the skin and point their mesh-space transform at the
+      // wrapper (the synthetic child itself has no glTF transform).
+      std::int32_t const wrapperSkin = model_.nodes[static_cast<std::size_t>(modelIndex)].skin;
       for (std::size_t p = 0; p < primitiveMeshes.size(); ++p) {
         ModelNode child;
         child.name = node.name + "/primitive" + std::to_string(p);
         child.parent = modelIndex;
         child.mesh = primitiveMeshes[p];
+        child.skin = wrapperSkin;
+        child.skinNode = modelIndex;
         model_.nodes.push_back(std::move(child));
       }
     }
@@ -735,9 +869,136 @@ bool GlbReader::collectNode(std::size_t nodeIndex, std::int32_t parentModel,
   return true;
 }
 
+bool GlbReader::buildSkins(JsonDocument::NodeId skinsNode) {
+  if (skinsNode == JsonDocument::kInvalid) {
+    return true;
+  }
+  if (document_.type(skinsNode) != JsonDocument::Type::Array) {
+    std::printf("glb: skins must be an array; model stays rigid\n");
+    return true;
+  }
+
+  std::size_t const count = document_.size(skinsNode);
+  model_.skins.reserve(count);
+  for (std::size_t s = 0; s < count; ++s) {
+    ModelSkin skin;
+    bool ok = true;
+    std::string why;
+
+    JsonDocument::NodeId skinNode = document_.element(skinsNode, s);
+    JsonDocument::NodeId jointsNode = document_.member(skinNode, "joints");
+    std::size_t const jointCount = document_.size(jointsNode);
+    if (document_.type(skinNode) != JsonDocument::Type::Object ||
+        document_.type(jointsNode) != JsonDocument::Type::Array || jointCount == 0U ||
+        jointCount > kMaxSkinJoints) {
+      ok = false;
+      why = "invalid joints";
+    }
+    if (ok) {
+      skin.joints.reserve(jointCount);
+      for (std::size_t j = 0; j < jointCount && ok; ++j) {
+        std::size_t nodeIndex = 0;
+        if (!readSize(document_.element(jointsNode, j), nodeIndex, "skin joint node") ||
+            nodeIndex >= nodeMap_.size() || nodeMap_[nodeIndex] < 0) {
+          ok = false;
+          why = "joint node outside the scene";
+          break;
+        }
+        skin.joints.push_back(nodeMap_[nodeIndex]);
+      }
+      error_.clear();
+    }
+
+    JsonDocument::NodeId ibmNode = document_.member(skinNode, "inverseBindMatrices");
+    bool const hasIbm = ibmNode != JsonDocument::kInvalid &&
+                        document_.type(ibmNode) != JsonDocument::Type::Null;
+    // The property is optional (absent means identity). A present but
+    // non-numeric value is a malformed file, not an absent one: fail the skin
+    // rather than silently deforming with identity matrices.
+    if (ok && hasIbm && document_.type(ibmNode) != JsonDocument::Type::Number) {
+      ok = false;
+      why = "inverseBindMatrices must be an accessor index";
+    }
+    if (ok && hasIbm && document_.type(ibmNode) == JsonDocument::Type::Number) {
+      std::size_t accessorIndex = 0;
+      if (!readSize(ibmNode, accessorIndex, "inverseBindMatrices accessor") ||
+          document_.type(accessorsNode_) != JsonDocument::Type::Array ||
+          accessorIndex >= document_.size(accessorsNode_)) {
+        ok = false;
+        why = "bad inverseBindMatrices accessor";
+      } else {
+        JsonDocument::NodeId accessorNode = document_.element(accessorsNode_, accessorIndex);
+        if (document_.member(accessorNode, "sparse") != JsonDocument::kInvalid) {
+          ok = false;
+          why = "sparse inverseBindMatrices unsupported";
+        } else {
+          AccessorView ibm{};
+          if (!buildAccessor(accessorNode, ibm)) {
+            ok = false;
+            why = error_;
+          } else if (ibm.componentType != 5126U || ibm.components != 16U ||
+                     ibm.normalised || ibm.count < jointCount) {
+            ok = false;
+            why = "inverseBindMatrices must be MAT4 float with one entry per joint";
+          } else {
+            skin.inverseBindMatrices.reserve(jointCount);
+            for (std::size_t j = 0; j < jointCount && ok; ++j) {
+              Mat4 matrix;
+              for (std::size_t k = 0; k < 16U; ++k) {
+                matrix.m[k] = readComponentFloat(ibm, j, static_cast<std::uint32_t>(k));
+              }
+              if (!std::isfinite(matrix.m[3]) || !std::isfinite(matrix.m[7]) ||
+                  !std::isfinite(matrix.m[11]) || !std::isfinite(matrix.m[15]) ||
+                  std::fabs(matrix.m[3]) > 1e-4F || std::fabs(matrix.m[7]) > 1e-4F ||
+                  std::fabs(matrix.m[11]) > 1e-4F || std::fabs(matrix.m[15] - 1.0F) > 1e-4F) {
+                ok = false;
+                why = "inverseBindMatrix bottom row is not [0,0,0,1]";
+                break;
+              }
+              bool finite = true;
+              for (std::size_t k = 0; k < 16U; ++k) {
+                finite = finite && std::isfinite(matrix.m[k]);
+              }
+              if (!finite) {
+                ok = false;
+                why = "non-finite inverseBindMatrix";
+                break;
+              }
+              skin.inverseBindMatrices.push_back(matrix);
+            }
+          }
+        }
+      }
+      error_.clear();
+    } else if (ok) {
+      skin.inverseBindMatrices.assign(jointCount, Mat4{});
+    }
+
+    if (!ok) {
+      std::printf("glb: skin %zu ignored (%s); affected meshes stay rigid\n", s, why.c_str());
+      skin = ModelSkin{};
+    }
+    model_.skins.push_back(std::move(skin));
+  }
+
+  // A node referring to a missing or malformed skin renders with its rest
+  // transforms; keep the geometry usable instead of failing the whole file.
+  for (ModelNode& node : model_.nodes) {
+    if (node.skin >= 0 &&
+        (static_cast<std::size_t>(node.skin) >= model_.skins.size() ||
+         model_.skins[static_cast<std::size_t>(node.skin)].joints.empty())) {
+      node.skin = -1;
+      node.skinNode = -1;
+    }
+  }
+  return true;
+}
+
 // Channels outside the selected scene are validated but not emitted. Unused
-// samplers are ignored. Morph weights and sparse accessors are not supported;
-// reject them explicitly rather than silently misinterpreting animation data.
+// samplers are ignored. Morph weight channels are skipped (morph targets are
+// not supported) while the clip's TRS channels remain playable. Sparse
+// accessors are rejected explicitly rather than silently misinterpreting
+// animation data.
 bool GlbReader::buildAnimations(JsonDocument::NodeId animations) {
   if (animations == JsonDocument::kInvalid) {
     return true;
@@ -787,6 +1048,11 @@ bool GlbReader::buildAnimations(JsonDocument::NodeId animations) {
         components = 4;
       } else if (path == "scale") {
         result.path = AnimationPath::Scale;
+      } else if (path == "weights") {
+        // Morph-target animation is not supported, but a skeletal clip often
+        // carries a face/morph channel alongside its TRS channels. Skip the
+        // channel instead of discarding the whole character clip.
+        continue;
       } else {
         return fail("glb: unsupported animation path");
       }
@@ -912,6 +1178,9 @@ bool GlbReader::run() {
   imagesNode_ = document_.member(root, "images");
   visited_.assign(document_.size(nodesNode_), false);
   nodeMap_.assign(document_.size(nodesNode_), -1);
+  JsonDocument::NodeId skinsNode = document_.member(root, "skins");
+  hasSkinDefinitions_ =
+      document_.type(skinsNode) == JsonDocument::Type::Array && document_.size(skinsNode) > 0U;
 
   JsonDocument::NodeId scenesNode = document_.member(root, "scenes");
   JsonDocument::NodeId sceneNode = JsonDocument::kInvalid;
@@ -936,6 +1205,15 @@ bool GlbReader::run() {
     if (!collectNode(nodeIndex, -1, modelIndex, 0U)) {
       return false;
     }
+  }
+  if (!buildSkins(skinsNode)) {
+    std::fprintf(stderr, "glb: skins ignored: %s\n", error_.c_str());
+    model_.skins.clear();
+    for (ModelNode& node : model_.nodes) {
+      node.skin = -1;
+      node.skinNode = -1;
+    }
+    error_.clear();
   }
   // Animation is optional: an unsupported clip must not make a previously
   // viewable model disappear from the library.

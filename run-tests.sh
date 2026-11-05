@@ -29,7 +29,7 @@ else
 fi
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
   src/scene.cpp src/picking.cpp src/gizmo.cpp src/camera.cpp src/handles.cpp \
-  src/editor_state.cpp src/carousel.cpp src/triangle_sort.cpp \
+  src/editor_state.cpp src/carousel.cpp src/triangle_sort.cpp src/skin.cpp \
   src/mesh.cpp src/json.cpp src/gltf.cpp src/obj.cpp src/image.cpp \
   tests/test_core.cpp \
   -lz -o .build/test-core
@@ -38,7 +38,7 @@ fi
   tests/test_hands.cpp -o .build/test-hands
 ./.build/test-hands
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
-  src/scene.cpp src/animation.cpp src/gltf.cpp src/json.cpp src/image.cpp tests/test_animation.cpp \
+  src/scene.cpp src/animation.cpp src/gltf.cpp src/json.cpp src/image.cpp src/skin.cpp tests/test_animation.cpp \
   -lz -o .build/test-animation
 ./.build/test-animation
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude -Ithird_party/openxr/include \

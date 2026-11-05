@@ -38,9 +38,29 @@ public:
 
   bool resize(std::uint32_t width, std::uint32_t height);
 
-  // Registers static mesh data and returns a handle (0 is the built-in cube).
-  // Safe to call at any time; internally synchronises with in-flight frames.
-  MeshHandle addMesh(MeshData const& data);
+  // Registers mesh data and returns a handle (0 is the built-in cube).
+  // `dynamic` allocates a persistent host staging slot for updateMeshVertices;
+  // static meshes keep the cheaper upload-once path. `trackTriangleSums`
+  // keeps the per-triangle depth keys used to sort alpha-blended draws; pass
+  // false for material that is always opaque, which makes each dynamic update
+  // skip an O(triangles) pass (a blended draw of such a mesh then uses index
+  // order, as every unsortable mesh already does). Safe to call at any time;
+  // internally synchronises with in-flight frames.
+  MeshHandle addMesh(MeshData const& data, bool dynamic = false,
+                     bool trackTriangleSums = true);
+
+  // Replaces the position and normal data of a dynamic mesh without changing
+  // its topology or vertex count. The upload is queued for the next draw,
+  // which already waits for the previous frame's fence: no vkDeviceWaitIdle
+  // and no per-frame GPU stall. Blend sorting keys are recomputed from the new
+  // vertices when the mesh tracks them. `boundsCentre`, when non-null, is the
+  // new mesh-space bounds centre used to order blended draws; passing the
+  // value the caller already computed saves a full read of the vertices (it
+  // only affects blend ordering, never geometry). Returns false (and leaves
+  // the old GPU data intact) for a static mesh, a vertex-count change,
+  // non-finite data or a Vulkan failure.
+  bool updateMeshVertices(MeshHandle handle, std::vector<MeshVertex> const& vertices,
+                          Vec3 const* boundsCentre = nullptr);
 
   // Two reusable opaque hand meshes, depth-tested against scene geometry
   // and each other. slot is 0 (left) or 1

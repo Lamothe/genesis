@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 using namespace vredit;
@@ -464,6 +465,59 @@ int main() {
     std::printf("renderer test: hand reactivation failed\n");
     return 1;
   }
+  // Dynamic (skinned) mesh path: the same handle is updated in place, with no
+  // topology change, and the next draw sees the new vertices.
+  MeshData dynamic;
+  dynamic.vertices = {vertex({-0.6F, -0.6F, -3.0F}, normal, {1, 1, 1}),
+                      vertex({0.6F, -0.6F, -3.0F}, normal, {1, 1, 1}),
+                      vertex({0.0F, 0.6F, -3.0F}, normal, {1, 1, 1})};
+  dynamic.indices = {0, 1, 2};
+  MeshHandle const dynamicHandle = renderer.addMesh(dynamic, true);
+  DrawItem dynamicItem;
+  dynamicItem.mesh = dynamicHandle;
+  dynamicItem.lit = false;
+  if (dynamicHandle == kInvalidMesh ||
+      renderer.updateMeshVertices(sourceHandle, dynamic.vertices) ||
+      !render(renderer, camera, dynamicItem, pixels) || pixels[centre] < 200) {
+    std::printf("renderer test: dynamic mesh registration/static rejection failed\n");
+    return 1;
+  }
+  std::vector<MeshVertex> moved = dynamic.vertices;
+  for (MeshVertex& v : moved) {
+    v.pos.x += 1.8F;
+  }
+  std::vector<MeshVertex> wrongSize = moved;
+  wrongSize.pop_back();
+  std::vector<MeshVertex> nonFinite = moved;
+  nonFinite[0].pos.x = std::numeric_limits<float>::quiet_NaN();
+  if (!renderer.updateMeshVertices(dynamicHandle, moved) ||
+      renderer.updateMeshVertices(dynamicHandle, wrongSize) ||
+      renderer.updateMeshVertices(dynamicHandle, nonFinite) ||
+      !render(renderer, camera, dynamicItem, pixels) || pixels[centre] > 60) {
+    std::printf("renderer test: dynamic mesh update/validation failed\n");
+    return 1;
+  }
+  if (!renderer.updateMeshVertices(dynamicHandle, dynamic.vertices) ||
+      !render(renderer, camera, dynamicItem, pixels) || pixels[centre] < 200) {
+    std::printf("renderer test: dynamic mesh restore failed\n");
+    return 1;
+  }
+  // Pending data is a plain assignment: when the app updates twice before a
+  // frame, the last payload is what the next draw shows. An opaque skinned
+  // registration (trackTriangleSums=false, the production path for characters
+  // without blending) must update and draw too.
+  MeshHandle const opaqueHandle = renderer.addMesh(dynamic, true, false);
+  DrawItem opaqueItem = dynamicItem;
+  opaqueItem.mesh = opaqueHandle;
+  if (opaqueHandle == kInvalidMesh ||
+      !renderer.updateMeshVertices(opaqueHandle, moved) ||
+      !renderer.updateMeshVertices(opaqueHandle, dynamic.vertices) ||
+      !render(renderer, camera, opaqueItem, pixels) || pixels[centre] < 200) {
+    std::printf("renderer test: opaque dynamic mesh last-update-wins failed\n");
+    return 1;
+  }
+
+  std::printf("renderer tests: dynamic vertex update and validation passed\n");
   std::printf("renderer tests: scene-correct hand depth, slots, lines, bounds and clear passed\n");
   std::printf("renderer tests: nonuniform/mirrored/singular normals and blend sort/reuse passed\n");
   return 0;

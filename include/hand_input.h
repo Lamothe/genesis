@@ -306,6 +306,11 @@ class HandContactMesh {
 // no scene, undo snapshot, or other client still owns that geometry.
 class HandContactCache {
  public:
+  // The BVH is built once per geometry and then reused: a build costs about
+  // a microsecond per triangle (measured: 211 ms at 200k triangles, 2.4 s at
+  // 2M), so it must never run per frame. For a skinned visual the surface is
+  // whatever the pose was when the hand first reached it; ray picking and
+  // bounds use the live deformed vertices and stay exact.
   std::shared_ptr<const HandContactMesh> get(std::shared_ptr<const PickGeometry> const& geometry) {
     auto& mesh = entries_[geometry];
     if (!mesh) { mesh = std::make_shared<HandContactMesh>(geometry); }

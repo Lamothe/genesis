@@ -44,6 +44,8 @@ bash run-editor.sh --smoke-offscreen     # render + pixel assertions
 bash run-editor.sh --smoke-textured      # texture sampling end-to-end
 bash run-editor.sh --smoke-blend         # blended surfaces
 bash run-editor.sh --smoke-perf          # offscreen rendering timings
+bash run-editor.sh --smoke-skinned       # rig: bind pose -> animated deformation
+bash run-editor.sh --bench-skin          # CPU skinning cost at 100k/300k/1.2M vertices
 bash run-editor.sh --smoke-window 30     # windowed present path
 bash run-editor.sh --smoke-xr            # XR frame loop (SKIP without a runtime)
 ```
@@ -51,6 +53,17 @@ bash run-editor.sh --smoke-xr            # XR frame loop (SKIP without a runtime
 `run-tests.sh` compiles with `g++ -std=c++20 -Wall -Wextra -Werror`;
 `run-editor.sh` compiles the shell and shaders and runs it. Thin shell launchers
 only: **all project logic is typed C/C++ (project rule — no Python)**.
+
+The offscreen renderer regressions are a separate binary because they need a
+live Vulkan 1.3 device and the compiled shaders (build them with
+`run-editor.sh` once):
+
+```sh
+g++ -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude -Iapp tests/test_renderer.cpp \
+  src/camera.cpp src/handles.cpp src/triangle_sort.cpp src/mesh.cpp src/image.cpp \
+  app/geometry.cpp app/vk_renderer.cpp -lvulkan -lxcb -lz -o .build/test-renderer
+./.build/test-renderer
+```
 
 ## Controls
 
@@ -170,10 +183,63 @@ flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
 The first usable glTF node-TRS clip plays automatically and loops on placed
 models and command-line imports. STEP, LINEAR and CUBICSPLINE translation,
 rotation and scale are supported; playback is separate from undoable edits.
-Unsupported clips are logged and skipped. This is **not skinning**: rigged
-characters, morph targets and clips requiring them will not deform. Nodes with
-singular (zero-scale) rest transforms cannot currently be animated. There is no
-clip selector yet.
+Unsupported clips are logged and skipped. Nodes with singular (zero-scale) rest
+transforms cannot currently be animated. There is no clip selector yet.
+
+### Skeletal skinning (rigged characters)
+
+glTF skins are loaded (`skins`, node `skin`, `inverseBindMatrices`,
+`JOINTS_0`/`WEIGHTS_0`) and animated with four-influence linear blend skinning.
+A clip that targets a skin joint is preferred over an object clip, so a rigged
+character plays its walk cycle rather than a turntable. The clip choice is
+still automatic (first joint-targeting clip); there is no selector.
+
+Joint matrices are `inverse(meshWorld) * jointWorld * inverseBindMatrix` per
+the glTF spec, built from the scene's live world matrices after the node pose
+is applied, so animated *and* hand-edited hierarchies both drive the skin. The
+node's own transform cancels exactly: moving the whole model re-parents the
+draw but does not reskin it. Inverse bind matrices must be MAT4 float, affine
+(bottom row `0,0,0,1`) and one per joint; a malformed skin is logged and its
+meshes render rigid instead of hiding the model. `JOINTS_1+` (more than four
+influences), sparse skin accessors, morph targets and joints outside the
+selected scene stay unsupported; those primitives render in the bind pose.
+Models with skins but no playable joint clip keep their bind-pose draw, and
+`JOINTS_0`/`WEIGHTS_0` are only parsed when the file actually defines skins
+(the static library exports carry unused joint attributes).
+
+**CPU skinning is deliberate**: weights are ordinary CPU data, exact picking
+and selection bounds need the deformed vertices anyway, both stereo eyes share
+one pose, and the upload uses the renderer's fence-safe dynamic path instead of
+a per-frame `vkDeviceWaitIdle`. Measured single-threaded on platinum (Radeon
+8060S, `--bench-skin`, run-to-run variation about ±20%): 100k vertices
+0.9 ms deform + 0.3 ms queue, 300k vertices 3.1 + 0.9 ms, 1.2M vertices
+11.0 + 5.1 ms. Small and medium rigs play inside the 90 Hz stereo budget; the
+library's largest static characters (1.0–1.7 M vertices) would spend ~16 ms per
+frame in the CPU path alone, so multi-million-vertex rigs need GPU skinning or
+a threaded deformer next.
+Skinned primitives are per-instance dynamic meshes (two copies of a character
+deform independently), and a mesh used only by skinned nodes skips the shared
+static registration entirely, so a placement costs one copy rather than two.
+Each placed copy keeps a device vertex buffer, a persistent host-visible
+staging buffer and the CPU pending vertices: about 132 bytes per vertex plus 12
+bytes per triangle, i.e. roughly 165 MB for a 1.2 M-vertex (600k-triangle)
+character. That memory is never reclaimed, because the renderer has no release
+path (see Design notes) — spawning and deleting large rigged characters
+repeatedly grows memory for the rest of the session.
+Deform results are re-uploaded only while the joint
+matrices change, and opaque skinned meshes skip the blend-sort key pass.
+Ray picking and selection bounds use the live deformed vertices. Physical hand
+contact still builds its triangle BVH once per mesh (a build costs ~1 µs per
+triangle, measured: 211 ms at 200k, 2.4 s at 2M), so grasping an *animated*
+character tests the surface from when the hand first reached it, not the
+current pose; use pinch/ray selection for exact contact. Deleting an animated
+model still leaves its registered GPU mesh (resources are never released, see
+Design notes).
+
+`--smoke-skinned` renders the synthetic two-joint fixture that
+`run-tests.sh` writes to `.build/test-skinned.glb` (bind pose → animated,
+moved bounds/picking, changed pixels); it needs an offscreen Vulkan device.
+Headset-side appearance still has to be judged by eye.
 
 A comparison with Centre Stage identified the missing PBR materials,
 transmission, emissive, sRGB material pipeline and studio lighting. This change

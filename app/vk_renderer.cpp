@@ -98,12 +98,32 @@ struct VkRenderer::Impl {
     VkBuffer indexBuffer{VK_NULL_HANDLE};
     VkDeviceMemory indexMemory{VK_NULL_HANDLE};
     std::uint32_t indexCount{0};
+    std::uint32_t vertexCount{0};
     // CPU-side source data for the per-view blend sort (see recordCommands):
     // per-triangle position sums (the depth key), the source indices (the
     // rewrite input) and the mesh-space bounds centre (the item-ordering key).
     std::vector<Vec3> triPosSums;
     std::vector<std::uint32_t> indices;
     Vec3 boundsCentre{0.0F, 0.0F, 0.0F};
+    // Dynamic meshes: updated vertices wait in CPU memory, then copy through
+    // a persistent host-visible staging buffer at the start of recordCommands
+    // (after the previous frame's fence). Nothing in flight is overwritten.
+    bool dynamic{false};
+    // True while the CPU holds vertices the GPU has not received yet. Cleared
+    // only after the submit that copied them succeeds, so a failed frame
+    // retries instead of leaving the drawn mesh a pose behind its bounds.
+    bool updatePending{false};
+    // Blend sorting needs per-triangle position sums, which cost an O(tris)
+    // pass per skinned update. Opaque skinned meshes never read them, so a
+    // caller that knows the material is opaque registers with
+    // trackTriangleSums=false and the update leaves the sums empty (a blended
+    // draw of such a mesh deterministically uses index order, as it always has
+    // for unsortable meshes).
+    bool trackTriangleSums{true};
+    VkBuffer updateStaging{VK_NULL_HANDLE};
+    VkDeviceMemory updateStagingMemory{VK_NULL_HANDLE};
+    void* updateStagingMapped{nullptr};
+    std::vector<MeshVertex> pendingVertices;
   };
 
   // Backdrop void colour (setClearColour).
@@ -728,6 +748,63 @@ struct VkRenderer::Impl {
 
     // Host-coherent staging is changed only after the frame fence. Copy to
     // device-local mesh buffers before this frame's vertex/index reads.
+    // Dynamic (skinned) vertices use the same rule: the CPU result waited in
+    // MeshRecord::pendingVertices, and this is the first point after the
+    // previous frame's fence where the persistent staging slot is safe to
+    // rewrite. A mesh is copied at most once per frame.
+    // Host writes must be made available to the copy engine even for
+    // HOST_COHERENT memory (the spec requires the availability barrier; the
+    // coherence only removes the flush).
+    bool anyHostCopy = false;
+    for (Impl::MeshRecord const& record : meshes) {
+      if (record.dynamic && record.updatePending) {
+        anyHostCopy = true;
+        break;
+      }
+    }
+    if (!anyHostCopy) {
+      for (auto const& hand : hands) {
+        if (hand.dirty && hand.indexBytes != 0U) {
+          anyHostCopy = true;
+          break;
+        }
+      }
+    }
+    if (anyHostCopy) {
+      VkMemoryBarrier2 hostBarrier =
+          vkStruct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+      hostBarrier.srcStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+      hostBarrier.srcAccessMask = VK_ACCESS_2_HOST_WRITE_BIT;
+      hostBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      hostBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+      VkDependencyInfo hostInfo = vkStruct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+      hostInfo.memoryBarrierCount = 1;
+      hostInfo.pMemoryBarriers = &hostBarrier;
+      vkCmdPipelineBarrier2(command, &hostInfo);
+    }
+    bool vertexCopies = false;
+    // Indices of dynamic meshes whose copy this frame recorded. Their pending
+    // flag is cleared only once the submit succeeds (see below), so a failed
+    // frame retries rather than silently dropping the update.
+    std::vector<std::size_t> copiedUpdates;
+    for (std::size_t meshIndex = 0; meshIndex < meshes.size(); ++meshIndex) {
+      Impl::MeshRecord& record = meshes[meshIndex];
+      if (!record.dynamic || !record.updatePending) {
+        continue;
+      }
+      if (record.updateStagingMapped == nullptr ||
+          record.pendingVertices.size() != record.vertexCount) {
+        record.updatePending = false; // can never succeed; drop it
+        continue;
+      }
+      VkDeviceSize const bytes = sizeof(MeshVertex) * record.vertexCount;
+      std::memcpy(record.updateStagingMapped, record.pendingVertices.data(),
+                  static_cast<std::size_t>(bytes));
+      VkBufferCopy copy{0, 0, bytes};
+      vkCmdCopyBuffer(command, record.updateStaging, record.vertexBuffer, 1, &copy);
+      copiedUpdates.push_back(meshIndex);
+      vertexCopies = true;
+    }
     bool handCopies = false;
     for (auto const& hand : hands) {
       if (!hand.dirty || hand.indexBytes == 0U) {
@@ -741,7 +818,7 @@ struct VkRenderer::Impl {
       vkCmdCopyBuffer(command, hand.staging, record.indexBuffer, 1, &indexCopy);
       handCopies = true;
     }
-    if (handCopies) {
+    if (handCopies || vertexCopies) {
       VkMemoryBarrier2 barrier = vkStruct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
       barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
       barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -1049,6 +1126,9 @@ struct VkRenderer::Impl {
     }
     for (auto& hand : hands) {
       hand.dirty = false;
+    }
+    for (std::size_t meshIndex : copiedUpdates) {
+      meshes[meshIndex].updatePending = false;
     }
     return true;
   }
@@ -1525,6 +1605,15 @@ void VkRenderer::shutdown() {
     if (record.indexMemory != VK_NULL_HANDLE) {
       vkFreeMemory(g.device, record.indexMemory, nullptr);
     }
+    if (record.updateStagingMapped != nullptr) {
+      vkUnmapMemory(g.device, record.updateStagingMemory);
+    }
+    if (record.updateStaging != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, record.updateStaging, nullptr);
+    }
+    if (record.updateStagingMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, record.updateStagingMemory, nullptr);
+    }
   }
   g.meshes.clear();
   for (auto& hand : g.hands) {
@@ -1576,7 +1665,7 @@ void VkRenderer::shutdown() {
   }
 }
 
-MeshHandle VkRenderer::addMesh(MeshData const& data) {
+MeshHandle VkRenderer::addMesh(MeshData const& data, bool dynamic, bool trackTriangleSums) {
   Impl& g = *impl_;
   if (g.device == VK_NULL_HANDLE || data.vertices.empty() || data.indices.empty() ||
       data.indices.size() > UINT32_MAX || data.vertices.size() > UINT32_MAX) {
@@ -1601,6 +1690,9 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
   }
   record.boundsCentre = (bmin + bmax) * 0.5F;
   record.indices = data.indices;
+  record.dynamic = dynamic;
+  record.trackTriangleSums = trackTriangleSums;
+  record.vertexCount = static_cast<std::uint32_t>(data.vertices.size());
   // Validate every index (including any trailing partial triangle) before the
   // CPU mirror reads through them.
   for (std::uint32_t const index : data.indices) {
@@ -1609,13 +1701,15 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
       return kInvalidMesh;
     }
   }
-  record.triPosSums.resize(data.indices.size() / 3U);
-  for (std::size_t t = 0; t < record.triPosSums.size(); ++t) {
-    Vec3 sum{0.0F, 0.0F, 0.0F};
-    for (std::size_t k = 0; k < 3U; ++k) {
-      sum = sum + data.vertices[data.indices[3U * t + k]].pos;
+  if (trackTriangleSums) {
+    record.triPosSums.resize(data.indices.size() / 3U);
+    for (std::size_t t = 0; t < record.triPosSums.size(); ++t) {
+      Vec3 sum{0.0F, 0.0F, 0.0F};
+      for (std::size_t k = 0; k < 3U; ++k) {
+        sum = sum + data.vertices[data.indices[3U * t + k]].pos;
+      }
+      record.triPosSums[t] = sum;
     }
-    record.triPosSums[t] = sum;
   }
   VkDeviceSize vertexBytes = sizeof(MeshVertex) * data.vertices.size();
   VkDeviceSize indexBytes = sizeof(std::uint32_t) * data.indices.size();
@@ -1662,6 +1756,25 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
     }
     return kInvalidMesh;
   }
+  // Dynamic meshes keep a dedicated host-visible staging slot for their whole
+  // lifetime. It is only written between the previous frame's fence and this
+  // frame's submit, so no in-flight transfer can be overwritten.
+  if (dynamic) {
+    ok = g.createBuffer(vertexBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        record.updateStaging, record.updateStagingMemory,
+                        &record.updateStagingMapped);
+    if (!ok) {
+      vkDestroyBuffer(g.device, stagingBuffer, nullptr);
+      vkFreeMemory(g.device, stagingMemory, nullptr);
+      vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
+      vkFreeMemory(g.device, record.vertexMemory, nullptr);
+      vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
+      vkFreeMemory(g.device, record.indexMemory, nullptr);
+      return kInvalidMesh;
+    }
+  }
 
   auto* stagingBytes = static_cast<std::uint8_t*>(stagingMapped);
   std::memcpy(stagingBytes, data.vertices.data(), static_cast<std::size_t>(vertexBytes));
@@ -1680,6 +1793,15 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
     vkFreeMemory(g.device, record.vertexMemory, nullptr);
     vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
     vkFreeMemory(g.device, record.indexMemory, nullptr);
+    if (record.updateStagingMapped != nullptr) {
+      vkUnmapMemory(g.device, record.updateStagingMemory);
+    }
+    if (record.updateStaging != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, record.updateStaging, nullptr);
+    }
+    if (record.updateStagingMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, record.updateStagingMemory, nullptr);
+    }
     return kInvalidMesh;
   }
   vkCmdCopyBuffer(g.command, stagingBuffer, record.vertexBuffer, 1, &vertexCopy);
@@ -1706,6 +1828,15 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
     vkFreeMemory(g.device, record.vertexMemory, nullptr);
     vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
     vkFreeMemory(g.device, record.indexMemory, nullptr);
+    if (record.updateStagingMapped != nullptr) {
+      vkUnmapMemory(g.device, record.updateStagingMemory);
+    }
+    if (record.updateStaging != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, record.updateStaging, nullptr);
+    }
+    if (record.updateStagingMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, record.updateStagingMemory, nullptr);
+    }
     return kInvalidMesh;
   }
   VkSubmitInfo submitInfo = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
@@ -1722,12 +1853,88 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
     vkFreeMemory(g.device, record.vertexMemory, nullptr);
     vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
     vkFreeMemory(g.device, record.indexMemory, nullptr);
+    if (record.updateStagingMapped != nullptr) {
+      vkUnmapMemory(g.device, record.updateStagingMemory);
+    }
+    if (record.updateStaging != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, record.updateStaging, nullptr);
+    }
+    if (record.updateStagingMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, record.updateStagingMemory, nullptr);
+    }
     return kInvalidMesh;
   }
 
   record.indexCount = static_cast<std::uint32_t>(data.indices.size());
   g.meshes.push_back(std::move(record));
   return static_cast<MeshHandle>(g.meshes.size() - 1U);
+}
+
+bool VkRenderer::updateMeshVertices(MeshHandle handle, std::vector<MeshVertex> const& vertices,
+                                    Vec3 const* boundsCentre) {
+  Impl& g = *impl_;
+  if (g.device == VK_NULL_HANDLE || handle == kInvalidMesh || handle >= g.meshes.size()) {
+    return false;
+  }
+  Impl::MeshRecord& record = g.meshes[handle];
+  if (!record.dynamic || record.updateStaging == VK_NULL_HANDLE ||
+      vertices.size() != record.vertexCount || record.indices.size() % 3U != 0U) {
+    return false;
+  }
+  for (MeshVertex const& vertex : vertices) {
+    if (!std::isfinite(vertex.pos.x) || !std::isfinite(vertex.pos.y) ||
+        !std::isfinite(vertex.pos.z) || !std::isfinite(vertex.normal.x) ||
+        !std::isfinite(vertex.normal.y) || !std::isfinite(vertex.normal.z)) {
+      return false;
+    }
+  }
+
+  Vec3 centre{};
+  if (boundsCentre != nullptr) {
+    centre = *boundsCentre;
+  } else {
+    Vec3 bmin = vertices.front().pos;
+    Vec3 bmax = bmin;
+    for (MeshVertex const& vertex : vertices) {
+      bmin.x = std::min(bmin.x, vertex.pos.x);
+      bmin.y = std::min(bmin.y, vertex.pos.y);
+      bmin.z = std::min(bmin.z, vertex.pos.z);
+      bmax.x = std::max(bmax.x, vertex.pos.x);
+      bmax.y = std::max(bmax.y, vertex.pos.y);
+      bmax.z = std::max(bmax.z, vertex.pos.z);
+    }
+    centre = (bmin + bmax) * 0.5F;
+  }
+  if (!std::isfinite(centre.x) || !std::isfinite(centre.y) || !std::isfinite(centre.z)) {
+    return false;
+  }
+  // The blend item-order key must follow the moving surface, or a skinned
+  // character sorts against its bind pose.
+  record.boundsCentre = centre;
+  if (record.trackTriangleSums) {
+    for (std::size_t t = 0; t < record.triPosSums.size(); ++t) {
+      Vec3 sum{0.0F, 0.0F, 0.0F};
+      for (std::size_t k = 0; k < 3U; ++k) {
+        std::uint32_t const index = record.indices[3U * t + k];
+        if (index >= vertices.size()) {
+          return false;
+        }
+        sum = sum + vertices[index].pos;
+      }
+      record.triPosSums[t] = sum;
+    }
+  }
+  record.pendingVertices = vertices;
+  record.updatePending = true;
+  // The per-triangle depth order of a blended skinned mesh changes when its
+  // vertices move; the view/model-keyed reuse cache must not keep the old
+  // sorted index buffer.
+  for (Impl::BlendScratch& slot : g.blendScratch) {
+    if (slot.lastMesh == handle) {
+      slot.hasSort = false;
+    }
+  }
+  return true;
 }
 
 MeshHandle VkRenderer::updateHandMesh(std::size_t slot, MeshData const& data) {

@@ -23,9 +23,10 @@ struct NodeVisual {
   float normalScale{1.0F};
   Aabb localBounds{{-0.5F, -0.5F, -0.5F}, {0.5F, 0.5F, 0.5F}};
   // Exact picking triangles (node-local); shared between visuals that loaded
-  // the same mesh. Null for box-shaped visuals (demo cubes), where the bounds
+  // the same mesh. A skinned instance owns its geometry and rewrites it as the
+  // skeleton moves. Null for box-shaped visuals (demo cubes), where the bounds
   // are the shape.
-  std::shared_ptr<const PickGeometry> pickGeometry;
+  std::shared_ptr<PickGeometry> pickGeometry;
   Vec3 colour{1.0F, 1.0F, 1.0F};
   float alphaFactor{1.0F};
   AlphaMode alpha{AlphaMode::Opaque};

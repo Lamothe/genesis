@@ -38,6 +38,7 @@
 #include "obj.h"
 #include "picking.h"
 #include "scene.h"
+#include "skin.h"
 #include "undo.h"
 #include "vk_renderer.h"
 
@@ -171,9 +172,30 @@ struct App;
 bool smokeHandEditing(App& app, VkRenderer& renderer);
 inline MeshHandle cachedMesh(App& app, VkRenderer& renderer, MeshData const& data);
 
+// One animated skinned primitive. The rest mesh is copied for this instance
+// (two placed copies of a character must deform independently), while the GPU
+// mesh is a per-instance dynamic registration that is updated in place.
+struct SkinnedMeshBinding {
+  std::size_t skin{0}; // index into AnimationInstance::model.skins
+  NodeId visual{kInvalidNode};
+  NodeId skinNodeId{kInvalidNode};
+  MeshHandle mesh{kInvalidMesh};
+  std::shared_ptr<PickGeometry> pickGeometry;
+  ModelMesh rest; // rest vertices/indices plus that primitive's skin weights
+  MeshData deformed;
+  std::vector<Mat4> jointMatrices;
+  std::vector<Mat4> jointWorlds;       // scratch, reused every frame
+  std::vector<Mat4> lastJointMatrices; // empty = never uploaded
+  bool warnedUpload{false};
+  bool warnedDeform{false};
+};
+
 struct AnimationInstance {
-  Model model; // nodes and clips only; mesh/image payload is not retained
+  // Nodes, skins and the selected clip. Mesh payloads are retained only for
+  // the skinned bindings below.
+  Model model;
   std::vector<NodeId> nodes;
+  std::vector<SkinnedMeshBinding> skins;
   double elapsed{0};
   float duration{0};
 };
@@ -393,7 +415,7 @@ void buildDemoScene(App& app) {
 // Adds a loaded model's meshes and node hierarchy to the scene and visuals.
 // Node-local picking triangles derived from loaded mesh data, shared per mesh
 // so meshes referenced by several nodes cost one copy.
-std::shared_ptr<const vredit::PickGeometry> makePickGeometry(MeshData const& data) {
+std::shared_ptr<vredit::PickGeometry> makePickGeometry(MeshData const& data) {
   auto geometry = std::make_shared<vredit::PickGeometry>();
   geometry->positions.reserve(data.vertices.size());
   for (MeshVertex const& vertex : data.vertices) {
@@ -401,6 +423,59 @@ std::shared_ptr<const vredit::PickGeometry> makePickGeometry(MeshData const& dat
   }
   geometry->indices = data.indices;
   return geometry;
+}
+
+// Skeletal clips are the useful default when a file carries both a working
+// animation and an unrelated object/rigid clip: prefer the first clip that
+// targets a skin joint, then fall back to the first playable clip (the old
+// behaviour for unrigged models).
+bool clipTargetsJoint(AnimationClip const& clip, std::vector<bool> const& jointNodes) {
+  for (AnimationChannel const& channel : clip.channels) {
+    if (channel.node < jointNodes.size() && jointNodes[channel.node]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+AnimationClip const* chooseAnimationClip(Model const& model) {
+  std::vector<bool> jointNodes(model.nodes.size(), false);
+  for (ModelSkin const& skin : model.skins) {
+    for (std::int32_t const joint : skin.joints) {
+      if (joint >= 0 && static_cast<std::size_t>(joint) < jointNodes.size()) {
+        jointNodes[static_cast<std::size_t>(joint)] = true;
+      }
+    }
+  }
+  for (AnimationClip const& clip : model.clips) {
+    if (!clip.channels.empty() && clipTargetsJoint(clip, jointNodes)) {
+      return &clip;
+    }
+  }
+  for (AnimationClip const& clip : model.clips) {
+    if (!clip.channels.empty()) {
+      return &clip;
+    }
+  }
+  return nullptr;
+}
+
+// Every non-zero influence must name a joint inside the skin. A file whose
+// weights reference a joint the skin does not own cannot be skinned faithfully
+// (the deformer would silently drop the influence and renormalise the rest), so
+// the primitive is treated as rigid instead. Checked once at placement.
+
+// The live visual for a scene node, if any (skinned bounds/pick geometry are
+// per instance and mutate every animated frame). Visuals are a flat vector;
+// models have tens to a few hundred parts, so a linear scan is cheap next to
+// the deformation it follows.
+NodeVisual* findVisual(App& app, NodeId id) {
+  for (NodeVisual& visual : app.visuals) {
+    if (visual.id == id) {
+      return &visual;
+    }
+  }
+  return nullptr;
 }
 
 // The insertion itself: copies mesh/pick data and allocates, so it CAN throw
@@ -411,15 +486,77 @@ bool addModelToSceneImpl(App& app,
                          Model const& model,
                          std::vector<NodeId>* rootsOut = nullptr,
                          bool withTextures = true) {
-  std::vector<MeshHandle> meshHandles(model.meshes.size(), 0U);
-  std::vector<std::shared_ptr<const vredit::PickGeometry>> pickGeometries(model.meshes.size());
+  AnimationClip const* playable = withTextures ? chooseAnimationClip(model) : nullptr;
+  bool animateSkins = false;
+  if (playable != nullptr) {
+    std::vector<bool> jointNodes(model.nodes.size(), false);
+    for (ModelSkin const& skin : model.skins) {
+      for (std::int32_t const joint : skin.joints) {
+        if (joint >= 0 && static_cast<std::size_t>(joint) < jointNodes.size()) {
+          jointNodes[static_cast<std::size_t>(joint)] = true;
+        }
+      }
+    }
+    animateSkins = clipTargetsJoint(*playable, jointNodes);
+  }
+
+  // A node is a skinned animated primitive when its glTF node names a valid
+  // skin and the primitive carries four-influence weights. Static skinned
+  // models (no clip, or a clip with no joint channels) keep the shared cached
+  // mesh because their bind pose never changes.
+  std::vector<bool> nodeSkinned(model.nodes.size(), false);
+  std::vector<bool> meshNeedsStatic(model.meshes.size(), false);
+  for (std::size_t n = 0; n < model.nodes.size(); ++n) {
+    ModelNode const& node = model.nodes[n];
+    bool skinned = false;
+    if (animateSkins && node.skin >= 0 && node.mesh >= 0 &&
+        static_cast<std::size_t>(node.skin) < model.skins.size() &&
+        !model.skins[static_cast<std::size_t>(node.skin)].joints.empty() &&
+        static_cast<std::size_t>(node.mesh) < model.meshes.size() &&
+        !model.meshes[static_cast<std::size_t>(node.mesh)].skinWeights.empty() &&
+        skinWeightsMatchSkin(model.meshes[static_cast<std::size_t>(node.mesh)].skinWeights,
+                             model.skins[static_cast<std::size_t>(node.skin)]) &&
+        node.skinNode >= 0 && static_cast<std::size_t>(node.skinNode) < model.nodes.size()) {
+      skinned = true;
+    }
+    nodeSkinned[n] = skinned;
+    if (node.mesh >= 0 && static_cast<std::size_t>(node.mesh) < model.meshes.size() &&
+        !skinned) {
+      meshNeedsStatic[static_cast<std::size_t>(node.mesh)] = true;
+    }
+  }
+
+  std::vector<MeshHandle> meshHandles(model.meshes.size(), kInvalidMesh);
+  std::vector<std::shared_ptr<vredit::PickGeometry>> pickGeometries(model.meshes.size());
   for (std::size_t m = 0; m < model.meshes.size(); ++m) {
+    if (!meshNeedsStatic[m]) {
+      continue; // only used by dynamic skinned nodes (or unused)
+    }
     meshHandles[m] = cachedMesh(app, renderer, model.meshes[m].data);
     if (meshHandles[m] == kInvalidMesh) {
       std::printf("mesh registration failed for mesh %zu\n", m);
       return false;
     }
     pickGeometries[m] = makePickGeometry(model.meshes[m].data);
+  }
+
+  // Register each skinned instance's mutable GPU mesh before any scene nodes
+  // exist, so a registration failure cannot leave a half-inserted model.
+  // Skinned meshes are deliberately not shared: two placed characters must
+  // deform independently, and updateMeshVertices rewrites one handle.
+  std::vector<MeshHandle> skinnedHandles(model.nodes.size(), kInvalidMesh);
+  std::vector<std::shared_ptr<vredit::PickGeometry>> skinnedPicks(model.nodes.size());
+  for (std::size_t n = 0; n < model.nodes.size(); ++n) {
+    if (!nodeSkinned[n]) {
+      continue;
+    }
+    ModelMesh const& mesh = model.meshes[static_cast<std::size_t>(model.nodes[n].mesh)];
+    skinnedHandles[n] = renderer.addMesh(mesh.data, true, mesh.alpha == AlphaMode::Blend);
+    if (skinnedHandles[n] == kInvalidMesh) {
+      std::printf("skinned mesh registration failed for node %zu\n", n);
+      return false;
+    }
+    skinnedPicks[n] = makePickGeometry(mesh.data);
   }
   std::vector<TextureHandle> textureHandles(model.textures.size(), 0U);
   for (std::size_t t = 0; withTextures && t < model.textures.size(); ++t) {
@@ -451,6 +588,7 @@ bool addModelToSceneImpl(App& app,
   std::vector<NodeId> handles(model.nodes.size(), kInvalidNode);
   std::uint32_t const modelGroup = app.nextModelGroup++;
   std::vector<NodeId> createdRoots; // top-level nodes created so far (rollback)
+  std::vector<SkinnedMeshBinding> bindings;
   try {
   for (std::size_t n = 0; n < model.nodes.size(); ++n) {
     ModelNode const& node = model.nodes[n];
@@ -467,11 +605,12 @@ bool addModelToSceneImpl(App& app,
     app.modelGroups.push_back({id, modelGroup}); // one file = one model
     if (node.mesh >= 0 && static_cast<std::size_t>(node.mesh) < model.meshes.size()) {
       ModelMesh const& mesh = model.meshes[static_cast<std::size_t>(node.mesh)];
+      bool const skinned = nodeSkinned[n];
       NodeVisual visual;
       visual.id = id;
-      visual.mesh = meshHandles[static_cast<std::size_t>(node.mesh)];
+      visual.mesh = skinned ? skinnedHandles[n] : meshHandles[static_cast<std::size_t>(node.mesh)];
       visual.localBounds = meshBounds(mesh.data);
-      visual.pickGeometry = pickGeometries[static_cast<std::size_t>(node.mesh)];
+      visual.pickGeometry = skinned ? skinnedPicks[n] : pickGeometries[static_cast<std::size_t>(node.mesh)];
       visual.colour = mesh.colour;
       visual.alphaFactor = mesh.alphaFactor;
       visual.alpha = mesh.alpha;
@@ -489,16 +628,29 @@ bool addModelToSceneImpl(App& app,
         visual.normalScale = mesh.normalScale;
       }
       app.visuals.push_back(visual);
+      if (skinned) {
+        SkinnedMeshBinding binding;
+        binding.skin = static_cast<std::size_t>(node.skin);
+        binding.visual = id;
+        binding.skinNodeId = handles[static_cast<std::size_t>(node.skinNode)];
+        binding.mesh = skinnedHandles[n];
+        binding.pickGeometry = skinnedPicks[n];
+        binding.rest = mesh; // rest vertices/indices + this primitive's weights
+        binding.deformed = binding.rest.data;
+        binding.jointMatrices.reserve(
+            model.skins[static_cast<std::size_t>(node.skin)].joints.size());
+        bindings.push_back(std::move(binding));
+      }
     }
   }
-  auto const playable = std::find_if(model.clips.begin(), model.clips.end(),
-      [](AnimationClip const& clip) { return !clip.channels.empty(); });
-  if (withTextures && playable != model.clips.end()) {
+  if (withTextures && playable != nullptr) {
 
     AnimationInstance instance;
     instance.model.nodes = model.nodes;
+    instance.model.skins = model.skins;
     instance.model.clips.push_back(*playable);
     instance.nodes = handles;
+    instance.skins = std::move(bindings);
     for (auto const& channel : instance.model.clips.front().channels) {
       if (!channel.times.empty()) { instance.duration = std::fmax(instance.duration, channel.times.back()); }
     }
@@ -514,7 +666,78 @@ bool addModelToSceneImpl(App& app,
 
 }
 
-void tickAnimations(App& app, float dt) {
+// CPU skinning is the renderer-independent choice for this MVP: glTF weights
+// are standard CPU data, exact picking and bounds need the deformed vertices
+// anyway, and the upload goes through the renderer's fence-safe dynamic path
+// rather than a per-frame vkDeviceWaitIdle. The pose is sampled once per XR
+// frame (not once per eye), so stereo views see the same geometry.
+void updateSkinnedInstance(App& app, VkRenderer& renderer, AnimationInstance& instance) {
+  for (SkinnedMeshBinding& binding : instance.skins) {
+    if (!app.scene.valid(binding.visual) || !app.scene.valid(binding.skinNodeId) ||
+        binding.skin >= instance.model.skins.size()) {
+      continue;
+    }
+    ModelSkin const& skin = instance.model.skins[binding.skin];
+    binding.jointWorlds.clear();
+    binding.jointWorlds.reserve(skin.joints.size());
+    bool jointsAlive = true;
+    for (std::int32_t const joint : skin.joints) {
+      if (joint < 0 || static_cast<std::size_t>(joint) >= instance.nodes.size() ||
+          !app.scene.valid(instance.nodes[static_cast<std::size_t>(joint)])) {
+        jointsAlive = false;
+        break;
+      }
+      binding.jointWorlds.push_back(
+          app.scene.world(instance.nodes[static_cast<std::size_t>(joint)]));
+    }
+    if (!jointsAlive) {
+      continue; // a deleted joint: freeze the last valid pose until undo
+    }
+    Mat4 const meshWorld = app.scene.world(binding.skinNodeId);
+    if (!computeSkinMatrices(skin, meshWorld, binding.jointWorlds,
+                             binding.jointMatrices)) {
+      continue;
+    }
+    if (sameSkinMatrices(binding.jointMatrices, binding.lastJointMatrices)) {
+      continue; // static key, paused clip or a whole-model move (cancels out)
+    }
+    Aabb deformedBounds{};
+    if (!deformSkinnedMesh(binding.rest.data, binding.rest.skinWeights,
+                           binding.jointMatrices, binding.deformed, &deformedBounds)) {
+      if (!binding.warnedDeform) {
+        std::printf("skinned mesh deformation failed for visual %u; keeping last pose\n",
+                    static_cast<unsigned>(binding.visual));
+        binding.warnedDeform = true;
+      }
+      continue;
+    }
+    Vec3 const deformedCentre = (deformedBounds.min + deformedBounds.max) * 0.5F;
+    if (!renderer.updateMeshVertices(binding.mesh, binding.deformed.vertices,
+                                     &deformedCentre)) {
+      if (!binding.warnedUpload) {
+        std::printf("skinned mesh upload failed for visual %u; keeping last pose\n",
+                    static_cast<unsigned>(binding.visual));
+        binding.warnedUpload = true;
+      }
+      continue;
+    }
+    binding.lastJointMatrices = binding.jointMatrices;
+    NodeVisual* visual = findVisual(app, binding.visual);
+    if (visual != nullptr) {
+      visual->localBounds = deformedBounds;
+    }
+    if (binding.pickGeometry != nullptr) {
+      if (binding.pickGeometry->positions.size() != binding.deformed.vertices.size()) {
+        binding.pickGeometry->positions.resize(binding.deformed.vertices.size());
+      }
+      for (std::size_t v = 0; v < binding.deformed.vertices.size(); ++v) {
+        binding.pickGeometry->positions[v] = binding.deformed.vertices[v].pos;
+      }
+    }
+  }
+}
+
+void tickAnimations(App& app, VkRenderer& renderer, float dt) {
   app.animations.erase(std::remove_if(app.animations.begin(), app.animations.end(),
       [&](AnimationInstance const& instance) {
         for (auto id : instance.nodes) { if (app.scene.valid(id)) { return false; } }
@@ -543,6 +766,9 @@ void tickAnimations(App& app, float dt) {
       Mat4 inverseRest;
       if (!invertAffine(toMatrix(instance.model.nodes[index].local), inverseRest)) { continue; }
       app.scene.setPoseOffset(instance.nodes[index], mul(inverseRest, toMatrix(pose[index])));
+    }
+    if (!instance.skins.empty()) {
+      updateSkinnedInstance(app, renderer, instance);
     }
   }
 }
@@ -1357,7 +1583,7 @@ bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
   }
   // The selection ray hits the preview, not a floor target. Place under the
   // stationary centre preview instead of extending shallow rays to infinity.
-  tickAnimations(app, 0.0F);
+  tickAnimations(app, renderer, 0.0F);
   auto target = app.ring.slotPose(index, app.ringOrigin, app.ringForward).position;
   target.y = 0.0F;
   vredit::placeOnFloor(app.scene, app.visuals, roots, target);
@@ -2626,6 +2852,236 @@ int runPerfSmoke(char const* shaderDir, std::vector<char const*> const& modelPat
   return 0;
 }
 
+// Measures the per-frame CPU cost of the skinning path at realistic vertex
+// counts (the largest library characters carry 1.0-1.7 M vertices). Reports
+// measured milliseconds only; no projections.
+int runBenchSkin(char const* shaderDir) {
+  VkRenderer renderer;
+  VkRenderer::Config config;
+  config.windowed = false;
+  config.width = 320U;
+  config.height = 240U;
+  config.shaderDir = shaderDir;
+  if (!renderer.init(config)) {
+    std::printf("BENCH FAIL: renderer init\n");
+    return 1;
+  }
+  constexpr std::size_t counts[] = {100000U, 300000U, 1200000U};
+  constexpr int iterations = 5;
+  for (std::size_t const count : counts) {
+    MeshData rest;
+    rest.vertices.resize(count);
+    for (std::size_t v = 0; v < count; ++v) {
+      float const x = static_cast<float>(v % 1000U) * 0.001F;
+      float const y = static_cast<float>((v / 1000U) % 1000U) * 0.001F;
+      rest.vertices[v].pos = {x, y, 0.5F};
+      rest.vertices[v].normal = {0.0F, 0.0F, 1.0F};
+      rest.vertices[v].colour = {1.0F, 1.0F, 1.0F};
+      rest.vertices[v].uv = {x, y};
+    }
+    rest.indices.resize((count / 4U) * 6U);
+    for (std::size_t q = 0; q < count / 4U; ++q) {
+      std::uint32_t const base = static_cast<std::uint32_t>(q * 4U);
+      std::uint32_t* out = rest.indices.data() + q * 6U;
+      out[0] = base;
+      out[1] = base + 1U;
+      out[2] = base + 2U;
+      out[3] = base + 2U;
+      out[4] = base + 1U;
+      out[5] = base + 3U;
+    }
+    std::vector<SkinVertexWeight> weights(count);
+    for (SkinVertexWeight& weight : weights) {
+      weight.joints = {0, 0, 0, 0};
+      weight.weights = {1.0F, 0.0F, 0.0F, 0.0F};
+    }
+    Mat4 const joint =
+        mul(translationMatrix({0.1F, 0.0F, 0.0F}),
+            rotationMatrix(quatFromAxisAngle({0.0F, 0.0F, 1.0F}, 0.35F)));
+    MeshData deformed = rest;
+    auto bench = [&](auto&& body) {
+      auto const start = std::chrono::steady_clock::now();
+      for (int i = 0; i < iterations; ++i) {
+        body();
+      }
+      double const total =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+              .count();
+      return total / iterations;
+    };
+    double const deformMs =
+        bench([&] { (void)deformSkinnedMesh(rest, weights, {joint}, deformed); });
+    MeshHandle const handle = renderer.addMesh(rest, true, false); // opaque: no sort keys
+    Aabb benchBounds{};
+    (void)deformSkinnedMesh(rest, weights, {joint}, deformed, &benchBounds);
+    Vec3 const benchCentre = (benchBounds.min + benchBounds.max) * 0.5F;
+    double const uploadMs = handle == kInvalidMesh
+                                ? -1.0
+                                : bench([&] {
+                                    (void)renderer.updateMeshVertices(
+                                        handle, deformed.vertices, &benchCentre);
+                                  });
+    std::printf("BENCH skin %zu verts (%zu tris): deform %.2f ms, queue upload %.2f ms "
+                "(single-threaded CPU)\n",
+                count, rest.indices.size() / 3U, deformMs, uploadMs);
+  }
+  renderer.shutdown();
+  return 0;
+}
+
+// End-to-end skinned-character smoke. Uses the synthetic two-joint GLB
+// written by run-tests.sh (test-animation): rest is a tall strip, half of it
+// bound to a joint that the clip swings. Verifies the CPU-deformed vertices,
+// per-instance dynamic handles, moved bounds/pick geometry and a visibly
+// changed rendered frame. Headset stereo is not emulated here.
+int runSmokeSkinned(char const* shaderDir) {
+  constexpr std::uint32_t width = 640U;
+  constexpr std::uint32_t height = 480U;
+  App app;
+  app.width = width;
+  app.height = height;
+
+  VkRenderer renderer;
+  VkRenderer::Config config;
+  config.windowed = false;
+  config.width = width;
+  config.height = height;
+  config.shaderDir = shaderDir;
+  if (!renderer.init(config)) {
+    std::printf("SMOKE FAIL: renderer init\n");
+    return 1;
+  }
+
+  Model model;
+  std::string error;
+  if (!loadModelFile(".build/test-skinned.glb", model, error)) {
+    std::printf("SMOKE FAIL: load .build/test-skinned.glb (%s); run run-tests.sh first\n",
+                error.c_str());
+    renderer.shutdown();
+    return 1;
+  }
+  std::vector<NodeId> roots;
+  if (!addModelToScene(app, renderer, model, &roots)) {
+    std::printf("SMOKE FAIL: add skinned model\n");
+    renderer.shutdown();
+    return 1;
+  }
+  Model second;
+  std::string secondError;
+  std::vector<NodeId> secondRoots;
+  if (!loadModelFile(".build/test-skinned.glb", second, secondError) ||
+      !addModelToScene(app, renderer, second, &secondRoots)) {
+    std::printf("SMOKE FAIL: add second skinned instance\n");
+    renderer.shutdown();
+    return 1;
+  }
+  for (NodeId root : secondRoots) {
+    Transform t = app.scene.local(root);
+    t.translation.x += 3.0F;
+    app.scene.setLocal(root, t);
+  }
+
+  if (app.animations.size() != 2U || app.animations[0].skins.size() != 1U ||
+      app.animations[1].skins.size() != 1U) {
+    std::printf("SMOKE FAIL: skinned bindings missing (%zu animations)\n",
+                app.animations.size());
+    renderer.shutdown();
+    return 1;
+  }
+  if (app.animations[0].skins[0].mesh == app.animations[1].skins[0].mesh) {
+    std::printf("SMOKE FAIL: two instances share one dynamic mesh handle\n");
+    renderer.shutdown();
+    return 1;
+  }
+
+  app.camera.position = {0.0F, 0.9F, 3.2F};
+  app.camera.yaw = 0.0F;
+  app.camera.pitch = 0.0F;
+  auto frame = [&](std::vector<std::uint8_t>& pixels) {
+    std::vector<DrawItem> items;
+    std::vector<RendererVertex> depthLines;
+    std::vector<RendererVertex> overlayLines;
+    assembleFrame(app, items, depthLines, overlayLines);
+    return renderer.draw(app.camera, items, depthLines, overlayLines) &&
+           renderer.readback(pixels) && writePpm(".build/smoke-skinned.ppm", pixels, width, height);
+  };
+
+  tickAnimations(app, renderer, 0.0F);
+  std::vector<std::uint8_t> restPixels;
+  if (!frame(restPixels)) {
+    std::printf("SMOKE FAIL: rest frame\n");
+    renderer.shutdown();
+    return 1;
+  }
+  SkinnedMeshBinding& binding = app.animations[0].skins[0];
+  Vec3 const restTop = binding.deformed.vertices[2].pos;
+  if (std::fabs(restTop.y - 1.5F) > 0.001F || std::fabs(restTop.x + 0.5F) > 0.001F) {
+    std::printf("SMOKE FAIL: bind pose is not the rest strip (%.3f, %.3f)\n", restTop.x,
+                restTop.y);
+    renderer.shutdown();
+    return 1;
+  }
+  NodeVisual* visual = findVisual(app, binding.visual);
+  if (visual == nullptr || binding.pickGeometry == nullptr) {
+    std::printf("SMOKE FAIL: skinned visual/pick geometry missing\n");
+    renderer.shutdown();
+    return 1;
+  }
+  Vec3 const pickBefore = binding.pickGeometry->positions[3];
+
+  tickAnimations(app, renderer, 0.5F);
+  Vec3 const movedTop = binding.deformed.vertices[2].pos;
+  SkinnedMeshBinding& secondBinding = app.animations[1].skins[0];
+  Vec3 const secondTop = secondBinding.deformed.vertices[2].pos;
+  if (&secondBinding.deformed == &binding.deformed ||
+      std::fabs(secondTop.x - restTop.x) < 0.05F ||
+      std::fabs(secondTop.y - restTop.y) < 0.05F) {
+    std::printf("SMOKE FAIL: second instance did not deform independently\n");
+    renderer.shutdown();
+    return 1;
+  }
+  if (std::fabs(movedTop.x - restTop.x) < 0.05F || std::fabs(movedTop.y - restTop.y) < 0.05F) {
+    std::printf("SMOKE FAIL: animated joint did not deform the mesh (%.3f, %.3f)\n",
+                movedTop.x, movedTop.y);
+    renderer.shutdown();
+    return 1;
+  }
+  Vec3 const pickAfter = binding.pickGeometry->positions[3];
+  if (!(visual->localBounds.max.y > 1.55F) ||
+      std::fabs(pickAfter.x - pickBefore.x) < 0.01F ||
+      std::fabs(pickAfter.y - pickBefore.y) < 0.01F || pickAfter.y < 1.55F) {
+    std::printf("SMOKE FAIL: skinned bounds/picking did not follow the pose\n");
+    renderer.shutdown();
+    return 1;
+  }
+  std::vector<std::uint8_t> movedPixels;
+  if (!frame(movedPixels)) {
+    std::printf("SMOKE FAIL: animated frame\n");
+    renderer.shutdown();
+    return 1;
+  }
+  std::size_t changed = 0;
+  for (std::size_t i = 0; i < restPixels.size(); i += 4U) {
+    if (std::abs(static_cast<int>(restPixels[i]) - static_cast<int>(movedPixels[i])) > 8 ||
+        std::abs(static_cast<int>(restPixels[i + 1U]) - static_cast<int>(movedPixels[i + 1U])) > 8 ||
+        std::abs(static_cast<int>(restPixels[i + 2U]) - static_cast<int>(movedPixels[i + 2U])) > 8) {
+      ++changed;
+    }
+  }
+  if (changed < 200U) {
+    std::printf("SMOKE FAIL: animated frame barely changed (%zu pixels)\n", changed);
+    renderer.shutdown();
+    return 1;
+  }
+
+  std::printf("SMOKE skinned: bind -> animated, bounds/pick moved, %zu pixels changed -> "
+              ".build/smoke-skinned.ppm\n", changed);
+  std::printf("SMOKE PASS (skinned CPU deformation + dynamic GPU upload) on %s\n",
+              renderer.deviceName());
+  renderer.shutdown();
+  return 0;
+}
+
 // Interactive or smoke VR session through the OpenXR shell. Returns 0 when no
 // runtime/headset is available (nothing to test against), 2 on setup failure.
 // Hand-only editing: capture world matrices of the topmost selected nodes.
@@ -3534,7 +3990,7 @@ int runXr(char const* shaderDir,
     selectionLatch.advance(dt); // use elapsed time, not the animation timestep clamp
     dt = dt > 0.1F ? 0.1F : dt;
 
-    tickAnimations(app, dt);
+    tickAnimations(app, renderer, dt);
 
     // No flight controls: passthrough means you walk in the real world with
     // the models placed in it — the sticks' flight/turn bindings were removed
@@ -4331,7 +4787,7 @@ int runInteractive(char const* shaderDir,
     if (dt > 0.1F) {
       dt = 0.1F; // tab stalls must not teleport the camera
     }
-    tickAnimations(app, dt);
+    tickAnimations(app, renderer, dt);
     updateFlight(app, dt);
     updateArrowEdit(app, dt); // arrow keys mirror the sticks (edit the selection)
     galleryTick(app, renderer, dt, app.camera.position, cameraForward(app.camera));
@@ -4368,6 +4824,8 @@ int main(int argc, char** argv) {
     SmokeBlend,
     SmokeWindow,
     SmokePerf,
+    SmokeSkinned,
+    BenchSkin,
     Xr,
     SmokeXr
   };
@@ -4391,6 +4849,10 @@ int main(int argc, char** argv) {
       mode = Mode::SmokeBlend;
     } else if (std::strcmp(arg, "--smoke-perf") == 0) {
       mode = Mode::SmokePerf;
+    } else if (std::strcmp(arg, "--smoke-skinned") == 0) {
+      mode = Mode::SmokeSkinned;
+    } else if (std::strcmp(arg, "--bench-skin") == 0) {
+      mode = Mode::BenchSkin;
     } else if (std::strcmp(arg, "--smoke-window") == 0) {
       mode = Mode::SmokeWindow;
       if (i + 1 < argc) {
@@ -4418,7 +4880,8 @@ int main(int argc, char** argv) {
       std::printf(
           "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR] [--library DIR]\n"
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
-          "                 --smoke-blend | --smoke-perf | --smoke-xr |\n"
+          "                 --smoke-blend | --smoke-perf | --smoke-skinned | --bench-skin |\n"
+      "                 --smoke-xr |\n"
           "                 --smoke-window [FRAMES]]\n"
           "keys: WASD/QE fly (RMB look), arrows edit: left/right = X (scale in\n"
           "      move mode, spin in rotate), up/down = Y (height / tip),\n"
@@ -4471,6 +4934,10 @@ int main(int argc, char** argv) {
     return runSmokeWindow(shaderDir, frames, modelPaths);
   case Mode::SmokePerf:
     return runPerfSmoke(shaderDir, modelPaths);
+  case Mode::SmokeSkinned:
+    return runSmokeSkinned(shaderDir);
+  case Mode::BenchSkin:
+    return runBenchSkin(shaderDir);
   default:
     return runInteractive(shaderDir, modelPaths, libraryDir);
   }
