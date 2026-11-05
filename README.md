@@ -94,8 +94,11 @@ buttons and sticks are unchanged:
 - While holding a right-hand grab, pinch and hold with the left hand and vary
   the distance between the palms to scale uniformly about the model's centre.
   Releasing either hand ends the edit; release the right hand before another
-  edit. Both hands' tracked joints are drawn as overlay skeletons so models
-  cannot hide them.
+  edit. Both hands are shown as tracked, procedurally generated 3D surfaces
+  over models; they are not the downloaded rigged asset.
+- After selecting a model, bring the right hand near its surface and close it
+  to grab and rotate it directly; opening the hand releases it. This uses the
+  runtime grasp gesture and does not provide collision or haptic resistance.
 - The hand menu offers **Models**, **Undo**, **Redo**, **Delete** and
   **Backdrop**. Delete requires a 0.6 s hold with red charge feedback.
   A held menu interaction stays captured until release.
@@ -105,7 +108,7 @@ buttons and sticks are unchanged:
 - Tracking loss or a skipped/paused XR frame ends the current hand edit;
   release the pinch before starting again. Aim-and-pinch select/place remains
   available without joint tracking, but grab/rotation and the palm-up menu
-  toggle need tracked palm joints. The console reports joint availability
+  toggle need tracked palm joints. Direct grasp also needs runtime grasp input. The console reports joint availability
   and tracking, left-pinch menu actions and tool activations.
 
 **Verification status:** build, automated hand/core tests and offscreen hand
@@ -169,10 +172,9 @@ clip selector yet.
 A comparison with Centre Stage identified the missing PBR materials,
 transmission, emissive, sRGB material pipeline and studio lighting. This change
 only fixes normal transforms and Vulkan blend-upload synchronisation; it does
-not claim Centre Stage appearance parity. Hand meshes and virtual-object contact
-are not implemented: the downloaded hand's library GLB has no skin, while the
-original archive contains a rig; tracked-joint-to-rig retargeting, depth-tested
-hand rendering and collision need further work. Passthrough does not supply real
+not claim Centre Stage appearance parity. The hands are procedural tracked surfaces, not the downloaded rig; its library
+GLB has no skin, while the original archive contains a rig. Rig retargeting and
+collision need further work. Passthrough does not supply real
 room geometry for collision.
 
 ## Design notes

@@ -32,6 +32,101 @@ bool near(Mat4 const& a, Mat4 const& b) {
   return true;
 }
 
+void graspArbitration() {
+  HandGraspGate gate;
+  HandGesture grasp;
+  auto step = [&](bool valid, float squeeze, bool pinch, bool captured, bool primed) {
+    grasp.update(valid, squeeze);
+    bool const held = handPinchHeld(valid, squeeze);
+    gate.update(valid, held, pinch, captured);
+    return gate.canAcquire(grasp.pressed(), primed);
+  };
+  CHECK(!step(true, 1, false, false, true)); // first sample cannot arm
+  CHECK(!step(true, 0, false, false, true));
+  CHECK(step(true, .8F, true, false, true)); // simultaneous: grasp wins
+  CHECK(step(true, .8F, true, false, true)); // held may enter contact later
+  CHECK(!step(false, 1, true, false, true));
+  CHECK(!step(true, 1, true, false, true)); // reacquisition needs release
+  CHECK(!step(true, 0, false, false, true));
+  CHECK(!step(true, .8F, true, false, false)); // first pinch cannot move
+  gate.reset(); grasp.reset(); // selection was made during this hold
+  CHECK(!step(true, .8F, true, false, true));
+  CHECK(!step(true, 0, true, false, true)); // both must release
+  CHECK(!step(true, .8F, false, false, true));
+  CHECK(!step(true, 0, false, false, true));
+  CHECK(!step(true, .8F, false, false, false)); // unprimed selection remains safe
+  CHECK(!step(true, .8F, true, true, true)); // UI capture owns overlap
+  CHECK(!step(true, .8F, false, false, true));
+  CHECK(!step(true, 0, false, false, true));
+  CHECK(step(true, .8F, true, false, true));
+}
+
+void contactCacheLifetime() {
+  HandContactCache cache;
+  auto geometry = std::make_shared<PickGeometry>();
+  geometry->positions = {{0,0,0},{1,0,0},{0,1,0}};
+  geometry->indices = {0,1,2};
+  std::weak_ptr<const PickGeometry> weak = geometry;
+  auto mesh = cache.get(geometry);
+  CHECK(cache.get(geometry) == mesh);
+  cache.prune();
+  CHECK(cache.size() == 1);
+  geometry.reset();
+  cache.prune(); // an external mesh still needs its geometry
+  CHECK(cache.size() == 1 && !weak.expired());
+  CHECK(mesh->near({.2F,.2F,0}, Mat4{}, .035F));
+  mesh.reset();
+  cache.prune();
+  CHECK(cache.size() == 0 && weak.expired());
+}
+
+void surfaceContact() {
+  auto g = std::make_shared<PickGeometry>();
+  g->positions = {{0,0,0},{1,0,0},{0,1,0}, {100,100,100}};
+  g->indices = {0,1,2, 0,0,0, 0,1,999}; // ignore invalid and degenerate triangles
+  HandContactMesh mesh(g);
+  CHECK(mesh.near({.2F,.2F,.03F}, Mat4{}, .035F));
+  CHECK(!mesh.near({.8F,.8F,0}, Mat4{}, .035F)); // inside bounds, outside triangle
+  CHECK(!mesh.near({.2F,.2F,.04F}, Mat4{}, .035F));
+  CHECK(mesh.near({.51F,.51F,0}, Mat4{}, .035F)); // nearest edge
+  CHECK(!mesh.near({100,100,100}, Mat4{}, .035F));
+  auto const world = mul(translationMatrix({2,3,4}),
+      mul(rotationMatrix(quatFromAxisAngle({0,1,0}, .6F)), scaleMatrix({4,.1F,2})));
+  auto const surface = transformPoint(world, {.2F,.2F,0});
+  auto const normal = rotate(quatFromAxisAngle({0,1,0}, .6F), {0,0,1});
+  CHECK(mesh.near(surface+normal*.03F, world, .035F));
+  CHECK(!mesh.near(surface+normal*.04F, world, .035F));
+  CHECK(!mesh.near(surface, scaleMatrix({0,1,1}), .035F));
+  CHECK(!mesh.near({NAN,0,0}, Mat4{}, .035F));
+  CHECK(!mesh.near({0,0,0}, Mat4{}, NAN));
+  CHECK(!mesh.near({0,0,0}, Mat4{}, -1));
+  // Exercise internal BVH traversal and rejected distant regions.
+  auto many = std::make_shared<PickGeometry>();
+  for (unsigned i = 0; i < 1000; ++i) {
+    float const x = static_cast<float>(i)*2;
+    auto const base = static_cast<unsigned>(many->positions.size());
+    many->positions.insert(many->positions.end(), {{x,0,0},{x+1,0,0},{x,1,0}});
+    many->indices.insert(many->indices.end(), {base,base+1,base+2});
+  }
+  HandContactMesh large(many);
+  CHECK(large.near({1998.2F,.2F,.02F}, Mat4{}, .035F));
+  CHECK(!large.near({1999.2F,.2F,.02F}, Mat4{}, .035F));
+  HandGesture squeeze;
+  CHECK(!squeeze.update(true, 1)); // acquisition cannot start held
+  CHECK(!squeeze.update(true, 0));
+  CHECK(squeeze.update(true, .8F));
+  CHECK(!squeeze.update(false, 1)); // readiness/tracking loss disarms
+  CHECK(!squeeze.update(true, 1));
+  CHECK(!squeeze.update(true, 0));
+  CHECK(squeeze.update(true, .8F));
+  HandPose const start{{1,2,3}, {}, true};
+  auto const turn = quatFromAxisAngle({0,1,0}, 1.0F);
+  HandPose const current{{1.1F,2.2F,3.3F}, turn, true};
+  auto const object = translationMatrix({1.2F,2,3});
+  auto const result = handGrabTransform(start, current, start.position, object);
+  CHECK(near(transformPoint(result, {}), current.position + rotate(turn, {.2F,0,0})));
+}
+
 void gestures() {
   HandGesture gesture;
   CHECK(!gesture.update(false, 0.0F));
@@ -59,6 +154,63 @@ void gestures() {
   CHECK(!gesture.update(true, 1.0F));
   CHECK(!gesture.update(true, 0.0F));
   CHECK(gesture.update(true, 0.6F));
+}
+
+void selectionGraceAndTracking() {
+  HandSelectionLatch latch;
+  HandGesture gesture;
+  CHECK(!gesture.update(true, 0));
+  CHECK(gesture.update(true, 1));
+  CHECK(!latch.startsGrab(true, true)); // first pinch cannot move anything
+  latch.selected(true);
+  CHECK(!latch.recentHit()); // selecting is not a post-release hover
+  CHECK(!gesture.update(true, 1));
+  CHECK(!gesture.update(true, 0));
+  latch.rememberHit();
+  latch.advance(.10F);
+  CHECK(latch.recentHit());
+  CHECK(gesture.update(true, 1));
+  CHECK(latch.startsGrab(false, latch.recentHit()));
+  latch.advance(.051F);
+  CHECK(!latch.recentHit());
+  CHECK(!latch.startsGrab(false, latch.recentHit()));
+  CHECK(latch.startsGrab(true)); // exact hit still works after expiry
+  latch.rememberHit();
+  latch.clearHit(); // a different closest object, UI or stick capture
+  CHECK(!latch.recentHit());
+  latch.rememberHit();
+  latch.selected(false); // selection changed/cleared
+  CHECK(!latch.startsGrab(true, latch.recentHit()));
+  latch.selected(true);
+  latch.rememberHit();
+  latch.advance(std::numeric_limits<float>::quiet_NaN());
+  CHECK(!latch.recentHit());
+  latch.rememberHit();
+  latch.reset(); // tracking interruption requires new selection
+  CHECK(!latch.recentHit());
+  CHECK(!latch.startsGrab(true));
+
+  // Aim loss during a held pinch must not reset the gesture. Pinch action or
+  // palm tracking loss still stops edits and requires release to re-arm.
+  HandGesture held;
+  CHECK(!held.update(handPinchSignal(true, true, 0), 0));
+  CHECK(held.update(handPinchSignal(true, true, .8F), .8F));
+  bool const aimValid = false;
+  CHECK(!aimValid && handPinchHeld(handPinchSignal(true, true, .8F), .8F));
+  CHECK(!held.update(handPinchSignal(true, true, .8F), .8F));
+  CHECK(held.pressed());
+  CHECK(!handPinchHeld(handPinchSignal(true, false, .8F), .8F));
+  CHECK(!held.update(handPinchSignal(true, false, .8F), .8F));
+  CHECK(!held.update(handPinchSignal(true, true, .8F), .8F));
+  CHECK(!held.update(handPinchSignal(true, true, 0), 0));
+  CHECK(held.update(handPinchSignal(true, true, .8F), .8F));
+  held.reset(); // palm tracking loss during grab
+  CHECK(!held.update(true, .8F));
+  CHECK(!held.update(true, 0));
+  CHECK(held.update(true, .8F));
+  auto const nan = std::numeric_limits<float>::quiet_NaN();
+  CHECK(!handPinchHeld(handPinchSignal(true, true, nan), nan));
+  CHECK(!handPinchSignal(false, true, .8F));
 }
 
 void carouselDirections() {
@@ -298,7 +450,11 @@ int main() {
   CHECK(smoothHandPose(smoothed, tiny, .01F).position.x > smoothed.position.x);
   CHECK(handScaleRatio(.2F, .4F) == 2.0F);
   CHECK(handScaleRatio(.0F, .4F) == 1.0F);
+  graspArbitration();
+  contactCacheLifetime();
+  surfaceContact();
   gestures();
+  selectionGraceAndTracking();
 
   carouselDirections();
   panels();

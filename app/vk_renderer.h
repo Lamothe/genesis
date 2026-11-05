@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -40,6 +41,20 @@ public:
   // Registers static mesh data and returns a handle (0 is the built-in cube).
   // Safe to call at any time; internally synchronises with in-flight frames.
   MeshHandle addMesh(MeshData const& data);
+
+  // Two reusable opaque hand meshes, drawn on top of the scene with depth
+  // testing among hand triangles and slots. slot is 0 (left) or 1
+  // (right); each has a stable handle and fixed capacity. The caller adds a
+  // DrawItem with that handle to each eye/frame; its material is forced opaque.
+  // The hand pass clears scene depth after scene geometry and depth lines;
+  // overlay lines still draw on top. Hands remain clip-volume limited. Empty
+  // vertex and index arrays clear the slot. Invalid input or a
+  // Vulkan failure returns kInvalidMesh and leaves the previous data intact.
+  // Update is fence-synchronised; call on the renderer thread, before drawing.
+  static constexpr std::size_t kHandMeshSlots = 2U;
+  static constexpr std::size_t kHandMeshMaxVertices = 65536U;
+  static constexpr std::size_t kHandMeshMaxIndices = 196608U;
+  MeshHandle updateHandMesh(std::size_t slot, MeshData const& data);
 
   // Registers an RGBA8 texture and returns a handle (0 is the built-in white
   // fallback). Up to 256 textures; safe to call at any time.

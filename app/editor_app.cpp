@@ -32,6 +32,7 @@
 #include "editor_state.h"
 #include "gizmo.h"
 #include "gltf.h"
+#include "hand_mesh.h"
 #include "mesh.h"
 #include "obj.h"
 #include "picking.h"
@@ -232,6 +233,8 @@ struct App {
   // Stick-driven editing (VR): one undo step per stick gesture — begun on the
   // first deflection past the dead zone, committed when the sticks settle.
   bool handGrab{false};
+  bool physicalGrab{false};
+  HandContactCache handContactCache;
   HandPose grabStart{};
   HandPose grabFiltered{};
   HandPose scaleLeftFiltered{};
@@ -718,6 +721,7 @@ void pointerPress(App& app, PointerTarget const& target, bool partSelect) {
 void cancelLiveEdit(App& app) {
   app.stickSession = false;
   app.handGrab = false;
+  app.physicalGrab = false;
   app.handScaling = false;
   app.handTool = -1;
   // Disarm the sticks exactly like the apply paths: a held stick would
@@ -742,6 +746,7 @@ bool endEdits(App& app) {
   bool const wasActive = app.stickSession || app.handGrab || app.handTool >= 2;
   app.stickSession = false;
   app.handGrab = false;
+  app.physicalGrab = false;
   app.handScaling = false;
   app.handTool = -1;
   app.stickArmed = false;
@@ -2400,6 +2405,54 @@ int runPerfSmoke(char const* shaderDir, std::vector<char const*> const& modelPat
 // Hand-only editing: capture world matrices of the topmost selected nodes.
 // Children ride along once; converting through the current parent keeps part
 // selections correct without applying a hierarchy transform twice.
+// Only selected subtrees can supply contact. Built-in cubes really are boxes;
+// imported meshes always use their triangles, never their bounding box.
+bool selectedHandContact(App& app, XrFrameInput const& input, Mat4 const& rigWorld) {
+  constexpr int joints[] = {0, 5, 10, 15, 20, 25}; // palm and fingertip joints
+  constexpr float distance = .035F;
+  static auto const cube = [] {
+    auto g = std::make_shared<PickGeometry>();
+    g->positions = {{-.5F,-.5F,-.5F},{.5F,-.5F,-.5F},{.5F,.5F,-.5F},{-.5F,.5F,-.5F},
+                    {-.5F,-.5F,.5F},{.5F,-.5F,.5F},{.5F,.5F,.5F},{-.5F,.5F,.5F}};
+    g->indices = {0,1,2,0,2,3,4,6,5,4,7,6,0,4,5,0,5,1,
+                  3,2,6,3,6,7,0,3,7,0,7,4,1,5,6,1,6,2};
+    return std::make_shared<HandContactMesh>(g);
+  }();
+  for (auto const& visual : app.visuals) {
+    auto node = visual.id;
+    while (node != kInvalidNode && std::find(app.selection.begin(), app.selection.end(), node) == app.selection.end()) {
+      node = app.scene.parent(node);
+    }
+    if (node == kInvalidNode) { continue; }
+    auto const world = app.scene.world(visual.id);
+    // Reject distant nodes before building or traversing their BVH.
+    Mat4 inverse;
+    if (!invertAffine(world, inverse)) { continue; }
+    float norm2 = 0;
+    for (int col = 0; col < 3; ++col) {
+      for (int row = 0; row < 3; ++row) { norm2 += inverse.m[col*4+row]*inverse.m[col*4+row]; }
+    }
+    if (!std::isfinite(norm2)) { continue; }
+    std::shared_ptr<const HandContactMesh> mesh;
+    for (int joint : joints) {
+      if (!input.handJointValid[1][joint]) { continue; }
+      auto const point = transformPoint(rigWorld, input.handJoints[1][joint]);
+      if (!finiteHandPoint(point)) { continue; }
+      auto const local = transformPoint(inverse, point);
+      if (!finiteHandPoint(local) || handBoxDistanceSquared(local, visual.localBounds) > distance*distance*norm2) { continue; }
+      if (!mesh) {
+        if (visual.pickGeometry) {
+          mesh = app.handContactCache.get(visual.pickGeometry);
+        } else {
+          mesh = cube;
+        }
+      }
+      if (mesh->near(point, world, distance)) { return true; }
+    }
+  }
+  return false;
+}
+
 void beginHandGrab(App& app, HandPose pose, std::optional<Vec3> point = std::nullopt, HandGrabView view = {}) {
   Aabb bounds;
   if (!pose.valid || !movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
@@ -2504,7 +2557,9 @@ void updateHandScale(App& app, HandPose left, HandPose right, float dt) {
 }
 
 void updateHandGrab(App& app, HandPose pose) {
-  applyHandDelta(app, projectedHandGrabTransform(app.grabView, app.grabStart, pose, app.grabPivot, Mat4{}));
+  applyHandDelta(app, app.physicalGrab
+      ? handGrabTransform(app.grabStart, pose, app.grabStart.position, Mat4{})
+      : projectedHandGrabTransform(app.grabView, app.grabStart, pose, app.grabPivot, Mat4{}));
 }
 
 // Freeze a live controller edit while choosing a tool. Its snapshot stays
@@ -2576,6 +2631,26 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   auto const turn = quatFromAxisAngle({-1, 2, 3}, .9F);
   Vec3 const displacement{.3F, .4F, -.2F};
   HandPose const current{start.position + displacement, normalized(turn * start.orientation), true};
+  // Physical contact is exact, selected-subtree-only, and independent of aim.
+  XrFrameInput contactInput;
+  contactInput.handJointValid[1][5] = true;
+  auto const cubeWorld = app.scene.world(cube);
+  contactInput.handJoints[1][5] = transformPoint(cubeWorld, {.5F, 0, 0});
+  if (!check(selectedHandContact(app, contactInput, Mat4{}), "selected cube surface contact")) { return false; }
+  contactInput.handJoints[1][5] = transformPoint(cubeWorld, {0, 0, 0});
+  if (!check(!selectedHandContact(app, contactInput, Mat4{}), "cube interior is not contact")) { return false; }
+  contactInput.handJoints[1][5] = transformPoint(cubeWorld, {.5F, 0, 0});
+  app.selection.clear();
+  if (!check(!selectedHandContact(app, contactInput, Mat4{}), "unselected cube cannot be grabbed")) { return false; }
+  app.selection = {cube};
+  beginHandGrab(app, start);
+  app.physicalGrab = true;
+  auto const physicalInitial = app.scene.world(cube);
+  updateHandGrab(app, current);
+  if (!check(nearMatrix(app.scene.world(cube), handGrabTransform(start, current, start.position, physicalInitial)),
+             "physical grab anchored to palm")) { return false; }
+  cancelLiveEdit(app);
+  if (!check(sameSnapshot(snapshot(app), before), "physical grab cancel restores state")) { return false; }
   beginHandGrab(app, start);
   auto const pivot = app.grabPivot;
   updateHandGrab(app, start);
@@ -2955,17 +3030,22 @@ int runXr(char const* shaderDir,
   bool handMenuOpen = false;
   HandGesture leftPinch;
   HandGesture rightPinch;
+  HandGesture rightGrasp;
+  HandGraspGate graspGate;
   bool palmUp = false;
   bool leftUiOwned = false;
   int jointSignature = -1;
   bool rightWasHand = false;
   HandSelectionLatch selectionLatch;
+  NodeId recentHandNode = kInvalidNode;
+  Vec3 recentHandLocalPoint{};
   int skipsInARow = 0;
   double frameMsTotal = 0.0;
   double frameMsMax = 0.0;
   std::chrono::steady_clock::time_point frameStart = std::chrono::steady_clock::now();
   std::chrono::steady_clock::time_point lastFrameTime = frameStart;
   while (running) {
+    app.handContactCache.prune();
     XrFrameInput input;
     frameStart = std::chrono::steady_clock::now();
     XrShell::FrameStatus status = shell.beginFrame(input);
@@ -2981,6 +3061,8 @@ int runXr(char const* shaderDir,
       selectionLatch.reset();
       leftPinch.reset();
       rightPinch.reset();
+      rightGrasp.reset();
+      graspGate.reset();
       app.handUiOwned = true;
       app.handPanel.visible = false;
       palmUp = false;
@@ -3006,6 +3088,7 @@ int runXr(char const* shaderDir,
     auto const now = std::chrono::steady_clock::now();
     float dt = std::chrono::duration<float>(now - lastFrameTime).count();
     lastFrameTime = now;
+    selectionLatch.advance(dt); // use elapsed time, not the animation timestep clamp
     dt = dt > 0.1F ? 0.1F : dt;
 
     tickAnimations(app, dt);
@@ -3042,27 +3125,45 @@ int runXr(char const* shaderDir,
       jointSignature = jointsNow;
     }
     bool const handRight = input.handActive[1];
-    bool const handTracked = handRight && input.aimValid[1] && input.pinchActive[1];
-    bool const leftPressed = leftPinch.update(input.handActive[0] && input.aimValid[0] && input.pinchActive[0] && worldHands[0].valid, input.pinch[0]);
-    bool const rightPressed = rightPinch.update(handTracked, input.pinch[1]);
-    bool const handHeld = handTracked && input.pinch[1] > .4F;
-    bool const leftHeld = input.handActive[0] && input.aimValid[0] && input.pinchActive[0] && input.pinch[0] > .4F;
-    if (!handTracked || !worldHands[1].valid) { selectionLatch.reset(); }
+    bool const handSignal = handPinchSignal(handRight, input.pinchActive[1], input.pinch[1]);
+    bool const leftSignal = handPinchSignal(input.handActive[0], input.pinchActive[0], input.pinch[0]) &&
+        worldHands[0].valid;
+    // Aim is needed to target, not to sustain a tracked pinch or palm grab.
+    bool const leftPressed = leftPinch.update(leftSignal, input.pinch[0]);
+    bool const rightPressed = rightPinch.update(handSignal, input.pinch[1]);
+    bool const handHeld = handPinchHeld(handSignal, input.pinch[1]);
+    bool const graspSignal = handPinchSignal(handRight, input.graspActive, input.grasp) && worldHands[1].valid;
+    rightGrasp.update(graspSignal, input.grasp);
+    bool const graspHeld = handPinchHeld(graspSignal, input.grasp);
+    bool const leftHeld = handPinchHeld(leftSignal, input.pinch[0]);
+    graspGate.update(graspSignal, graspHeld, handHeld,
+                     app.handUiOwned || app.galleryActive || handMenuOpen || app.stickSession);
+    if (app.physicalGrab) {
+      rightPinch.reset(); // a pinch made during a physical grab cannot click on release
+    }
+    if (!worldHands[1].valid || !handRight) { selectionLatch.reset(); }
     if (!leftHeld) { leftUiOwned = false; }
     if (handRight || rightWasHand) {
-      input.selectPressed = handRight && rightPressed;
+      input.selectPressed = handRight && rightPressed && !app.physicalGrab;
       input.selectHeld = handHeld;
       input.selectReleased = !handHeld;
     }
-    if (rightWasHand != handRight || app.galleryActive) { selectionLatch.reset(); }
+    if (rightWasHand != handRight || app.galleryActive) {
+      selectionLatch.reset();
+      graspGate.reset();
+      rightGrasp.reset();
+    }
     rightWasHand = handRight;
     bool handCarouselToggled = false;
     palmUp = input.handActive[0] && palmFacingUp(worldHands[0], palmUp);
     if (leftPressed && palmUp && !handHeld && !app.handGrab) {
       selectionLatch.reset();
+      graspGate.reset();
+      rightGrasp.reset();
       leftUiOwned = true;
       handMenuOpen = !handMenuOpen;
-      endEdits(app);
+      if (handMenuOpen) { prepareHandPanel(app); }
+      else { endEdits(app); }
       app.handUiOwned = true;
       if (!handMenuOpen) { galleryClose(app); }
       handCarouselToggled = true;
@@ -3086,17 +3187,17 @@ int runXr(char const* shaderDir,
       endEdits(app);
     }
     app.handPanel.visible = panelWanted;
-    app.handHover = handTracked ? app.handPanel.hit(worldRay) : -1;
+    app.handHover = handSignal && input.aimValid[1] ? app.handPanel.hit(worldRay) : -1;
     if (app.handHover >= 1 && app.handHover <= 7) {
       app.handHover = -1;
     }
     if (!handHeld) {
-      if (app.handGrab || app.handTool >= 0) {
+      if ((app.handGrab && !app.physicalGrab) || app.handTool >= 0) {
         endEdits(app);
       }
       app.handUiOwned = false;
     }
-    if (rightPressed && app.handHover >= 0 && !handCarouselToggled) {
+    if (rightPressed && !app.physicalGrab && app.handHover >= 0 && !handCarouselToggled) {
       int const button = app.handHover;
       prepareHandTool(app, button);
       app.handUiOwned = true;
@@ -3113,12 +3214,14 @@ int runXr(char const* shaderDir,
       } else if (button == 11) {
         toggleBackdrop(app, renderer, &shell);
       }
-    } else if (rightPressed && app.handPanel.visible && !app.galleryActive) {
+    } else if (rightPressed && !app.physicalGrab && app.handPanel.visible && !app.galleryActive) {
       app.handUiOwned = true; // tool panel owns misses too; do not click through
     }
     if (app.handGrab) {
-      if (handHeld && worldHands[1].valid && !app.handUiOwned && !panelWanted && !app.galleryActive) {
-        if (app.handScaling) {
+      if ((app.physicalGrab ? graspHeld : handHeld) && worldHands[1].valid && !app.handUiOwned && !panelWanted && !app.galleryActive) {
+        if (app.physicalGrab) {
+          updateHandGrab(app, worldHands[1]); // unfiltered, 1:1 palm pose
+        } else if (app.handScaling) {
           if (leftHeld && worldHands[0].valid) {
             updateHandScale(app, worldHands[0], worldHands[1], dt);
           } else {
@@ -3136,11 +3239,19 @@ int runXr(char const* shaderDir,
           updateHandGrab(app, app.grabFiltered);
         }
       } else {
+        bool const wasPhysical = app.physicalGrab;
         endEdits(app);
+        if (wasPhysical) { graspGate.reset(); rightGrasp.reset(); }
+        // A lost palm is a tracking interruption, not a release. Require a
+        // real release before this held pinch can start a new interaction.
+        if (handHeld && !worldHands[1].valid) {
+          rightPinch.reset();
+          app.handUiOwned = true;
+        }
       }
     }
 
-    if (handRight && app.handUiOwned) {
+    if (handRight && (app.handUiOwned || app.physicalGrab)) {
       input.selectPressed = false;
     }
 
@@ -3181,7 +3292,7 @@ int runXr(char const* shaderDir,
       carouselToggled = true;
     }
     bool cancelledLiveEdit = false;
-    if (input.undoPressed || input.redoPressed) { selectionLatch.reset(); }
+    if (input.undoPressed || input.redoPressed) { selectionLatch.reset(); graspGate.reset(); rightGrasp.reset(); }
     if (input.undoPressed) {
       if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
         cancelLiveEdit(app);
@@ -3213,24 +3324,81 @@ int runXr(char const* shaderDir,
     // movement and rotation are the sticks' job (controller aim is too
     // jittery for accurate placement).
     app.camera.position = headWorld;
+    // Cache only an actual closest selected surface while released. A current
+    // hit on another object always wins over the grace; never use gaze fallback.
+    PointerTarget handTarget;
+    bool const handCanTarget = handSignal && input.aimValid[1];
+    bool const sceneHandTargeting = handCanTarget && !app.handUiOwned &&
+        !panelWanted && !app.galleryActive && !app.stickSession;
+    if (app.handUiOwned || panelWanted || app.galleryActive || app.stickSession) {
+      selectionLatch.clearHit();
+    }
+    if (sceneHandTargeting && selectionLatch.primed() && !handHeld) {
+      handTarget = resolvePointerTarget(app, worldRay);
+      bool const selected = handTarget.node != kInvalidNode &&
+          std::find(app.selection.begin(), app.selection.end(), handTarget.node) != app.selection.end();
+      if (selected) {
+        Mat4 inverse{};
+        if (invertAffine(app.scene.world(handTarget.node), inverse)) {
+          recentHandNode = handTarget.node;
+          recentHandLocalPoint = transformPoint(inverse, handTarget.point);
+          selectionLatch.rememberHit();
+        } else {
+          selectionLatch.clearHit();
+        }
+      } else if (handTarget.node != kInvalidNode && !selected) {
+        selectionLatch.clearHit();
+      }
+    }
+    // Physical contact wins an overlapping pinch, but an unprimed first
+    // selection never becomes an edit. A held, armed squeeze may enter contact.
+    if (graspGate.canAcquire(rightGrasp.pressed(), selectionLatch.primed()) &&
+        !app.physicalGrab && !app.handUiOwned && !panelWanted && !handMenuOpen &&
+        !app.galleryActive && !app.stickSession && !handCarouselToggled &&
+        !input.undoPressed && !input.redoPressed && !app.selection.empty() &&
+        selectedHandContact(app, input, rigWorld)) {
+      if (app.handGrab) {
+        // Upgrade the projected pinch in place: keep its original undo
+        // transaction, but rebase the physical motion at the current pose.
+        app.grabStart = worldHands[1];
+        app.grabFiltered = worldHands[1];
+        app.handScaling = false;
+        for (auto& [id, world] : app.grabWorlds) { world = app.scene.world(id); }
+        for (auto& [id, local] : app.grabLocals) { local = app.scene.local(id); }
+        for (auto& [id, pose] : app.grabPoseStarts) { pose = app.scene.poseOffset(id); }
+      } else {
+        beginHandGrab(app, worldHands[1]);
+      }
+      app.physicalGrab = app.handGrab;
+      if (app.physicalGrab) { input.selectPressed = false; rightPinch.reset(); }
+    }
     if (input.selectPressed && !handCarouselToggled) {
       if (app.galleryActive) {
-        // The carousel owns the trigger: it places the staged model at the
-        // floor point under the aim ray.
-        galleryPointerPress(app, renderer, worldRay);
+        // A hand without a valid aim must never act on the gaze fallback.
+        if (!handRight || handCanTarget) { galleryPointerPress(app, renderer, worldRay); }
+        graspGate.reset();
+        rightGrasp.reset();
         if (!app.galleryActive) { handMenuOpen = false; }
         if (handRight) { app.handUiOwned = true; }
       } else {
-        // Grip + trigger selects a single part; trigger alone the whole model.
         bool const partSelect = !handRight && input.gripHeld > 0.5F;
-        PointerTarget target = resolvePointerTarget(app, worldRay);
+        PointerTarget target = handRight && !handCanTarget ? PointerTarget{} :
+            resolvePointerTarget(app, worldRay);
         bool const selectedHit = target.node != kInvalidNode &&
             std::find(app.selection.begin(), app.selection.end(), target.node) != app.selection.end();
-        if (handTracked && selectionLatch.startsGrab(selectedHit)) {
-          beginHandGrab(app, worldHands[1], target.point, {headWorld, normalized(cameraOrientation(rig) * input.headOrient), true});
-        } else {
+        bool const recentSelected = handRight && target.node == kInvalidNode &&
+            selectionLatch.recentHit() &&
+            std::find(app.selection.begin(), app.selection.end(), recentHandNode) != app.selection.end();
+        if (handSignal && worldHands[1].valid &&
+            selectionLatch.startsGrab(selectedHit, recentSelected)) {
+          Vec3 const point = selectedHit ? target.point :
+              transformPoint(app.scene.world(recentHandNode), recentHandLocalPoint);
+          beginHandGrab(app, worldHands[1], point, {headWorld, normalized(cameraOrientation(rig) * input.headOrient), true});
+        } else if (!handRight || handCanTarget) {
           pointerPress(app, target, partSelect);
-          selectionLatch.selected(handTracked && !app.selection.empty());
+          graspGate.reset();
+          rightGrasp.reset();
+          selectionLatch.selected(handSignal && !app.selection.empty());
         }
       }
     }
@@ -3415,32 +3583,21 @@ int runXr(char const* shaderDir,
     std::vector<RendererVertex> overlayLines;
     assembleFrame(app, items, depthLines, overlayLines);
     drawHandPanel(app, overlayLines);
-    // Joint skeletons are overlay geometry, so hands remain visible through models.
-    constexpr int bones[][2] = {{0,1}, {1,2}, {2,3}, {3,4}, {4,5},
-        {0,6}, {6,7}, {7,8}, {8,9}, {9,10}, {0,11}, {11,12}, {12,13},
-        {13,14}, {14,15}, {0,16}, {16,17}, {17,18}, {18,19}, {19,20},
-        {0,21}, {21,22}, {22,23}, {23,24}, {24,25}, {6,11}, {11,16}, {16,21}};
+    // Two reusable meshes follow current tracked joints and render over models.
+    // Do not retain a stale hand when tracking or mesh generation fails.
     for (int hand = 0; hand < 2; ++hand) {
       if (!input.handActive[hand]) { continue; }
-      Vec3 const colour = hand == 0 ? Vec3{.45F,.8F,1} : Vec3{1,.8F,.45F};
-      auto line = [&](Vec3 a, Vec3 b) {
-        overlayLines.push_back({a, {0,1,0}, colour, {0,0}});
-        overlayLines.push_back({b, {0,1,0}, colour, {0,0}});
-      };
-      for (auto const& bone : bones) {
-        if (!input.handJointValid[hand][bone[0]] || !input.handJointValid[hand][bone[1]]) { continue; }
-        auto const a = transformPoint(rigWorld, input.handJoints[hand][bone[0]]);
-        auto const b = transformPoint(rigWorld, input.handJoints[hand][bone[1]]);
-        auto side = normalized(cross(b-a, headWorld - (a+b)*.5F)) * .0015F;
-        line(a, b); line(a+side, b+side); line(a-side, b-side);
+      Vec3 joints[kHandJointCount]{};
+      for (std::size_t joint = 0; joint < kHandJointCount; ++joint) {
+        joints[joint] = transformPoint(rigWorld, input.handJoints[hand][joint]);
       }
-      for (int tip : {5, 10, 15, 20, 25}) {
-        if (!input.handJointValid[hand][tip]) { continue; }
-        auto const p = transformPoint(rigWorld, input.handJoints[hand][tip]);
-        auto const side = normalized(cross(headForward, Vec3{0,1,0})) * .004F;
-        line(p-side, p+side);
-        line(p-Vec3{0,.004F,0}, p+Vec3{0,.004F,0});
-      }
+      auto const mesh = makeHandMesh(joints, input.handJointValid[hand]);
+      if (mesh.indices.empty()) { continue; }
+      auto const handle = renderer.updateHandMesh(static_cast<std::size_t>(hand), mesh);
+      if (handle == kInvalidMesh) { continue; }
+      DrawItem handItem;
+      handItem.mesh = handle;
+      items.push_back(handItem);
     }
     // Controller pointers: one beam per tracked hand, always on top so the
 
@@ -3679,6 +3836,7 @@ int runInteractive(char const* shaderDir,
 
   auto previous = std::chrono::steady_clock::now();
   while (app.running) {
+    app.handContactCache.prune();
     xcb_generic_event_t* event = nullptr;
     while ((event = xcb_poll_for_event(window.connection)) != nullptr) {
       handleEvent(app, window, event, renderer);

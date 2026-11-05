@@ -1,8 +1,12 @@
 #pragma once
 
 #include "vecmath.h"
+#include "picking.h"
 
 #include <initializer_list>
+#include <map>
+#include <algorithm>
+#include <vector>
 
 namespace vredit {
 
@@ -55,14 +59,53 @@ class HandGesture {
   bool pressed_{false};
 };
 
-// Only a second released-and-repressed pinch on the selected surface starts a grab.
+// Aim availability is independent of pinch/palm tracking. Never infer a
+// held pinch from an inactive or non-finite action sample.
+inline bool handPinchSignal(bool handActive, bool pinchActive, float pinch) {
+  return handActive && pinchActive && std::isfinite(pinch);
+}
+inline bool handPinchHeld(bool signal, float pinch) {
+  return signal && std::isfinite(pinch) && pinch > .4F;
+}
+
+// A selection or UI interaction owns the entire overlapping squeeze. Both
+// actions must return to release before a new physical grasp can be acquired.
+class HandGraspGate {
+ public:
+  void update(bool valid, bool graspHeld, bool pinchHeld, bool captured) {
+    if (!valid || captured) { blocked_ = true; }
+    else if (!graspHeld && !pinchHeld) { blocked_ = false; }
+  }
+  void reset() { blocked_ = true; }
+  bool canAcquire(bool graspPressed, bool selectionPrimed) const {
+    return !blocked_ && graspPressed && selectionPrimed;
+  }
+ private:
+  bool blocked_{true};
+};
+
+// A recent exact hit can survive a brief aim wobble on the second pinch.
+// The caller verifies that the cached node is still selected and gives a
+// current hit on a different object priority over the cached hit.
 class HandSelectionLatch {
  public:
-  bool startsGrab(bool hitSelection) const { return primed_ && hitSelection; }
-  void selected(bool hasSelection) { primed_ = hasSelection; }
-  void reset() { primed_ = false; }
+  static constexpr float hitGraceSeconds = .15F;
+  bool startsGrab(bool hitSelection, bool recentSelection = false) const {
+    return primed_ && (hitSelection || recentSelection);
+  }
+  void selected(bool hasSelection) { primed_ = hasSelection; clearHit(); }
+  bool primed() const { return primed_; }
+  void rememberHit() { hitAge_ = 0.0F; }
+  void advance(float dt) {
+    if (!(dt >= 0.0F) || !std::isfinite(dt)) { clearHit(); return; }
+    hitAge_ += dt;
+  }
+  bool recentHit() const { return primed_ && hitAge_ <= hitGraceSeconds; }
+  void clearHit() { hitAge_ = hitGraceSeconds + 1.0F; }
+  void reset() { primed_ = false; clearHit(); }
  private:
   bool primed_{false};
+  float hitAge_{hitGraceSeconds + 1.0F};
 };
 
 // Exponential low-pass filtering preserves sub-millimetre motion rather than
@@ -84,6 +127,148 @@ inline float handScaleRatio(float initialDistance, float distance) {
   }
   return std::fmax(.05F, std::fmin(20.0F, distance / initialDistance));
 }
+
+// Exact nearest-triangle contact. Bounds only prune; they are never a mesh
+// contact target. The local BVH is immutable and shared by mesh instances.
+inline bool finiteHandPoint(Vec3 p) {
+  return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+}
+
+inline Vec3 closestTrianglePoint(Vec3 p, Vec3 a, Vec3 b, Vec3 c) {
+  auto const ab = b-a, ac = c-a, ap = p-a;
+  float const d1 = dot(ab, ap), d2 = dot(ac, ap);
+  if (d1 <= 0 && d2 <= 0) { return a; }
+  auto const bp = p-b;
+  float const d3 = dot(ab, bp), d4 = dot(ac, bp);
+  if (d3 >= 0 && d4 <= d3) { return b; }
+  float const vc = d1*d4-d3*d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) { return a + ab*(d1/(d1-d3)); }
+  auto const cp = p-c;
+  float const d5 = dot(ab, cp), d6 = dot(ac, cp);
+  if (d6 >= 0 && d5 <= d6) { return c; }
+  float const vb = d5*d2-d1*d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) { return a + ac*(d2/(d2-d6)); }
+  float const va = d3*d6-d5*d4;
+  if (va <= 0 && d4-d3 >= 0 && d5-d6 >= 0) {
+    return b + (c-b)*((d4-d3)/((d4-d3)+(d5-d6)));
+  }
+  float const denom = va+vb+vc;
+  if (!(std::fabs(denom) > 1e-20F)) { return a; }
+  return a + ab*(vb/denom) + ac*(vc/denom);
+}
+
+inline float handBoxDistanceSquared(Vec3 p, Aabb box) {
+  float const dx = std::fmax(0.0F, std::fmax(box.min.x-p.x, p.x-box.max.x));
+  float const dy = std::fmax(0.0F, std::fmax(box.min.y-p.y, p.y-box.max.y));
+  float const dz = std::fmax(0.0F, std::fmax(box.min.z-p.z, p.z-box.max.z));
+  return dx*dx+dy*dy+dz*dz;
+}
+
+class HandContactMesh {
+ public:
+  explicit HandContactMesh(std::shared_ptr<const PickGeometry> geometry) : geometry_(std::move(geometry)) {
+    if (!geometry_) { return; }
+    for (std::size_t i = 0; i+2 < geometry_->indices.size(); i += 3) {
+      auto const a = geometry_->indices[i], b = geometry_->indices[i+1], c = geometry_->indices[i+2];
+      if (a >= geometry_->positions.size() || b >= geometry_->positions.size() || c >= geometry_->positions.size()) { continue; }
+      auto const p = geometry_->positions[a], q = geometry_->positions[b], r = geometry_->positions[c];
+      if (!finiteHandPoint(p) || !finiteHandPoint(q) || !finiteHandPoint(r) ||
+          !(dot(cross(q-p,r-p), cross(q-p,r-p)) > 1e-20F)) { continue; }
+      triangles_.push_back(i);
+    }
+    if (!triangles_.empty()) { build(0, triangles_.size()); }
+  }
+
+  // maxDistance is in world metres; inverse norm conservatively handles
+  // nonuniform scaling, while final distances use world-space triangles.
+  bool near(Vec3 point, Mat4 world, float maxDistance) const {
+    Mat4 inverse;
+    if (nodes_.empty() || !finiteHandPoint(point) || !std::isfinite(maxDistance) ||
+        !(maxDistance >= 0) || !invertAffine(world, inverse)) { return false; }
+    auto const local = transformPoint(inverse, point);
+    float norm2 = 0;
+    for (int col = 0; col < 3; ++col) {
+      for (int row = 0; row < 3; ++row) { norm2 += inverse.m[col*4+row]*inverse.m[col*4+row]; }
+    }
+    float const radius2 = maxDistance*maxDistance*norm2;
+    if (!finiteHandPoint(local) || !std::isfinite(radius2)) { return false; }
+    std::vector<std::size_t> stack{0};
+    while (!stack.empty()) {
+      auto const index = stack.back(); stack.pop_back();
+      auto const& node = nodes_[index];
+      if (handBoxDistanceSquared(local, node.bounds) > radius2) { continue; }
+      if (node.count == 0) { stack.push_back(node.left); stack.push_back(node.right); continue; }
+      for (std::size_t i = node.begin; i < node.begin+node.count; ++i) {
+        auto const offset = triangles_[i];
+        auto const a = transformPoint(world, geometry_->positions[geometry_->indices[offset]]);
+        auto const b = transformPoint(world, geometry_->positions[geometry_->indices[offset+1]]);
+        auto const c = transformPoint(world, geometry_->positions[geometry_->indices[offset+2]]);
+        if (!finiteHandPoint(a) || !finiteHandPoint(b) || !finiteHandPoint(c)) { continue; }
+        auto const normal = cross(b-a, c-a);
+        if (!(dot(normal, normal) > 1e-20F)) { continue; }
+        auto const delta = point-closestTrianglePoint(point,a,b,c);
+        if (dot(delta,delta) <= maxDistance*maxDistance) { return true; }
+      }
+    }
+    return false;
+  }
+ private:
+  struct Node { Aabb bounds{}; std::size_t begin{}, count{}, left{}, right{}; };
+  std::shared_ptr<const PickGeometry> geometry_;
+  std::vector<std::size_t> triangles_;
+  std::vector<Node> nodes_;
+  Aabb triangleBounds(std::size_t offset) const {
+    auto const a = geometry_->positions[geometry_->indices[offset]];
+    auto const b = geometry_->positions[geometry_->indices[offset+1]];
+    auto const c = geometry_->positions[geometry_->indices[offset+2]];
+    return {{std::fmin(a.x,std::fmin(b.x,c.x)),std::fmin(a.y,std::fmin(b.y,c.y)),std::fmin(a.z,std::fmin(b.z,c.z))},
+            {std::fmax(a.x,std::fmax(b.x,c.x)),std::fmax(a.y,std::fmax(b.y,c.y)),std::fmax(a.z,std::fmax(b.z,c.z))}};
+  }
+  std::size_t build(std::size_t begin, std::size_t end) {
+    auto bounds = triangleBounds(triangles_[begin]);
+    for (auto i = begin+1; i < end; ++i) {
+      auto const b = triangleBounds(triangles_[i]);
+      bounds.min = {std::fmin(bounds.min.x,b.min.x),std::fmin(bounds.min.y,b.min.y),std::fmin(bounds.min.z,b.min.z)};
+      bounds.max = {std::fmax(bounds.max.x,b.max.x),std::fmax(bounds.max.y,b.max.y),std::fmax(bounds.max.z,b.max.z)};
+    }
+    auto const index = nodes_.size(); nodes_.push_back({bounds,begin,end-begin,0,0});
+    if (end-begin > 8) {
+      auto const size = bounds.max-bounds.min;
+      int const axis = size.x >= size.y && size.x >= size.z ? 0 : size.y >= size.z ? 1 : 2;
+      auto centre = [this,axis](std::size_t t) {
+        auto const b = triangleBounds(t);
+        return axis == 0 ? b.min.x+b.max.x : axis == 1 ? b.min.y+b.max.y : b.min.z+b.max.z;
+      };
+      auto const mid = begin+(end-begin)/2;
+      std::nth_element(triangles_.begin()+begin, triangles_.begin()+mid, triangles_.begin()+end,
+                       [&](auto a, auto b) { return centre(a) < centre(b); });
+      auto const left = build(begin,mid), right = build(mid,end);
+      nodes_[index].left = left; nodes_[index].right = right; nodes_[index].count = 0;
+    }
+    return index;
+  }
+};
+
+// The key and the mesh each own one geometry reference. Prune only when
+// no scene, undo snapshot, or other client still owns that geometry.
+class HandContactCache {
+ public:
+  std::shared_ptr<const HandContactMesh> get(std::shared_ptr<const PickGeometry> const& geometry) {
+    auto& mesh = entries_[geometry];
+    if (!mesh) { mesh = std::make_shared<HandContactMesh>(geometry); }
+    return mesh;
+  }
+  void prune() {
+    for (auto it = entries_.begin(); it != entries_.end();) {
+      if (it->first.use_count() <= 2 && it->second.use_count() == 1) { it = entries_.erase(it); }
+      else { ++it; }
+    }
+  }
+  std::size_t size() const { return entries_.size(); }
+ private:
+  std::map<std::shared_ptr<const PickGeometry>, std::shared_ptr<const HandContactMesh>,
+           std::owner_less<std::shared_ptr<const PickGeometry>>> entries_;
+};
 
 // Panel-local coordinates, with the origin at the top centre. Invalid indices
 // return the origin (which is not inside any button).

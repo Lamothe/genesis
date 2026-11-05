@@ -59,6 +59,8 @@ struct XrShell::ImplData {
   XrAction triggerAction{XR_NULL_HANDLE};
   XrAction pinchAction{XR_NULL_HANDLE};
   XrAction pinchReadyAction{XR_NULL_HANDLE};
+  XrAction graspAction{XR_NULL_HANDLE};
+  XrAction graspReadyAction{XR_NULL_HANDLE};
   XrAction leftStickAction{XR_NULL_HANDLE};
   XrAction rightStickAction{XR_NULL_HANDLE};
   XrAction menuAction{XR_NULL_HANDLE};
@@ -485,7 +487,7 @@ bool XrShell::createActions() {
     return xrOk(xrCreateAction(xr_->actionSet, &info, out), name);
   };
 
-  if (!makeFloat("trigger", &xr_->triggerAction) || !makeFloat("pinch", &xr_->pinchAction) || !makeBool("pinch_ready", &xr_->pinchReadyAction) || !makeVec2("leftstick", &xr_->leftStickAction) ||
+  if (!makeFloat("trigger", &xr_->triggerAction) || !makeFloat("pinch", &xr_->pinchAction) || !makeBool("pinch_ready", &xr_->pinchReadyAction) || !makeFloat("hand_grasp", &xr_->graspAction) || !makeBool("grasp_ready", &xr_->graspReadyAction) || !makeVec2("leftstick", &xr_->leftStickAction) ||
       !makeVec2("rightstick", &xr_->rightStickAction) || !makeBool("menu", &xr_->menuAction) ||
       !makeBool("undo", &xr_->undoAction) || !makeBool("redo", &xr_->redoAction) ||
       !makeBool("spawn", &xr_->spawnAction) || !makeBool("delete", &xr_->deleteAction) ||
@@ -549,7 +551,8 @@ bool XrShell::createActions() {
           {"/user/hand/right/input/pinch_ext/value", xr_->pinchAction},
           {"/user/hand/left/input/pinch_ext/ready_ext", xr_->pinchReadyAction},
           {"/user/hand/right/input/pinch_ext/ready_ext", xr_->pinchReadyAction},
-          {"/user/hand/right/input/grasp_ext/value", xr_->gripAction}}});
+          {"/user/hand/right/input/grasp_ext/value", xr_->graspAction},
+          {"/user/hand/right/input/grasp_ext/ready_ext", xr_->graspReadyAction}}});
   }
 
   for (Binding const& binding : bindings) {
@@ -929,6 +932,16 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
       }
     }
   }
+  // Grasp is an independent hand-only action; controller squeeze remains grip.
+  auto grasp = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
+  auto graspReady = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
+  getInfo.subactionPath = rightPath;
+  getInfo.action = xr_->graspAction;
+  xrGetActionStateFloat(xr_->session, &getInfo, &grasp);
+  getInfo.action = xr_->graspReadyAction;
+  xrGetActionStateBoolean(xr_->session, &getInfo, &graspReady);
+  input.graspActive = input.handActive[1] && grasp.isActive && graspReady.isActive && graspReady.currentState;
+  input.grasp = grasp.isActive ? grasp.currentState : 0.0F;
   // Per-hand aim rays for the drawn pointers; the right-hand aim doubles as
   // the manipulation pointer (head gaze fallback when it is untracked).
   uint32_t tracked = XR_SPACE_LOCATION_POSITION_VALID_BIT |

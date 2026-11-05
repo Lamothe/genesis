@@ -3,6 +3,7 @@
 #include "triangle_sort.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -135,6 +136,7 @@ struct VkRenderer::Impl {
   VkShaderModule fragModule{VK_NULL_HANDLE};
   VkPipeline meshPipeline{VK_NULL_HANDLE};
   VkPipeline blendPipeline{VK_NULL_HANDLE};
+  VkPipeline handPipeline{VK_NULL_HANDLE};
 
   static constexpr std::size_t kMaxTextures = 256; // matches the shader array
   // Upload budget per texture side: past this the resample costs more VRAM
@@ -178,6 +180,25 @@ struct VkRenderer::Impl {
   std::vector<VkImage> swapchainImages;
   std::vector<VkImageView> swapchainViews;
   std::vector<MeshRecord> meshes; // 0 = built-in cube
+  struct HandSlot {
+    MeshHandle handle{kInvalidMesh};
+    VkBuffer staging{VK_NULL_HANDLE};
+    VkDeviceMemory memory{VK_NULL_HANDLE};
+    void* mapped{nullptr};
+    VkDeviceSize vertexBytes{0};
+    VkDeviceSize indexBytes{0};
+    bool dirty{false};
+  };
+  std::array<HandSlot, VkRenderer::kHandMeshSlots> hands{};
+
+  bool isHand(MeshHandle handle) const {
+    for (auto const& hand : hands) {
+      if (hand.handle != kInvalidMesh && hand.handle == handle) {
+        return true;
+      }
+    }
+    return false;
+  }
   std::uint32_t swapchainIndex{0};
   VkSemaphore imageAvailable{VK_NULL_HANDLE};
   VkSemaphore renderFinished{VK_NULL_HANDLE};
@@ -691,6 +712,11 @@ struct VkRenderer::Impl {
       centreDist2[i] = d.x * d.x + d.y * d.y + d.z * d.z;
     }
     std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+      bool const aHand = isHand(items[a].mesh);
+      bool const bHand = isHand(items[b].mesh);
+      if (aHand != bHand) {
+        return !aHand;
+      }
       bool const aBlend = items[a].alpha == AlphaMode::Blend;
       bool const bBlend = items[b].alpha == AlphaMode::Blend;
       if (aBlend != bBlend) {
@@ -701,6 +727,34 @@ struct VkRenderer::Impl {
       }
       return centreDist2[a] > centreDist2[b]; // blend: farthest centre first
     });
+
+    // Host-coherent staging is changed only after the frame fence. Copy to
+    // device-local mesh buffers before this frame's vertex/index reads.
+    bool handCopies = false;
+    for (auto const& hand : hands) {
+      if (!hand.dirty || hand.indexBytes == 0U) {
+        continue;
+      }
+      MeshRecord const& record = meshes[hand.handle];
+      VkBufferCopy vertexCopy{0, 0, hand.vertexBytes};
+      VkBufferCopy indexCopy{sizeof(MeshVertex) * VkRenderer::kHandMeshMaxVertices,
+                             0, hand.indexBytes};
+      vkCmdCopyBuffer(command, hand.staging, record.vertexBuffer, 1, &vertexCopy);
+      vkCmdCopyBuffer(command, hand.staging, record.indexBuffer, 1, &indexCopy);
+      handCopies = true;
+    }
+    if (handCopies) {
+      VkMemoryBarrier2 barrier = vkStruct<VkMemoryBarrier2>(VK_STRUCTURE_TYPE_MEMORY_BARRIER_2);
+      barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      barrier.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                             VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
+      barrier.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
+      VkDependencyInfo info = vkStruct<VkDependencyInfo>(VK_STRUCTURE_TYPE_DEPENDENCY_INFO);
+      info.memoryBarrierCount = 1;
+      info.pMemoryBarriers = &barrier;
+      vkCmdPipelineBarrier2(command, &info);
+    }
 
     // Per-triangle back-to-front rewrite of each blend item's indices, uploaded
     // through one transient staging buffer into per-blend-ordinal DEVICE_LOCAL
@@ -836,42 +890,52 @@ struct VkRenderer::Impl {
     // Meshes: one indexed draw per item in the computed order (opaque+mask
     // first, blends last; blend draws read their per-view sorted indices).
     std::size_t drawBlendSlot = 0;
-    for (std::size_t oi = 0; oi < order.size(); ++oi) {
-      DrawItem const& item = items[order[oi]];
-      std::size_t handle = item.mesh < meshes.size() ? item.mesh : 0U;
-      MeshRecord const& record = meshes[handle];
-      vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                        item.alpha == AlphaMode::Blend ? blendPipeline : meshPipeline);
-      VkDeviceSize zero = 0;
-      vkCmdBindVertexBuffers(command, 0, 1, &record.vertexBuffer, &zero);
-      VkBuffer indexUsed = record.indexBuffer;
-      if (sortActive && item.alpha == AlphaMode::Blend) {
-        indexUsed = blendScratch[drawBlendSlot++].indexBuffer;
+    auto drawMeshes = [&](bool handPass) {
+      for (std::size_t oi = 0; oi < order.size(); ++oi) {
+        DrawItem const& item = items[order[oi]];
+        if (isHand(item.mesh) != handPass) {
+          continue;
+        }
+        std::size_t handle = item.mesh < meshes.size() ? item.mesh : 0U;
+        MeshRecord const& record = meshes[handle];
+        vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          handPass ? handPipeline :
+                          (item.alpha == AlphaMode::Blend ? blendPipeline : meshPipeline));
+        VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(command, 0, 1, &record.vertexBuffer, &zero);
+        VkBuffer indexUsed = record.indexBuffer;
+        if (sortActive && item.alpha == AlphaMode::Blend) {
+          indexUsed = blendScratch[drawBlendSlot++].indexBuffer;
+        }
+        vkCmdBindIndexBuffer(command, indexUsed, 0, VK_INDEX_TYPE_UINT32);
+        PushData push{};
+        std::memcpy(push.model, item.model.m, sizeof(float) * 16U);
+        push.tint[0] = item.colour.x;
+        push.tint[1] = item.colour.y;
+        push.tint[2] = item.colour.z;
+        // Enforce the opaque hand contract at the shader boundary as well as
+        // during item normalisation, including for transparent textures.
+        push.tint[3] = handPass ? 1.0F : item.alphaFactor;
+        push.params[0] = item.lit ? 1.0F : 0.0F;
+        push.params[1] = item.texture < textures.size() ? static_cast<float>(item.texture) : 0.0F;
+        push.params[2] = handPass ? 0.0F : item.alphaCutoff;
+        push.params[3] = handPass                         ? 0.0F
+                         : item.alpha == AlphaMode::Mask  ? 1.0F
+                         : item.alpha == AlphaMode::Blend ? 2.0F
+                                                          : 0.0F;
+        push.normalParams[0] =
+            (item.normalMapped && item.normalTexture < textures.size()) ? 1.0F : 0.0F;
+        push.normalParams[1] =
+            item.normalTexture < textures.size() ? static_cast<float>(item.normalTexture) : 0.0F;
+        push.normalParams[2] = item.normalScale;
+        push.normalParams[3] = item.highlight;
+        vkCmdPushConstants(command, pipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(PushData), &push);
+        vkCmdDrawIndexed(command, record.indexCount, 1, 0, 0, 0);
       }
-      vkCmdBindIndexBuffer(command, indexUsed, 0, VK_INDEX_TYPE_UINT32);
-      PushData push{};
-      std::memcpy(push.model, item.model.m, sizeof(float) * 16U);
-      push.tint[0] = item.colour.x;
-      push.tint[1] = item.colour.y;
-      push.tint[2] = item.colour.z;
-      push.tint[3] = item.alphaFactor;
-      push.params[0] = item.lit ? 1.0F : 0.0F;
-      push.params[1] = item.texture < textures.size() ? static_cast<float>(item.texture) : 0.0F;
-      push.params[2] = item.alphaCutoff;
-      push.params[3] = item.alpha == AlphaMode::Mask    ? 1.0F
-                       : item.alpha == AlphaMode::Blend ? 2.0F
-                                                        : 0.0F;
-      push.normalParams[0] =
-          (item.normalMapped && item.normalTexture < textures.size()) ? 1.0F : 0.0F;
-      push.normalParams[1] =
-          item.normalTexture < textures.size() ? static_cast<float>(item.normalTexture) : 0.0F;
-      push.normalParams[2] = item.normalScale;
-      push.normalParams[3] = item.highlight;
-      vkCmdPushConstants(command, pipelineLayout,
-                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                         sizeof(PushData), &push);
-      vkCmdDrawIndexed(command, record.indexCount, 1, 0, 0, 0);
-    }
+    };
+    drawMeshes(false);
 
     VkDeviceSize stride = sizeof(RendererVertex);
     // Line passes always push their own identity transform: overlay lines must
@@ -893,6 +957,21 @@ struct VkRenderer::Impl {
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                          sizeof(PushData), &linePush);
       vkCmdDraw(command, static_cast<std::uint32_t>(depthLineCount), 1, 0, 0);
+    }
+    // Keep scene-depth lines behind the hands, then discard scene depth so
+    // hands remain on top while still occluding one another. Overlay lines
+    // follow the hand pass and remain unconditionally on top.
+    bool const hasHands = std::any_of(items.begin(), items.end(),
+                                      [&](DrawItem const& item) { return isHand(item.mesh); });
+    if (hasHands) {
+      VkClearAttachment clear{};
+      clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+      clear.clearValue.depthStencil = {1.0F, 0};
+      VkClearRect clearRect{};
+      clearRect.rect = scissor;
+      clearRect.layerCount = 1;
+      vkCmdClearAttachments(command, 1, &clear, 1, &clearRect);
+      drawMeshes(true);
     }
     if (overlayLineCount > 0U) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, lineOverlayPipeline);
@@ -981,6 +1060,9 @@ struct VkRenderer::Impl {
         slot.hasSort = false;
       }
       return checkVk(submitResult, "vkQueueSubmit");
+    }
+    for (auto& hand : hands) {
+      hand.dirty = false;
     }
     return true;
   }
@@ -1377,6 +1459,7 @@ bool VkRenderer::createCommonResources(char const* shaderDir, VkFormat colourFor
   }
   if (!g.createPipeline(true, true, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, g.meshPipeline) ||
       !g.createPipeline(true, false, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, true, g.blendPipeline) ||
+      !g.createPipeline(true, true, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, false, g.handPipeline) ||
       !g.createPipeline(true, false, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false, g.lineDepthPipeline) ||
       !g.createPipeline(false, false, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, false,
                         g.lineOverlayPipeline)) {
@@ -1405,7 +1488,7 @@ void VkRenderer::shutdown() {
   }
   g.blendScratch.clear();
   for (VkPipeline pipeline :
-       {g.meshPipeline, g.blendPipeline, g.lineDepthPipeline, g.lineOverlayPipeline}) {
+       {g.meshPipeline, g.blendPipeline, g.handPipeline, g.lineDepthPipeline, g.lineOverlayPipeline}) {
     if (pipeline != VK_NULL_HANDLE) {
       vkDestroyPipeline(g.device, pipeline, nullptr);
     }
@@ -1458,6 +1541,18 @@ void VkRenderer::shutdown() {
     }
   }
   g.meshes.clear();
+  for (auto& hand : g.hands) {
+    if (hand.mapped != nullptr) {
+      vkUnmapMemory(g.device, hand.memory);
+    }
+    if (hand.staging != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, hand.staging, nullptr);
+    }
+    if (hand.memory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, hand.memory, nullptr);
+    }
+    hand = {};
+  }
   for (auto [buffer, memory] : {std::pair<VkBuffer, VkDeviceMemory>{g.lineBuffer, g.lineMemory},
                                 std::pair<VkBuffer, VkDeviceMemory>{g.uniformBuffer, g.uniformMemory},
                                 std::pair<VkBuffer, VkDeviceMemory>{g.readbackBuffer,
@@ -1647,6 +1742,86 @@ MeshHandle VkRenderer::addMesh(MeshData const& data) {
   record.indexCount = static_cast<std::uint32_t>(data.indices.size());
   g.meshes.push_back(std::move(record));
   return static_cast<MeshHandle>(g.meshes.size() - 1U);
+}
+
+MeshHandle VkRenderer::updateHandMesh(std::size_t slot, MeshData const& data) {
+  Impl& g = *impl_;
+  if (g.device == VK_NULL_HANDLE || g.fence == VK_NULL_HANDLE || slot >= kHandMeshSlots ||
+      data.vertices.size() > kHandMeshMaxVertices || data.indices.size() > kHandMeshMaxIndices ||
+      data.indices.size() % 3U != 0U || data.vertices.empty() != data.indices.empty()) {
+    return kInvalidMesh;
+  }
+  for (std::uint32_t index : data.indices) {
+    if (index >= data.vertices.size()) {
+      return kInvalidMesh;
+    }
+  }
+  if (!checkVk(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX),
+               "hand mesh fence wait")) {
+    return kInvalidMesh;
+  }
+
+  auto& hand = g.hands[slot];
+  if (hand.handle == kInvalidMesh) {
+    if (g.meshes.size() >= kInvalidMesh) {
+      return kInvalidMesh;
+    }
+    constexpr VkDeviceSize vertexCapacity = sizeof(MeshVertex) * kHandMeshMaxVertices;
+    constexpr VkDeviceSize indexCapacity = sizeof(std::uint32_t) * kHandMeshMaxIndices;
+    Impl::MeshRecord record{};
+    bool ok = g.createBuffer(vertexCapacity + indexCapacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             hand.staging, hand.memory, &hand.mapped);
+    if (ok) {
+      ok = g.createBuffer(vertexCapacity, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, record.vertexBuffer,
+                          record.vertexMemory, nullptr);
+    }
+    if (ok) {
+      ok = g.createBuffer(indexCapacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, record.indexBuffer,
+                          record.indexMemory, nullptr);
+    }
+    if (!ok) {
+      if (hand.mapped != nullptr) {
+        vkUnmapMemory(g.device, hand.memory);
+      }
+      if (hand.staging != VK_NULL_HANDLE) {
+        vkDestroyBuffer(g.device, hand.staging, nullptr);
+      }
+      if (hand.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(g.device, hand.memory, nullptr);
+      }
+      if (record.vertexBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
+      }
+      if (record.vertexMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(g.device, record.vertexMemory, nullptr);
+      }
+      if (record.indexBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
+      }
+      if (record.indexMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(g.device, record.indexMemory, nullptr);
+      }
+      hand = {};
+      return kInvalidMesh;
+    }
+    hand.handle = static_cast<MeshHandle>(g.meshes.size());
+    g.meshes.push_back(std::move(record));
+  }
+
+  hand.vertexBytes = sizeof(MeshVertex) * data.vertices.size();
+  hand.indexBytes = sizeof(std::uint32_t) * data.indices.size();
+  if (!data.indices.empty()) {
+    auto* staging = static_cast<std::uint8_t*>(hand.mapped);
+    std::memcpy(staging, data.vertices.data(), static_cast<std::size_t>(hand.vertexBytes));
+    std::memcpy(staging + sizeof(MeshVertex) * kHandMeshMaxVertices, data.indices.data(),
+                static_cast<std::size_t>(hand.indexBytes));
+  }
+  g.meshes[hand.handle].indexCount = static_cast<std::uint32_t>(data.indices.size());
+  hand.dirty = true;
+  return hand.handle;
 }
 
 // True when `image` needs the upload-budget resample: oversize or NPOT
@@ -2003,6 +2178,12 @@ bool VkRenderer::draw(Camera const& camera,
   }
 
   g.items = items;
+  for (DrawItem& item : g.items) {
+    if (g.isHand(item.mesh)) {
+      item.alpha = AlphaMode::Opaque;
+      item.alphaFactor = 1.0F;
+    }
+  }
   Impl::Target target = g.windowed ? Impl::Target::Window : Impl::Target::Readback;
   VkImage colourImageUsed = g.windowed ? g.swapchainImages[g.swapchainIndex] : g.colourImage;
   if (!g.recordCommands(depthCount, overlayLines.size(), colourViewUsed, colourImageUsed, target,
@@ -2084,6 +2265,12 @@ bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const&
   }
 
   g.items = items;
+  for (DrawItem& item : g.items) {
+    if (g.isHand(item.mesh)) {
+      item.alpha = AlphaMode::Opaque;
+      item.alphaFactor = 1.0F;
+    }
+  }
   if (!g.recordCommands(depthCount, overlayLines.size(), target, targetImage,
                         Impl::Target::External, view, cameraPos)) {
     return false;
