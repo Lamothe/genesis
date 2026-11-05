@@ -685,7 +685,7 @@ struct VkRenderer::Impl {
     rendering.pColorAttachments = &colourAttachment;
     rendering.pDepthAttachment = &depthAttachment;
 
-    // Draw order: opaque/mask items keep the app's order; blend items draw
+    // Draw order: opaque/mask, hands, then blend. Blend items draw
     // farthest-centre-first with a stable tie-break — the Centre Stage rule
     // ("hair shells painted over strands unsorted"). Per view, so both eyes
     // sort for their own camera. Within a blend item the same rule applies
@@ -697,7 +697,7 @@ struct VkRenderer::Impl {
     std::vector<float> centreDist2(items.size(), 0.0F);
     for (std::size_t i = 0; i < items.size(); ++i) {
       DrawItem const& item = items[i];
-      if (item.alpha != AlphaMode::Blend) {
+      if (isHand(item.mesh) || item.alpha != AlphaMode::Blend) {
         continue;
       }
       std::size_t const centreHandle = item.mesh < meshes.size() ? item.mesh : 0U;
@@ -712,18 +712,16 @@ struct VkRenderer::Impl {
       centreDist2[i] = d.x * d.x + d.y * d.y + d.z * d.z;
     }
     std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
-      bool const aHand = isHand(items[a].mesh);
-      bool const bHand = isHand(items[b].mesh);
-      if (aHand != bHand) {
-        return !aHand;
+      auto category = [&](DrawItem const& item) {
+        return isHand(item.mesh) ? 1 : (item.alpha == AlphaMode::Blend ? 2 : 0);
+      };
+      int const aCategory = category(items[a]);
+      int const bCategory = category(items[b]);
+      if (aCategory != bCategory) {
+        return aCategory < bCategory;
       }
-      bool const aBlend = items[a].alpha == AlphaMode::Blend;
-      bool const bBlend = items[b].alpha == AlphaMode::Blend;
-      if (aBlend != bBlend) {
-        return !aBlend; // non-blend first
-      }
-      if (!aBlend) {
-        return false; // non-blend items keep the app's order
+      if (aCategory != 2) {
+        return false; // opaque/mask and hands keep the app's order
       }
       return centreDist2[a] > centreDist2[b]; // blend: farthest centre first
     });
@@ -763,7 +761,7 @@ struct VkRenderer::Impl {
     std::size_t blendCount = 0;
     VkDeviceSize stagingBytes = 0;
     for (std::size_t i = 0; i < items.size(); ++i) {
-      if (items[i].alpha != AlphaMode::Blend) {
+      if (isHand(items[i].mesh) || items[i].alpha != AlphaMode::Blend) {
         continue;
       }
       ++blendCount;
@@ -789,7 +787,7 @@ struct VkRenderer::Impl {
       auto* staging = static_cast<std::uint8_t*>(stagingMapped);
       for (std::size_t oi = 0; oi < order.size() && sortActive; ++oi) {
         DrawItem const& item = items[order[oi]];
-        if (item.alpha != AlphaMode::Blend) {
+        if (isHand(item.mesh) || item.alpha != AlphaMode::Blend) {
           continue;
         }
         std::size_t const handle = item.mesh < meshes.size() ? item.mesh : 0U;
@@ -887,13 +885,14 @@ struct VkRenderer::Impl {
     vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1,
                             &descriptorSet, 0, nullptr);
 
-    // Meshes: one indexed draw per item in the computed order (opaque+mask
-    // first, blends last; blend draws read their per-view sorted indices).
+    // Meshes: opaque/mask, depth-writing hands, then sorted scene blends.
     std::size_t drawBlendSlot = 0;
-    auto drawMeshes = [&](bool handPass) {
+    auto drawMeshes = [&](int pass) {
       for (std::size_t oi = 0; oi < order.size(); ++oi) {
         DrawItem const& item = items[order[oi]];
-        if (isHand(item.mesh) != handPass) {
+        bool const handPass = isHand(item.mesh);
+        int const itemPass = handPass ? 1 : (item.alpha == AlphaMode::Blend ? 2 : 0);
+        if (itemPass != pass) {
           continue;
         }
         std::size_t handle = item.mesh < meshes.size() ? item.mesh : 0U;
@@ -904,7 +903,7 @@ struct VkRenderer::Impl {
         VkDeviceSize zero = 0;
         vkCmdBindVertexBuffers(command, 0, 1, &record.vertexBuffer, &zero);
         VkBuffer indexUsed = record.indexBuffer;
-        if (sortActive && item.alpha == AlphaMode::Blend) {
+        if (sortActive && itemPass == 2) {
           indexUsed = blendScratch[drawBlendSlot++].indexBuffer;
         }
         vkCmdBindIndexBuffer(command, indexUsed, 0, VK_INDEX_TYPE_UINT32);
@@ -935,7 +934,9 @@ struct VkRenderer::Impl {
         vkCmdDrawIndexed(command, record.indexCount, 1, 0, 0, 0);
       }
     };
-    drawMeshes(false);
+    drawMeshes(0);
+    drawMeshes(1);
+    drawMeshes(2);
 
     VkDeviceSize stride = sizeof(RendererVertex);
     // Line passes always push their own identity transform: overlay lines must
@@ -957,21 +958,6 @@ struct VkRenderer::Impl {
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                          sizeof(PushData), &linePush);
       vkCmdDraw(command, static_cast<std::uint32_t>(depthLineCount), 1, 0, 0);
-    }
-    // Keep scene-depth lines behind the hands, then discard scene depth so
-    // hands remain on top while still occluding one another. Overlay lines
-    // follow the hand pass and remain unconditionally on top.
-    bool const hasHands = std::any_of(items.begin(), items.end(),
-                                      [&](DrawItem const& item) { return isHand(item.mesh); });
-    if (hasHands) {
-      VkClearAttachment clear{};
-      clear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-      clear.clearValue.depthStencil = {1.0F, 0};
-      VkClearRect clearRect{};
-      clearRect.rect = scissor;
-      clearRect.layerCount = 1;
-      vkCmdClearAttachments(command, 1, &clear, 1, &clearRect);
-      drawMeshes(true);
     }
     if (overlayLineCount > 0U) {
       vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, lineOverlayPipeline);

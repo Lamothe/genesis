@@ -95,7 +95,7 @@ buttons and sticks are unchanged:
   the distance between the palms to scale uniformly about the model's centre.
   Releasing either hand ends the edit; release the right hand before another
   edit. Both hands are shown as tracked, procedurally generated 3D surfaces
-  over models; they are not the downloaded rigged asset.
+  depth-tested against models; they are not the downloaded rigged asset.
 - After selecting a model, bring the right hand near its surface and close it
   to grab and rotate it directly; opening the hand releases it. This uses the
   runtime grasp gesture and does not provide collision or haptic resistance.

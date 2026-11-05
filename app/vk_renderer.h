@@ -42,12 +42,13 @@ public:
   // Safe to call at any time; internally synchronises with in-flight frames.
   MeshHandle addMesh(MeshData const& data);
 
-  // Two reusable opaque hand meshes, drawn on top of the scene with depth
-  // testing among hand triangles and slots. slot is 0 (left) or 1
+  // Two reusable opaque hand meshes, depth-tested against scene geometry
+  // and each other. slot is 0 (left) or 1
   // (right); each has a stable handle and fixed capacity. The caller adds a
   // DrawItem with that handle to each eye/frame; its material is forced opaque.
-  // The hand pass clears scene depth after scene geometry and depth lines;
-  // overlay lines still draw on top. Hands remain clip-volume limited. Empty
+  // Hands share opaque/masked scene depth; translucent scene geometry is
+  // blended afterwards. Overlay lines draw on top. Hands are clip-volume
+  // limited. Empty
   // vertex and index arrays clear the slot. Invalid input or a
   // Vulkan failure returns kInvalidMesh and leaves the previous data intact.
   // Update is fence-synchronised; call on the renderer thread, before drawing.

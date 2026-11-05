@@ -146,8 +146,7 @@ int main() {
       return 1;
     }
   }
-  // Two stable hand slots update in place, render over occluders without
-  // disturbing ordinary depth, and may change size or be cleared.
+  // Two stable hand slots update in place and share scene depth.
   camera.position.z = 0.0F;
   MeshData hand;
   hand.vertices = {vertex({-0.8F, -0.8F, -3.0F}, normal, {1, 0, 0}),
@@ -163,7 +162,9 @@ int main() {
   }
   MeshData occluder = hand;
   for (auto& v : occluder.vertices) {
-    v.pos.z = -2.0F;
+    v.pos.x *= 4.0F / 3.0F;
+    v.pos.y *= 4.0F / 3.0F;
+    v.pos.z = -4.0F;
     v.colour = {0, 0, 1};
   }
   DrawItem sceneItem;
@@ -175,14 +176,113 @@ int main() {
   handItem.alpha = AlphaMode::Blend; // forced opaque
   handItem.alphaFactor = 0.1F;
   auto drawHand = [&]() {
-    // Hand listed first deliberately; renderer must still draw it last.
+    // Hand listed first deliberately; opaque scene must be drawn first.
     return renderer.draw(camera, {handItem, sceneItem}, {}, {}) && renderer.readback(pixels);
   };
   if (sceneItem.mesh == kInvalidMesh || !drawHand() || pixels[centre] < 240 ||
       pixels[centre + 2] > 10) {
-    std::printf("renderer test: hand overlay occlusion/opacity failed\n");
+    std::printf("renderer test: hand in front of opaque scene failed\n");
     return 1;
   }
+  // Inverting the depth must hide the hand, regardless of submission order.
+  DrawItem nearScene = sceneItem;
+  nearScene.model = scaleMatrix({0.5F, 0.5F, 0.5F});
+  for (int order = 0; order < 2; ++order) {
+    auto draws = order == 0 ? std::vector<DrawItem>{handItem, nearScene}
+                            : std::vector<DrawItem>{nearScene, handItem};
+    if (!renderer.draw(camera, draws, {}, {}) || !renderer.readback(pixels) ||
+        pixels[centre] > 10 || pixels[centre + 2] < 240) {
+      std::printf("renderer test: opaque in front of hand failed, order %d\n", order);
+      return 1;
+    }
+  }
+
+  // A sloping hand crosses the scene plane: both visible regions must coexist.
+  MeshData crossing = hand;
+  crossing.vertices[0].pos = {-0.8F * 2.0F / 3.0F, -0.8F * 2.0F / 3.0F, -2.0F};
+  crossing.vertices[1].pos = {0.8F * 4.0F / 3.0F, -0.8F * 4.0F / 3.0F, -4.0F};
+  DrawItem middleScene = sceneItem;
+  middleScene.model = scaleMatrix({0.75F, 0.75F, 0.75F});
+  auto sample = [&](std::uint32_t x, std::uint32_t y, unsigned channel) {
+    return pixels[(y * config.width + x) * 4U + channel];
+  };
+  if (renderer.updateHandMesh(0, crossing) != handHandle ||
+      !renderer.draw(camera, {handItem, middleScene}, {}, {}) || !renderer.readback(pixels) ||
+      sample(40, 52, 0) < 240 || sample(40, 52, 2) > 10 ||
+      sample(56, 52, 2) < 240 || sample(56, 52, 0) > 10 ||
+      renderer.updateHandMesh(0, hand) != handHandle) {
+    std::printf("renderer test: hand/scene intersection failed\n");
+    return 1;
+  }
+
+  // A cutout in front writes depth only for retained mask fragments.
+  Image cutout;
+  cutout.width = 2;
+  cutout.height = 1;
+  cutout.rgba = {255, 255, 255, 0, 255, 255, 255, 255};
+  auto const cutoutTexture = renderer.addTexture(cutout, false, false);
+  MeshData mask;
+  mask.vertices = {vertex({-0.8F, -0.8F, -2.0F}, normal, {0, 0, 1}),
+                   vertex({0.8F, -0.8F, -2.0F}, normal, {0, 0, 1}),
+                   vertex({0.8F, 0.8F, -2.0F}, normal, {0, 0, 1}),
+                   vertex({-0.8F, 0.8F, -2.0F}, normal, {0, 0, 1})};
+  mask.vertices[0].uv = {0, 0};
+  mask.vertices[1].uv = {1, 0};
+  mask.vertices[2].uv = {1, 1};
+  mask.vertices[3].uv = {0, 1};
+  mask.indices = {0, 1, 2, 0, 2, 3};
+  DrawItem maskItem;
+  maskItem.mesh = renderer.addMesh(mask);
+  maskItem.texture = cutoutTexture;
+  maskItem.alpha = AlphaMode::Mask;
+  maskItem.alphaCutoff = 0.5F;
+  maskItem.lit = false;
+  if (cutoutTexture == kInvalidTexture || maskItem.mesh == kInvalidMesh ||
+      !renderer.draw(camera, {handItem, maskItem}, {}, {}) || !renderer.readback(pixels) ||
+      sample(40, 52, 0) < 240 || sample(40, 52, 2) > 10 ||
+      sample(56, 52, 2) < 240 || sample(56, 52, 0) > 10) {
+    std::printf("renderer test: mask cutout depth failed\n");
+    return 1;
+  }
+
+  // Front blend composites over the hand; a blend behind it fails depth.
+  // The second blend exercises scratch slot indexing and reuse across frames.
+  DrawItem frontBlend = nearScene;
+  frontBlend.alpha = AlphaMode::Blend;
+  frontBlend.alphaFactor = 0.5F;
+  DrawItem backBlend = sceneItem;
+  backBlend.alpha = AlphaMode::Blend;
+  backBlend.alphaFactor = 0.5F;
+  for (int frame = 0; frame < 3; ++frame) {
+    // Alternate eye-like views to exercise per-view ordering and scratch reuse.
+    camera.position.x = frame == 0 ? -0.03F : (frame == 1 ? 0.03F : -0.03F);
+    if (!renderer.draw(camera, {frontBlend, handItem, backBlend}, {}, {}) ||
+        !renderer.readback(pixels) || pixels[centre] < 115 || pixels[centre] > 140 ||
+        pixels[centre + 1] > 10 || pixels[centre + 2] < 115 || pixels[centre + 2] > 140 ||
+        !renderer.draw(camera, {backBlend, handItem}, {}, {}) || !renderer.readback(pixels) ||
+        pixels[centre] < 240 || pixels[centre + 2] > 10) {
+      std::printf("renderer test: blended scene/hand depth failed, frame %d\n", frame);
+      return 1;
+    }
+  }
+  // Distinct blend meshes on both scratch slots: the first has deliberately
+  // reversed triangle indices; the second has only one triangle. The hand is
+  // behind both and must not consume a sorted-index slot.
+  DrawItem farHandItem = handItem;
+  farHandItem.model = translationMatrix({0, 0, -2});
+  DrawItem closestBlend = frontBlend;
+  closestBlend.model = scaleMatrix({0.375F, 0.375F, 0.375F});
+  for (int frame = 0; frame < 3; ++frame) {
+    camera.position.x = frame == 1 ? 0.03F : -0.03F;
+    if (!renderer.draw(camera, {closestBlend, farHandItem, item}, {}, {}) ||
+        !renderer.readback(pixels) || pixels[centre] < 85 || pixels[centre] > 105 ||
+        pixels[centre + 1] > 10 || pixels[centre + 2] < 150 || pixels[centre + 2] > 170) {
+      std::printf("renderer test: blend scratch alignment failed, frame %d\n", frame);
+      return 1;
+    }
+  }
+  camera.position.x = 0.0F;
+
   // Even transparent textures and hostile material settings cannot make a
   // hand translucent or discard it. Check alpha over a transparent clear and
   // colour over scene geometry, for both BLEND and MASK input modes.
@@ -213,8 +313,7 @@ int main() {
     }
   }
   renderer.setClearColour(0.08F, 0.09F, 0.11F, 1.0F);
-  // Overlapping triangles in one hand must resolve by depth, not index order,
-  // even when the scene (including a transparent draw) is closer than both.
+  // Overlapping triangles in one hand must resolve by depth, not index order.
   MeshData overlapping = hand;
   for (auto const& v : hand.vertices) {
     auto farVertex = v;
@@ -224,14 +323,11 @@ int main() {
     farVertex.colour = {0, 1, 0};
     overlapping.vertices.push_back(farVertex);
   }
-  DrawItem transparentScene = sceneItem;
-  transparentScene.alpha = AlphaMode::Blend;
-  transparentScene.alphaFactor = 0.5F;
   for (int order = 0; order < 2; ++order) {
     overlapping.indices = order == 0 ? std::vector<std::uint32_t>{0, 1, 2, 3, 4, 5}
                                      : std::vector<std::uint32_t>{3, 4, 5, 0, 1, 2};
     if (renderer.updateHandMesh(0, overlapping) != handHandle ||
-        !renderer.draw(camera, {handItem, sceneItem, transparentScene}, {}, {}) ||
+        !renderer.draw(camera, {handItem, sceneItem}, {}, {}) ||
         !renderer.readback(pixels) || pixels[centre] < 240 ||
         pixels[centre + 1] > 10 || pixels[centre + 2] > 10) {
       std::printf("renderer test: hand triangle depth failed for order %d\n", order);
@@ -273,8 +369,7 @@ int main() {
     return 1;
   }
 
-  // A depth-tested line in front of the scene is covered by the hand, while
-  // the same line in the overlay pass is visible even behind the hand.
+  // Depth lines respect both scene and hands; overlay lines ignore depth.
   std::vector<RendererVertex> line = {
       vertex({-0.4F, 0.0F, -1.5F}, normal, {0, 1, 0}),
       vertex({0.4F, 0.0F, -1.5F}, normal, {0, 1, 0})};
@@ -292,14 +387,15 @@ int main() {
   if (!renderer.draw(camera, {sceneItem}, line, {}) || !renderer.readback(pixels) ||
       !greenInCentre() ||
       !renderer.draw(camera, {sceneItem, handItem}, line, {}) || !renderer.readback(pixels) ||
-      greenInCentre()) {
+      !greenInCentre()) {
     std::printf("renderer test: scene depth line ordering failed\n");
     return 1;
   }
   for (auto& v : line) {
-    v.pos.z = -4.0F;
+    v.pos.z = -3.5F;
   }
-  if (!renderer.draw(camera, {sceneItem, handItem}, {}, line) || !renderer.readback(pixels) ||
+  if (!renderer.draw(camera, {sceneItem, handItem}, line, {}) || !renderer.readback(pixels) ||
+      greenInCentre() || !renderer.draw(camera, {sceneItem, handItem}, {}, line) || !renderer.readback(pixels) ||
       !greenInCentre()) {
     std::printf("renderer test: overlay line ordering failed\n");
     return 1;
@@ -336,7 +432,7 @@ int main() {
   }
   MeshData farther = occluder;
   for (auto& v : farther.vertices) {
-    v.pos.z = -2.5F;
+    v.pos.z = -5.0F;
     v.pos.x *= 1.25F;
     v.pos.y *= 1.25F;
     v.colour = {1, 0, 0};
@@ -368,7 +464,7 @@ int main() {
     std::printf("renderer test: hand reactivation failed\n");
     return 1;
   }
-  std::printf("renderer tests: dynamic hand slots, overlay, bounds and clear passed\n");
+  std::printf("renderer tests: scene-correct hand depth, slots, lines, bounds and clear passed\n");
   std::printf("renderer tests: nonuniform/mirrored/singular normals and blend sort/reuse passed\n");
   return 0;
 }
