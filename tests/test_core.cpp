@@ -343,6 +343,131 @@ void testPickClosestSurface() {
   CHECK(!miss.has_value());
 }
 
+// The BVH is a rejection accelerator only: every hit, miss, node and distance
+// must match a full brute-force scan through the same exact world-space test.
+// A mirrored, non-uniform transform and one shared geometry on two different
+// nodes catch a tree that accidentally caches world-space bounds.
+void testPickBvhMatchesBruteForce() {
+  auto geometry = std::make_shared<vredit::PickGeometry>();
+  constexpr int kGrid = 24;
+  for (int y = 0; y <= kGrid; ++y) {
+    for (int x = 0; x <= kGrid; ++x) {
+      float const fx = -1.0F + 2.0F * static_cast<float>(x) / static_cast<float>(kGrid);
+      float const fy = -1.0F + 2.0F * static_cast<float>(y) / static_cast<float>(kGrid);
+      geometry->positions.push_back(
+          {fx, fy, 0.2F * std::sin(fx * 5.1F) * std::cos(fy * 4.3F)});
+    }
+  }
+  for (int y = 0; y < kGrid; ++y) {
+    for (int x = 0; x < kGrid; ++x) {
+      auto const i0 = static_cast<std::uint32_t>(y * (kGrid + 1) + x);
+      auto const i1 = i0 + 1U;
+      auto const i2 = i0 + static_cast<std::uint32_t>(kGrid + 1);
+      auto const i3 = i2 + 1U;
+      geometry->indices.insert(geometry->indices.end(), {i0, i1, i2, i1, i3, i2});
+    }
+  }
+  // Malformed trailing triangle: both paths must skip it, not crash the build.
+  geometry->indices.insert(geometry->indices.end(), {0U, 1U, 999999U});
+
+  vredit::Aabb const localBounds{{-1.0F, -1.0F, -0.3F}, {1.0F, 1.0F, 0.3F}};
+  vredit::Mat4 const world = mul(
+      translationMatrix({0.7F, -0.4F, 1.3F}),
+      mul(rotationMatrix(quatFromAxisAngle({0.3F, 1.0F, 0.2F}, 0.7F)),
+          scaleMatrix({-1.4F, 0.9F, 1.2F})));
+  vredit::Mat4 const secondWorld = translationMatrix({-3.0F, 0.2F, 0.5F});
+
+  vredit::PickCandidate first;
+  first.node = 11;
+  first.world = world;
+  first.geometry = geometry;
+  first.worldBounds = transformAabb(world, localBounds);
+  vredit::PickCandidate second = first;
+  second.node = 12;
+  second.world = secondWorld;
+  second.worldBounds = transformAabb(secondWorld, localBounds);
+  std::vector<vredit::PickCandidate> const candidates{first, second};
+
+  auto bruteForce = [&candidates](vredit::Ray const& ray) -> std::optional<vredit::PickHit> {
+    std::optional<vredit::PickHit> best;
+    for (auto const& candidate : candidates) {
+      float boundT = 0.0F;
+      if (!rayAabb(ray, candidate.worldBounds, boundT)) {
+        continue;
+      }
+      if (best.has_value() && boundT >= best->t) {
+        continue;
+      }
+      vredit::PickGeometry const& geometry = *candidate.geometry;
+      float hitT = 0.0F;
+      bool hit = false;
+      for (std::size_t i = 0; i + 2U < geometry.indices.size(); i += 3U) {
+        auto const i0 = geometry.indices[i];
+        auto const i1 = geometry.indices[i + 1U];
+        auto const i2 = geometry.indices[i + 2U];
+        if (i0 >= geometry.positions.size() || i1 >= geometry.positions.size() ||
+            i2 >= geometry.positions.size()) {
+          continue;
+        }
+        Vec3 const a = transformPoint(candidate.world, geometry.positions[i0]);
+        Vec3 const b = transformPoint(candidate.world, geometry.positions[i1]);
+        Vec3 const c = transformPoint(candidate.world, geometry.positions[i2]);
+        float t = 0.0F;
+        if (rayTriangle(ray, a, b, c, t) && (!hit || t < hitT)) {
+          hitT = t;
+          hit = true;
+        }
+      }
+      if (hit && (!best.has_value() || hitT < best->t)) {
+        best = vredit::PickHit{candidate.node, hitT, ray.origin + ray.direction * hitT};
+      }
+    }
+    return best;
+  };
+
+  std::uint32_t state = 0x9E3779B9U;
+  auto next = [&state]() {
+    state = state * 1664525U + 1013904223U;
+    return static_cast<float>((state >> 8) & 0xFFFFU) / 65535.0F;
+  };
+
+  int hits = 0;
+  int misses = 0;
+  for (int i = 0; i < 400; ++i) {
+    Vec3 const target = transformPoint(world, {next() * 2.4F - 1.2F, next() * 2.4F - 1.2F, 0.0F});
+    Vec3 const origin{target.x + next() * 3.0F - 1.5F,
+                      target.y + next() * 3.0F - 1.5F,
+                      target.z + 2.0F + next() * 2.0F};
+    vredit::Ray const ray{origin, normalized(target - origin)};
+    auto const got = vredit::pickClosestSurface(ray, candidates);
+    auto const want = bruteForce(ray);
+    CHECK(got.has_value() == want.has_value());
+    if (got.has_value() && want.has_value()) {
+      ++hits;
+      CHECK(got->node == want->node);
+      CHECK_NEAR(got->t, want->t, 1e-4F);
+    } else {
+      ++misses;
+    }
+  }
+  CHECK(hits > 40);
+  CHECK(misses > 20);
+
+  // A plane-parallel ray and a ray pointing away are misses in both paths.
+  vredit::Ray const parallel{transformPoint(world, {0.0F, 0.0F, 2.0F}),
+                             normalized(transformVector(world, {1.0F, 0.0F, 0.0F}))};
+  vredit::Ray const away{transformPoint(world, {0.0F, 0.0F, -2.0F}),
+                         normalized(transformVector(world, {0.0F, 0.0F, -1.0F}))};
+  for (vredit::Ray const& ray : {parallel, away}) {
+    auto const got = vredit::pickClosestSurface(ray, candidates);
+    auto const want = bruteForce(ray);
+    CHECK(got.has_value() == want.has_value());
+    if (got.has_value() && want.has_value()) {
+      CHECK_NEAR(got->t, want->t, 1e-4F);
+    }
+  }
+}
+
 void testSceneSnapshotRestore() {
   vredit::Scene scene;
   vredit::NodeId a = scene.create();
@@ -2720,6 +2845,7 @@ int main() {
   testRayTriangle();
   testPickClosest();
   testPickClosestSurface();
+  testPickBvhMatchesBruteForce();
   testSceneSnapshotRestore();
   testUndoHistory();
   testCancelPendingEdit();

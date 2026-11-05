@@ -69,7 +69,7 @@ the library; clicking the exact surface of the centred preview places the
 staged model below the centred preview as one undo step and takes priority
 over browsing. Otherwise, clicking anywhere left or right of centre browses
 one model per click (previous on the left, next on the right — there is no
-central dead zone). **N**
+central dead zone; a grazing clip is inert). **N**
 closes without placing), **Delete** removes the selection (model or part),
 **Esc** quits. The selection is marked by a thin warm rim in the shader (a
 part selection marks the part) and the current mode's name shows as
@@ -85,8 +85,10 @@ buttons and sticks are unchanged:
   preview to place it (an exact hit has priority over browsing). Otherwise,
   pinching anywhere left or right of centre browses one model (previous on
   the left, next on the right — there is no central dead zone). A grazing
-  clip from a backward or plane-parallel ray never places, and a pinch with
-  an untracked aim (the head-gaze fallback) neither browses nor places.
+  clip from a backward or plane-parallel ray neither places nor browses, and
+  a pinch with an untracked aim (a valid pose that is not actively tracked)
+  neither browses nor places; the head-gaze fallback never acts on the
+  carousel.
   Placing a model closes the menu. While the aim rests exactly on the
   placeable preview's surface it wears a subtle rim highlight; the
   highlight never appears while the ring is moving or the aim is untracked.
@@ -153,7 +155,8 @@ trigger places the centred model only when its exact preview surface is hit,
 at natural size on the floor below the centred preview — one undo step
 (undo removes it entirely), and the carousel closes. Otherwise, a trigger
 with a tracked right aim anywhere left or right of centre browses one model
-(previous on the left, next on the right — there is no central dead zone).
+(previous on the left, next on the right — there is no central dead zone; a
+grazing clip is inert).
 **A**, a **menu tap** or undo (B) closes without placing. The library folder
 (`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
 opens — drop a file in and place it without restarting. **Hold X** to

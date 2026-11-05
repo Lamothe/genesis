@@ -23,10 +23,18 @@ struct PickHit {
 std::optional<PickHit> pickClosest(Ray const& ray,
                                    std::vector<std::pair<NodeId, Aabb>> const& candidates);
 
+// Conservative triangle tree, built lazily from a PickGeometry. Opaque here.
+struct PickBvh;
+
 // Exact picking geometry in node-local space (positions + triangle indices).
 struct PickGeometry {
   std::vector<Vec3> positions;
   std::vector<std::uint32_t> indices;
+  // Conservative local-space acceleration tree for exact surface picks. Built
+  // on the first pick and immutable afterwards; picks run on the frame thread,
+  // so the one-time build needs no lock. Do not mutate positions/indices after
+  // the first pick (the tree would no longer match them).
+  mutable std::shared_ptr<const PickBvh> bvh;
 };
 
 // A pickable visual: world bounds for broadphase plus optional exact geometry.
@@ -45,6 +53,10 @@ struct PickCandidate {
 // their bounds entry, exact for the built-in cube. A candidate WITH geometry
 // that the ray misses is no hit at all — the bounding box is not part of the
 // click target, so empty space next to a model selects nothing.
+//
+// Geometry candidates use a lazily built triangle BVH: node bounds are only a
+// conservative rejection test, every accepted triangle still goes through the
+// same exact world-space ray test, so results are identical to a full scan.
 std::optional<PickHit> pickClosestSurface(Ray const& ray,
                                           std::vector<PickCandidate> const& candidates);
 

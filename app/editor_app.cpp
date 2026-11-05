@@ -2215,12 +2215,14 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
       std::printf("SMOKE FAIL: carousel highlight render\n");
       return 1;
     }
-    // Count changed PIXELS and require the change to be COOL (blue-dominant):
-    // a shader regression that routed 6 into the warm selection rim or the red
-    // delete ramp would still change pixels, so direction is the assertion.
+    // Count changed PIXELS in the RGBA8 readback and require the change to be
+    // COOL (blue-dominant): a shader regression that routed 6 into the warm
+    // selection rim or the red delete ramp would still change pixels, so
+    // direction is the assertion. The buffer is RGBA, so the stride is 4:
+    // stepping 3 would compare channels from different pixels.
     int changed = 0;
     int cooled = 0;
-    for (std::size_t i = 0; i + 2 < plain.size(); i += 3) {
+    for (std::size_t i = 0; i + 3 < plain.size(); i += 4) {
       int const dr = static_cast<int>(pixels[i]) - static_cast<int>(plain[i]);
       int const dg = static_cast<int>(pixels[i + 1]) - static_cast<int>(plain[i + 1]);
       int const db = static_cast<int>(pixels[i + 2]) - static_cast<int>(plain[i + 2]);
@@ -3493,7 +3495,9 @@ int runXr(char const* shaderDir,
                     "disabled until tracking returns\n");
         carouselAimWarned = true;
       }
-    } else {
+    } else if (!app.galleryActive) {
+      // Re-arm on close, not on the next tracked frame: TRACKED can flap and
+      // one line per carousel session is enough.
       carouselAimWarned = false;
     }
     bool const sceneHandTargeting = handCanTarget && !app.handUiOwned &&
@@ -3522,7 +3526,7 @@ int runXr(char const* shaderDir,
     // selection never becomes an edit. A held, armed squeeze may enter contact.
     if (graspGate.canAcquire(rightGrasp.pressed(), selectionLatch.primed()) &&
         !app.physicalGrab && !app.handUiOwned && !panelWanted && !handMenuOpen &&
-        !app.galleryActive && !app.stickSession && !handCarouselToggled &&
+        !app.galleryActive && !app.stickSession && !carouselToggled &&
         !input.undoPressed && !input.redoPressed && !app.selection.empty() &&
         selectedHandContact(app, input, rigWorld)) {
       if (app.handGrab) {
@@ -3542,8 +3546,8 @@ int runXr(char const* shaderDir,
     }
     if (input.selectPressed && !carouselToggled) {
       if (app.galleryActive) {
-        // The carousel is a spatial target: neither a hand nor a controller
-        // acts through the head-gaze fallback. This is the highlight gate too.
+        // The carousel is a spatial target: an untracked aim (VALID but not
+        // TRACKED) neither browses nor places. This is the highlight gate too.
         if (carouselAimTracked) { galleryPointerPress(app, renderer, worldRay); }
         graspGate.reset();
         rightGrasp.reset();
@@ -3748,7 +3752,7 @@ int runXr(char const* shaderDir,
     }
 
     // The placeable preview's rim is exactly "would this press place?" with
-    // the tracked-aim gate on top: the head-gaze fallback never lights it.
+    // the tracked-aim gate on top: a VALID-but-untracked pose never lights it.
     app.galleryAimPlaceable = galleryAimHighlight(app, worldRay, carouselAimTracked);
 
     std::vector<DrawItem> items;
