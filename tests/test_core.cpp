@@ -343,13 +343,13 @@ void testPickClosestSurface() {
   CHECK(!miss.has_value());
 }
 
-// The BVH is a rejection accelerator only: every hit, miss, node and distance
-// must match a full brute-force scan through the same exact world-space test.
+// The BVH is a rejection accelerator for finite geometry: every hit, miss, node
+// and distance must match a full brute-force scan through the same exact test.
 // A mirrored, non-uniform transform and one shared geometry on two different
 // nodes catch a tree that accidentally caches world-space bounds.
 void testPickBvhMatchesBruteForce() {
   auto geometry = std::make_shared<vredit::PickGeometry>();
-  constexpr int kGrid = 24;
+  constexpr int kGrid = 64;
   for (int y = 0; y <= kGrid; ++y) {
     for (int x = 0; x <= kGrid; ++x) {
       float const fx = -1.0F + 2.0F * static_cast<float>(x) / static_cast<float>(kGrid);
@@ -388,9 +388,11 @@ void testPickBvhMatchesBruteForce() {
   second.worldBounds = transformAabb(secondWorld, localBounds);
   std::vector<vredit::PickCandidate> const candidates{first, second};
 
-  auto bruteForce = [&candidates](vredit::Ray const& ray) -> std::optional<vredit::PickHit> {
+  auto bruteForce = [&](vredit::Ray const& ray,
+                        std::vector<vredit::PickCandidate> const& pool)
+      -> std::optional<vredit::PickHit> {
     std::optional<vredit::PickHit> best;
-    for (auto const& candidate : candidates) {
+    for (auto const& candidate : pool) {
       float boundT = 0.0F;
       if (!rayAabb(ray, candidate.worldBounds, boundT)) {
         continue;
@@ -399,7 +401,7 @@ void testPickBvhMatchesBruteForce() {
         continue;
       }
       vredit::PickGeometry const& geometry = *candidate.geometry;
-      float hitT = 0.0F;
+      float hitT = std::numeric_limits<float>::max();
       bool hit = false;
       for (std::size_t i = 0; i + 2U < geometry.indices.size(); i += 3U) {
         auto const i0 = geometry.indices[i];
@@ -413,7 +415,7 @@ void testPickBvhMatchesBruteForce() {
         Vec3 const b = transformPoint(candidate.world, geometry.positions[i1]);
         Vec3 const c = transformPoint(candidate.world, geometry.positions[i2]);
         float t = 0.0F;
-        if (rayTriangle(ray, a, b, c, t) && (!hit || t < hitT)) {
+        if (rayTriangle(ray, a, b, c, t) && t < hitT) {
           hitT = t;
           hit = true;
         }
@@ -440,7 +442,7 @@ void testPickBvhMatchesBruteForce() {
                       target.z + 2.0F + next() * 2.0F};
     vredit::Ray const ray{origin, normalized(target - origin)};
     auto const got = vredit::pickClosestSurface(ray, candidates);
-    auto const want = bruteForce(ray);
+    auto const want = bruteForce(ray, candidates);
     CHECK(got.has_value() == want.has_value());
     if (got.has_value() && want.has_value()) {
       ++hits;
@@ -460,12 +462,88 @@ void testPickBvhMatchesBruteForce() {
                          normalized(transformVector(world, {0.0F, 0.0F, -1.0F}))};
   for (vredit::Ray const& ray : {parallel, away}) {
     auto const got = vredit::pickClosestSurface(ray, candidates);
-    auto const want = bruteForce(ray);
+    auto const want = bruteForce(ray, candidates);
     CHECK(got.has_value() == want.has_value());
     if (got.has_value() && want.has_value()) {
       CHECK_NEAR(got->t, want->t, 1e-4F);
     }
   }
+
+  // A large world translation exercises the world-unit padding branch: rays
+  // aimed near shared vertices and edges must still match the full scan.
+  vredit::Mat4 const farWorld = mul(translationMatrix({1.0e5F, 0.0F, 0.0F}), world);
+  vredit::PickCandidate far = first;
+  far.node = 16;
+  far.world = farWorld;
+  far.worldBounds = transformAabb(farWorld, localBounds);
+  std::vector<vredit::PickCandidate> const farOnly{far};
+  int farHits = 0;
+  Vec3 const farNormal = normalized(transformVector(farWorld, {0.0F, 0.0F, 1.0F}));
+  for (float ox : {-0.05F, 0.0F, 0.05F}) {
+    for (float oy : {-0.05F, 0.0F, 0.05F}) {
+      float const z = 0.2F * std::sin(ox * 5.1F) * std::cos(oy * 4.3F);
+      Vec3 const target = transformPoint(farWorld, {ox, oy, z});
+      vredit::Ray const ray{target + farNormal * 2.0F, -farNormal};
+      auto const got = vredit::pickClosestSurface(ray, farOnly);
+      auto const want = bruteForce(ray, farOnly);
+      CHECK(got.has_value() == want.has_value());
+      if (got.has_value() && want.has_value()) {
+        ++farHits;
+        CHECK(got->node == 16);
+        CHECK_NEAR(got->t, want->t, 1e-4F);
+      }
+    }
+  }
+  CHECK(farHits == 9);
+
+  // All-malformed geometry builds an empty tree (no triangles) and must pick nothing.
+  auto broken = std::make_shared<vredit::PickGeometry>();
+  broken->positions = {{-0.5F, -0.5F, 0.0F}, {0.5F, -0.5F, 0.0F}, {0.0F, 0.5F, 0.0F}};
+  broken->indices = {0U, 1U, 99U};
+  vredit::PickCandidate brokenCandidate;
+  brokenCandidate.node = 13;
+  brokenCandidate.geometry = broken;
+  brokenCandidate.worldBounds = {{-1.0F, -1.0F, -1.0F}, {1.0F, 1.0F, 1.0F}};
+  CHECK(!vredit::pickClosestSurface({{0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, -1.0F}},
+                                    {brokenCandidate}).has_value());
+
+  // A non-finite triangle must not poison or invent a hit: its NaN distance
+  // is discarded and the build skips it for bounds hygiene. A finite
+  // triangle supplies the real hit here.
+  auto nonFinite = std::make_shared<vredit::PickGeometry>();
+  nonFinite->positions = {{-0.5F, -0.5F, 0.0F},
+                          {0.5F, -0.5F, 0.0F},
+                          {0.0F, 0.5F, 0.0F},
+                          {std::numeric_limits<float>::quiet_NaN(),
+                           std::numeric_limits<float>::quiet_NaN(),
+                           std::numeric_limits<float>::quiet_NaN()},
+                          {1.0F, 0.0F, 0.0F},
+                          {0.0F, 1.0F, 0.0F}};
+  nonFinite->indices = {0U, 1U, 2U, 3U, 4U, 5U};
+  vredit::PickCandidate nanCandidate;
+  nanCandidate.node = 14;
+  nanCandidate.geometry = nonFinite;
+  nanCandidate.worldBounds = {{-1.0F, -1.0F, -1.0F}, {1.0F, 1.0F, 1.0F}};
+  auto const nanHit = vredit::pickClosestSurface(
+      {{0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, -1.0F}}, {nanCandidate});
+  CHECK(nanHit.has_value());
+  CHECK(nanHit->node == 14);
+  CHECK_NEAR(nanHit->t, 1.0F, 1e-4F);
+
+  // A geometry whose tree could not be built falls back to the exact scan.
+  auto fallback = std::make_shared<vredit::PickGeometry>();
+  fallback->positions = {{-0.5F, -0.5F, 0.0F}, {0.5F, -0.5F, 0.0F}, {0.0F, 0.5F, 0.0F}};
+  fallback->indices = {0U, 1U, 2U};
+  fallback->bvhUnavailable = true;
+  vredit::PickCandidate fallbackCandidate;
+  fallbackCandidate.node = 15;
+  fallbackCandidate.geometry = fallback;
+  fallbackCandidate.worldBounds = {{-1.0F, -1.0F, -1.0F}, {1.0F, 1.0F, 1.0F}};
+  auto const fallbackHit =
+      vredit::pickClosestSurface({{0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, -1.0F}}, {fallbackCandidate});
+  CHECK(fallbackHit.has_value());
+  CHECK_NEAR(fallbackHit->t, 1.0F, 1e-4F);
+  CHECK(!fallback->bvh); // the scan ran; no tree was built
 }
 
 void testSceneSnapshotRestore() {

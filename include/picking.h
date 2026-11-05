@@ -35,6 +35,7 @@ struct PickGeometry {
   // so the one-time build needs no lock. Do not mutate positions/indices after
   // the first pick (the tree would no longer match them).
   mutable std::shared_ptr<const PickBvh> bvh;
+  mutable bool bvhUnavailable{false}; // build failed once; use the full scan
 };
 
 // A pickable visual: world bounds for broadphase plus optional exact geometry.
@@ -56,7 +57,10 @@ struct PickCandidate {
 //
 // Geometry candidates use a lazily built triangle BVH: node bounds are only a
 // conservative rejection test, every accepted triangle still goes through the
-// same exact world-space ray test, so results are identical to a full scan.
+// same exact world-space ray test, so finite geometry yields the same hit node
+// and distance as a full scan. Non-finite triangles are skipped while building
+// so non-finite bounds can never enter the tree; their NaN distance is
+// discarded by the exact scan's strict distance test anyway.
 std::optional<PickHit> pickClosestSurface(Ray const& ray,
                                           std::vector<PickCandidate> const& candidates);
 

@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -159,53 +161,72 @@ std::uint32_t buildNode(PickGeometry const& geometry, PickBvh& bvh,
   return index;
 }
 
-std::shared_ptr<const PickBvh> const& pickBvhFor(PickGeometry const& geometry) {
-  if (!geometry.bvh) {
-    auto bvh = std::make_shared<PickBvh>();
-    std::vector<BuildTriangle> work;
-    work.reserve(geometry.indices.size() / 3U);
-    for (std::size_t i = 0; i + 2U < geometry.indices.size(); i += 3U) {
-      std::uint32_t const i0 = geometry.indices[i];
-      std::uint32_t const i1 = geometry.indices[i + 1U];
-      std::uint32_t const i2 = geometry.indices[i + 2U];
-      if (i0 >= geometry.positions.size() || i1 >= geometry.positions.size() ||
-          i2 >= geometry.positions.size()) {
-        continue; // never trust indices blindly
+PickBvh const* pickBvhFor(PickGeometry const& geometry) {
+  if (!geometry.bvh && !geometry.bvhUnavailable) {
+    try {
+      auto bvh = std::make_shared<PickBvh>();
+      std::vector<BuildTriangle> work;
+      work.reserve(geometry.indices.size() / 3U);
+      for (std::size_t i = 0; i + 2U < geometry.indices.size(); i += 3U) {
+        std::uint32_t const i0 = geometry.indices[i];
+        std::uint32_t const i1 = geometry.indices[i + 1U];
+        std::uint32_t const i2 = geometry.indices[i + 2U];
+        if (i0 >= geometry.positions.size() || i1 >= geometry.positions.size() ||
+            i2 >= geometry.positions.size()) {
+          continue; // never trust indices blindly
+        }
+        Vec3 const& a = geometry.positions[i0];
+        Vec3 const& b = geometry.positions[i1];
+        Vec3 const& c = geometry.positions[i2];
+        if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(a.z) ||
+            !std::isfinite(b.x) || !std::isfinite(b.y) || !std::isfinite(b.z) ||
+            !std::isfinite(c.x) || !std::isfinite(c.y) || !std::isfinite(c.z)) {
+          continue; // a non-finite triangle cannot be picked reliably
+        }
+        work.push_back({static_cast<std::uint32_t>(i),
+                        a * (1.0F / 3.0F) + b * (1.0F / 3.0F) + c * (1.0F / 3.0F)});
       }
-      Vec3 const& a = geometry.positions[i0];
-      Vec3 const& b = geometry.positions[i1];
-      Vec3 const& c = geometry.positions[i2];
-      if (!std::isfinite(a.x) || !std::isfinite(a.y) || !std::isfinite(a.z) ||
-          !std::isfinite(b.x) || !std::isfinite(b.y) || !std::isfinite(b.z) ||
-          !std::isfinite(c.x) || !std::isfinite(c.y) || !std::isfinite(c.z)) {
-        continue; // a non-finite triangle cannot be picked reliably
+      if (!work.empty()) {
+        bvh->nodes.reserve(2U * (work.size() / (kLeafTriangles / 2U) + 1U));
+        bvh->triangles.reserve(work.size());
+        buildNode(geometry, *bvh, work, 0U, static_cast<std::uint32_t>(work.size()));
+        for (BuildTriangle const& triangle : work) {
+          bvh->triangles.push_back(triangle.offset);
+        }
+        Aabb const& root = bvh->nodes[0].bounds;
+        Vec3 const extent = root.max - root.min;
+        float const longest = std::fmax(extent.x, std::fmax(extent.y, extent.z));
+        // Local padding: enough to absorb slab/transform rounding at any node,
+        // small enough to stay a real rejection test. Never used for the exact
+        // triangle test itself.
+        bvh->expansion = std::fmax(1e-4F, longest * 1e-5F);
       }
-      work.push_back({static_cast<std::uint32_t>(i),
-                      a * (1.0F / 3.0F) + b * (1.0F / 3.0F) + c * (1.0F / 3.0F)});
+      geometry.bvh = std::move(bvh);
+    } catch (std::exception const& e) {
+      // A hostile or enormous mesh must not terminate the render loop. Keep
+      // the old exact full scan for this geometry; it is slower, not wrong.
+      geometry.bvhUnavailable = true;
+      geometry.bvh.reset();
+      std::fprintf(stderr, "[pick] BVH build failed (%s); using a full scan\n", e.what());
     }
-    if (!work.empty()) {
-      bvh->nodes.reserve(2U * (work.size() / (kLeafTriangles / 2U) + 1U));
-      bvh->triangles.reserve(work.size());
-      buildNode(geometry, *bvh, work, 0U, static_cast<std::uint32_t>(work.size()));
-      for (BuildTriangle const& triangle : work) {
-        bvh->triangles.push_back(triangle.offset);
-      }
-      Aabb const& root = bvh->nodes[0].bounds;
-      Vec3 const extent = root.max - root.min;
-      float const longest = std::fmax(extent.x, std::fmax(extent.y, extent.z));
-      // Local padding: enough to absorb slab/transform rounding at any node,
-      // small enough to stay a real rejection test. Never used for the exact
-      // triangle test itself.
-      bvh->expansion = std::fmax(1e-4F, longest * 1e-5F);
-    }
-    geometry.bvh = std::move(bvh);
   }
-  return geometry.bvh;
+  return geometry.bvh.get();
 }
 
 Aabb worldNodeBounds(PickBvh const& bvh, PickBvhNode const& node, Mat4 const& world) {
   Vec3 const pad{bvh.expansion, bvh.expansion, bvh.expansion};
-  return transformAabb(world, Aabb{node.bounds.min - pad, node.bounds.max + pad});
+  Aabb box = transformAabb(world, Aabb{node.bounds.min - pad, node.bounds.max + pad});
+  // Also pad in WORLD units by a fraction of the coordinate magnitude: at a
+  // large translation, float rounding in transformPoint can exceed the local
+  // pad, and a silhouette-grazing ray must not be pruned at a node whose
+  // triangles the full scan would hit. This is rejection padding only.
+  float const magnitude = std::fmax(
+      std::fmax(std::fabs(box.min.x), std::fabs(box.max.x)),
+      std::fmax(std::fmax(std::fabs(box.min.y), std::fabs(box.max.y)),
+                std::fmax(std::fabs(box.min.z), std::fabs(box.max.z))));
+  float const worldPad = std::fmax(1e-5F, magnitude * 1e-6F);
+  Vec3 const worldPadding{worldPad, worldPad, worldPad};
+  return {box.min - worldPadding, box.max + worldPadding};
 }
 
 void pickBvhNode(PickGeometry const& geometry, PickBvh const& bvh, Ray const& ray,
@@ -245,6 +266,26 @@ void pickBvhNode(PickGeometry const& geometry, PickBvh const& bvh, Ray const& ra
     pickBvhNode(geometry, bvh, ray, world, node.left, leftEntry, bestT);
   } else if (rightHits) {
     pickBvhNode(geometry, bvh, ray, world, node.right, rightEntry, bestT);
+  }
+}
+
+void pickGeometryScan(PickGeometry const& geometry, Ray const& ray, Mat4 const& world,
+                      float& bestT) {
+  for (std::size_t i = 0; i + 2U < geometry.indices.size(); i += 3U) {
+    std::uint32_t const i0 = geometry.indices[i];
+    std::uint32_t const i1 = geometry.indices[i + 1U];
+    std::uint32_t const i2 = geometry.indices[i + 2U];
+    if (i0 >= geometry.positions.size() || i1 >= geometry.positions.size() ||
+        i2 >= geometry.positions.size()) {
+      continue;
+    }
+    Vec3 const a = transformPoint(world, geometry.positions[i0]);
+    Vec3 const b = transformPoint(world, geometry.positions[i1]);
+    Vec3 const c = transformPoint(world, geometry.positions[i2]);
+    float t = 0.0F;
+    if (rayTriangle(ray, a, b, c, t) && t < bestT) {
+      bestT = t;
+    }
   }
 }
 
@@ -307,7 +348,12 @@ std::optional<PickHit> pickClosestSurface(Ray const& ray,
     PickGeometry const& geometry = *candidate.geometry;
     float const limit = best.has_value() ? best->t : std::numeric_limits<float>::max();
     float hitT = limit;
-    pickGeometryBvh(geometry, *pickBvhFor(geometry), ray, candidate.world, hitT);
+    PickBvh const* bvh = pickBvhFor(geometry);
+    if (bvh != nullptr) {
+      pickGeometryBvh(geometry, *bvh, ray, candidate.world, hitT);
+    } else {
+      pickGeometryScan(geometry, ray, candidate.world, hitT);
+    }
     if (hitT < limit) {
       best = PickHit{candidate.node, hitT, ray.origin + ray.direction * hitT};
     }

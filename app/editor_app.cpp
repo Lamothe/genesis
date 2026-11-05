@@ -1300,10 +1300,10 @@ int galleryPointerAction(App& app, Ray const& ray) {
 }
 
 // The placeable preview's rim highlight is exactly "would a press place
-// right now?" with the tracked-aim gate on top: an untracked aim (the head
-// gaze fallback) must never light the preview.
-bool galleryAimHighlight(App& app, Ray const& ray, bool aimValid) {
-  return app.galleryActive && aimValid && galleryPointerAction(app, ray) == 2;
+// right now?" with the tracked-aim gate on top: a VALID-but-untracked aim
+// must never light the preview.
+bool galleryAimHighlight(App& app, Ray const& ray, bool aimTracked) {
+  return app.galleryActive && aimTracked && galleryPointerAction(app, ray) == 2;
 }
 
 void galleryPointerPress(App& app, VkRenderer& renderer, Ray const& ray) {
