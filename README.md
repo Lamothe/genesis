@@ -90,8 +90,9 @@ buttons and sticks are unchanged:
   neither browses nor places; the head-gaze fallback never acts on the
   carousel.
   Placing a model closes the menu. While the aim rests exactly on the
-  placeable preview's surface it wears a subtle rim highlight; the
-  highlight never appears while the ring is moving or the aim is untracked.
+  placeable preview's surface it wears a subtle cool rim plus a faint wash
+  (never a fill banner); the highlight never appears while the ring is moving
+  or the aim is untracked.
   The centre marker identifies the model that can be placed. Desktop and
   controller use the same hit rules.
 - Outside the menu, **right pinch and release** selects the whole model under
