@@ -65,6 +65,25 @@ g++ -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude -Iapp tests/test_renderer.cpp
 ./.build/test-renderer
 ```
 
+### Hair opacity and animation asset limitations
+
+BLEND materials whose whole name token is `hair` or `scalp` use Centre Stage's
+live-view default opacity remap `1-(1-alpha)^3`, intended to reduce scalp
+show-through. Name matching conservatively keeps non-ASCII bytes inside a token
+(rather than attempting Centre Stage's Unicode tokenisation). Other materials and opaque/masked draws are unchanged. This is only one piece
+of rendering parity: Genesis does not implement Centre Stage's PBR studio
+lighting, specular-glossiness shading, emissive or transmission.
+
+The platinum library assets `~/Downloads/VR/Characters/Una/Una.glb` (SHA-256
+`8aa497ba4b34c74321dc3eb87ed1adb6d4f200944fed7be86989c45b65bbfe96`) and
+`~/Downloads/VR/Characters/Rose/Rose.glb` (SHA-256
+`dd0ae874f5d5e3b41f431177fc9c518c970915993d7a3061e19afa057696b3fc`)
+and their archived original `model.gltf` files contain no skins, clips or
+morph targets. Separate experimental files on mercury,
+`~/Projects/UniRig/work/Una_Rose_20261104/{Una/Una_rigged,Rose/Rose_rigged}.glb`,
+contain skins but no clips; their generated weights and appearance are not
+approved. Playback cannot invent missing animation or facial expressions.
+
 ## Controls
 
 Free-flight, first-person (desktop debugging): **WASD** move, **Q/E** down/up,

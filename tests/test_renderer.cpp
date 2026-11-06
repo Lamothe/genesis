@@ -179,6 +179,41 @@ int main() {
       return 1;
     }
   }
+  // Centre Stage hair treatment: at alpha 0.5, k=3 yields 0.875 per
+  // fragment. Compare the actual GPU output with the authored-alpha path.
+  MeshData opacity = source;
+  for (auto& v : opacity.vertices) { v.colour = {1, 1, 1}; }
+  DrawItem opacityItem;
+  opacityItem.mesh = renderer.addMesh(opacity);
+  opacityItem.model = translationMatrix({0, 0, -3});
+  opacityItem.alpha = AlphaMode::Blend;
+  opacityItem.alphaFactor = 0.5F;
+  opacityItem.lit = false;
+  std::vector<std::uint8_t> unboosted;
+  if (opacityItem.mesh == kInvalidMesh || !render(renderer, camera, opacityItem, unboosted)) {
+    return 1;
+  }
+  opacityItem.hairOpacityBoost = true;
+  if (!render(renderer, camera, opacityItem, pixels) ||
+      pixels[centre] < unboosted[centre] + 70 || pixels[centre] < 215 || pixels[centre] > 230) {
+    std::printf("renderer test: hair opacity boost failed (%u -> %u)\n", unboosted[centre], pixels[centre]);
+    return 1;
+  }
+  opacityItem.alpha = AlphaMode::Opaque;
+  if (!render(renderer, camera, opacityItem, pixels) || pixels[centre] < 250) {
+    std::printf("renderer test: hair boost changed opaque mode\n");
+    return 1;
+  }
+  opacityItem.alpha = AlphaMode::Mask;
+  opacityItem.alphaCutoff = 0.6F;
+  opacityItem.hairOpacityBoost = false;
+  if (!render(renderer, camera, opacityItem, unboosted)) { return 1; }
+  opacityItem.hairOpacityBoost = true;
+  if (!render(renderer, camera, opacityItem, pixels) || pixels[centre] != unboosted[centre] ||
+      pixels[centre] > 30) {
+    std::printf("renderer test: hair boost changed mask cutoff\n");
+    return 1;
+  }
   // Two stable hand slots update in place and share scene depth.
   camera.position.z = 0.0F;
   MeshData hand;

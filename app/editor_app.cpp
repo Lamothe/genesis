@@ -615,6 +615,7 @@ bool addModelToSceneImpl(App& app,
       visual.alphaFactor = mesh.alphaFactor;
       visual.alpha = mesh.alpha;
       visual.alphaCutoff = mesh.alphaCutoff;
+      visual.hairOpacityBoost = mesh.hairOpacityBoost;
       if (mesh.texture >= 0 && static_cast<std::size_t>(mesh.texture) < textureHandles.size()) {
         visual.texture = textureHandles[static_cast<std::size_t>(mesh.texture)];
       }
@@ -1773,6 +1774,7 @@ void assembleFrame(App& app,
     item.colour = visual.colour;
     item.alphaFactor = visual.alphaFactor;
     item.alphaCutoff = visual.alphaCutoff;
+    item.hairOpacityBoost = visual.hairOpacityBoost;
     item.alpha = visual.alpha;
     item.lit = true;
     // The selection gets a thin neutral RIM in the shader (5) — the user

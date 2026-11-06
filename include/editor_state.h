@@ -35,6 +35,7 @@ struct NodeVisual {
   float alphaFactor{1.0F};
   AlphaMode alpha{AlphaMode::Opaque};
   float alphaCutoff{0.5F};
+  bool hairOpacityBoost{false};
 };
 
 // Model grouping: every node created for one loaded model shares a group id,

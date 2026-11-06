@@ -13,7 +13,7 @@ layout(set = 0, binding = 0) uniform Frame {
 layout(push_constant) uniform Push {
   mat4 model;
   vec4 tint;
-  vec4 params; // x: lit, y: texture index, z: alpha cutoff, w: alpha mode
+  vec4 params; // x: lit, y: texture index, z: mask cutoff / blend opacity exponent, w: alpha mode
   vec4 normalParams; // x: has normal map, y: texture index, z: scale, w: highlight
 } push;
 

@@ -21,6 +21,43 @@ constexpr std::uint32_t kMaxNodeDepth = 1024U;
 // bounds the inverse-bind matrix allocation from a hostile file.
 constexpr std::size_t kMaxSkinJoints = 65536U;
 
+// Centre Stage matches whole material-name tokens, not substrings such as
+// "Chair" or "Hairpin". Use ASCII classification so it is locale-independent;
+// Non-ASCII bytes stay inside tokens: this conservatively avoids boosting
+// names like "Hairé" which Centre Stage treats as one Unicode word.
+bool hairFamily(std::string const& name) {
+  auto letter = [](unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+  auto lower = [](unsigned char c) { return c >= 'a' && c <= 'z'; };
+  auto upper = [](unsigned char c) { return c >= 'A' && c <= 'Z'; };
+  auto digit = [](unsigned char c) { return c >= '0' && c <= '9'; };
+  auto tokenMatches = [&name](std::size_t start, std::size_t end) {
+    std::string token = name.substr(start, end - start);
+    for (char& c : token) {
+      if (c >= 'A' && c <= 'Z') { c = static_cast<char>(c - 'A' + 'a'); }
+    }
+    return token == "hair" || token == "scalp";
+  };
+  std::size_t start = std::string::npos;
+  for (std::size_t i = 0; i < name.size(); ++i) {
+    auto c = static_cast<unsigned char>(name[i]);
+    if (!letter(c) && !digit(c) && c < 0x80U) {
+      if (start != std::string::npos && tokenMatches(start, i)) { return true; }
+      start = std::string::npos;
+      continue;
+    }
+    if (start == std::string::npos) { start = i; continue; }
+    auto prev = static_cast<unsigned char>(name[i - 1]);
+    bool boundary = (digit(c) && letter(prev)) || digit(prev) ||
+        (upper(c) && (lower(prev) ||
+          (upper(prev) && i + 1 < name.size() && lower(static_cast<unsigned char>(name[i + 1])))));
+    if (boundary) {
+      if (tokenMatches(start, i)) { return true; }
+      start = i;
+    }
+  }
+  return start != std::string::npos && tokenMatches(start, name.size());
+}
+
 std::uint32_t readU32(std::uint8_t const* p) {
   std::uint32_t value = 0;
   std::memcpy(&value, p, 4);
@@ -445,6 +482,8 @@ bool GlbReader::buildMaterial(JsonDocument::NodeId primitiveNode, ModelMesh& mes
   } else if (alphaMode == "BLEND") {
     mesh.alpha = AlphaMode::Blend;
   }
+  mesh.hairOpacityBoost = mesh.alpha == AlphaMode::Blend &&
+      hairFamily(document_.asString(document_.member(materialNode, "name")));
   JsonDocument::NodeId cutoffNode = document_.member(materialNode, "alphaCutoff");
   if (document_.type(cutoffNode) == JsonDocument::Type::Number) {
     mesh.alphaCutoff = static_cast<float>(document_.asNumber(cutoffNode));

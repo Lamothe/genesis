@@ -2202,6 +2202,35 @@ void testGlbLoader() {
   writeFile(".build/test-model.glb", buildGlb(kTriangleJson, triangleBin(2)));
 }
 
+void testGlbHairOpacityFamily() {
+  using namespace fixtures;
+  struct Case { char const* name; char const* mode; bool expected; };
+  Case const cases[] = {
+      {"Hair", "BLEND", true}, {"Hair_Material", "BLEND", true},
+      {"Scalp_Transparency", "BLEND", true}, {"BabyHair2Cards", "BLEND", true},
+      {"HAIRTransparency", "BLEND", true}, {"FPHair_Cards", "BLEND", true},
+      {"Chair_Fabric", "BLEND", false}, {"Mohair_Trim", "BLEND", false},
+      {"Hairpin", "BLEND", false}, {"Hairé", "BLEND", false},
+      {"éHair", "BLEND", false}, {"髪_Hair", "BLEND", true},
+      {"hair", "OPAQUE", false},
+      {"Scalp", "MASK", false}, {"", "BLEND", false},
+  };
+  std::string const old = R"("materials": [{"pbrMetallicRoughness": {"baseColorFactor": [0.5, 0.25, 0.125, 1]}}])";
+  for (Case const& c : cases) {
+    std::string json = kTriangleJson;
+    auto const at = json.find(old);
+    CHECK(at != std::string::npos);
+    if (at == std::string::npos) { continue; }
+    json.replace(at, old.size(), std::string(R"("materials": [{"name": ")") + c.name +
+        R"(", "alphaMode": ")" + c.mode + R"("}])");
+    Model model;
+    std::string error;
+    bool const loaded = loadGlb(buildGlb(json, triangleBin(2)), model, error);
+    CHECK(loaded);
+    if (loaded && !model.meshes.empty()) { CHECK(model.meshes[0].hairOpacityBoost == c.expected); }
+  }
+}
+
 void testGlbInterleavedAccessors() {
   using namespace fixtures;
   // One bufferView with byteStride 24: [pos(12) normal(12)] x3, then indices.
@@ -3106,6 +3135,7 @@ int main() {
   testImageDecode();
   testDecodeSizeCaps();
   testGlbLoader();
+  testGlbHairOpacityFamily();
   testGlbInterleavedAccessors();
   testGlbTextureAndUv();
   testGlbSizeWrapRejected();

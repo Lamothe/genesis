@@ -17,7 +17,7 @@ layout(set = 0, binding = 0) uniform Frame {
 layout(push_constant) uniform Push {
   mat4 model;
   vec4 tint;
-  vec4 params; // x: lit, y: texture index, z: alpha cutoff, w: alpha mode
+  vec4 params; // x: lit, y: texture index, z: mask cutoff / blend opacity exponent, w: alpha mode
   vec4 normalParams; // x: has normal map, y: texture index, z: scale, w: highlight
 } push;
 
@@ -60,6 +60,11 @@ void main() {
   float mode = push.params.w;
   if (mode > 0.5 && mode < 1.5 && base.a < push.params.z) {
     discard; // AlphaMode::Mask
+  }
+  // Match Centre Stage's default hair/scalp blend opacity; the unboosted
+  // path is untouched, and alpha 0/1 remain exact.
+  if (mode > 1.5 && push.params.z > 1.0) {
+    base.a = 1.0 - pow(1.0 - clamp(base.a, 0.0, 1.0), push.params.z);
   }
   // glTF: OPAQUE ignores texture alpha and kept MASK fragments are opaque;
   // only BLEND keeps alpha. Without this the layer's passthrough composite

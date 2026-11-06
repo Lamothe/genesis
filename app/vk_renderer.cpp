@@ -994,7 +994,10 @@ struct VkRenderer::Impl {
         push.tint[3] = handPass ? 1.0F : item.alphaFactor;
         push.params[0] = item.lit ? 1.0F : 0.0F;
         push.params[1] = item.texture < textures.size() ? static_cast<float>(item.texture) : 0.0F;
-        push.params[2] = handPass ? 0.0F : item.alphaCutoff;
+        // params.z is a mask cutoff for MASK and an opacity exponent for BLEND.
+        push.params[2] = handPass ? 0.0F :
+            item.alpha == AlphaMode::Blend ? (item.hairOpacityBoost ? 3.0F : 1.0F) :
+                                             item.alphaCutoff;
         push.params[3] = handPass                         ? 0.0F
                          : item.alpha == AlphaMode::Mask  ? 1.0F
                          : item.alpha == AlphaMode::Blend ? 2.0F

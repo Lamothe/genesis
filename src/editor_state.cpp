@@ -25,7 +25,8 @@ bool sameVisual(NodeVisual const& a, NodeVisual const& b) {
          a.normalScale == b.normalScale && a.derivedBounds == b.derivedBounds &&
          (a.derivedBounds || sameAabb(a.localBounds, b.localBounds)) &&
          a.pickGeometry.get() == b.pickGeometry.get() && sameVec3(a.colour, b.colour) &&
-         a.alphaFactor == b.alphaFactor && a.alpha == b.alpha && a.alphaCutoff == b.alphaCutoff;
+         a.alphaFactor == b.alphaFactor && a.alpha == b.alpha && a.alphaCutoff == b.alphaCutoff &&
+         a.hairOpacityBoost == b.hairOpacityBoost;
 }
 
 bool sameSnapshot(EditorSnapshot const& a, EditorSnapshot const& b) {

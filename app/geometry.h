@@ -25,6 +25,7 @@ struct DrawItem {
   Vec3 colour{1.0F, 1.0F, 1.0F};
   float alphaFactor{1.0F};
   float alphaCutoff{0.5F};
+  bool hairOpacityBoost{false};
   AlphaMode alpha{AlphaMode::Opaque};
   bool lit{true};
   float highlight{0.0F}; // 6 = carousel placeable preview (subtle cool

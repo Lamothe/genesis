@@ -77,6 +77,7 @@ struct ModelMesh {
   float normalScale{1.0F};        // glTF normalTexture.scale
   AlphaMode alpha{AlphaMode::Opaque};
   float alphaCutoff{0.5F};
+  bool hairOpacityBoost{false}; // Centre Stage hair/scalp blend-family treatment
   // JOINTS_0 / WEIGHTS_0 for this primitive; empty = rigid. Parsed only when
   // the file defines skins, so the static library models (which carry unused
   // joint attributes) pay no per-vertex memory cost.
