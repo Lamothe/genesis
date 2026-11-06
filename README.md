@@ -74,6 +74,18 @@ show-through. Name matching conservatively keeps non-ASCII bytes inside a token
 of rendering parity: Genesis does not implement Centre Stage's PBR studio
 lighting, specular-glossiness shading, emissive or transmission.
 
+Genesis reads COLOR_0 VEC4 alpha (VEC3/absent default to one) for BLEND and
+MASK. Una/Rose have no vertex colours, so no visible improvement for those
+assets is established. Specular-glossiness shading, nonzero texture coordinate
+sets and colour texture sRGB decoding remain unsupported. Partial diffuse-only
+specular-glossiness support was avoided because it can turn metallic materials
+black. These changes do not establish material parity.
+
+An offline inventory of 109 GLBs in platinum ~/Downloads/VR on 06/11/2026
+found no skins or animation clips. No compatible approved motion source or
+approved production rig has been established; synthetic deformation is not
+a quality or retargeting validation.
+
 The platinum library assets `~/Downloads/VR/Characters/Una/Una.glb` (SHA-256
 `8aa497ba4b34c74321dc3eb87ed1adb6d4f200944fed7be86989c45b65bbfe96`) and
 `~/Downloads/VR/Characters/Rose/Rose.glb` (SHA-256

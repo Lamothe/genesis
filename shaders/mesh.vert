@@ -4,6 +4,7 @@ layout(location = 0) in vec3 inPos;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec3 inColour;
 layout(location = 3) in vec2 inUv;
+layout(location = 4) in float inAlpha;
 
 layout(set = 0, binding = 0) uniform Frame {
   mat4 viewProj;
@@ -23,6 +24,7 @@ layout(location = 1) out vec3 vColour;
 layout(location = 2) out vec2 vUv;
 layout(location = 3) out vec3 vWorldPos;
 layout(location = 4) flat out float vModelHandedness;
+layout(location = 5) out float vAlpha;
 
 void main() {
   vec4 world = push.model * vec4(inPos, 1.0);
@@ -43,6 +45,7 @@ void main() {
   // Keep even zero normals and collapsed axes finite for fragment shading.
   vNormal = dot(normal, normal) > 1e-20 ? normal : vec3(0.0, 0.0, 1.0);
   vColour = inColour * push.tint.rgb;
+  vAlpha = inAlpha;
   vUv = inUv;
   vWorldPos = world.xyz;
 }

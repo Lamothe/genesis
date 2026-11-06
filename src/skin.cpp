@@ -129,8 +129,7 @@ bool deformSkinnedMesh(MeshData const& rest,
       return false; // a non-finite bind-pose vertex cannot be skinned
     }
     MeshVertex& target = out.vertices[v];
-    target.pos = source.pos;
-    target.normal = source.normal;
+    target = source; // retain bind-pose colour, alpha and UV when reusing output
 
     Vec3 position{};
     Vec3 normal{};

@@ -764,6 +764,8 @@ bool GlbReader::addPrimitive(JsonDocument::NodeId primitiveNode, std::int32_t& m
                         ? Vec3{readComponentFloat(colours, v, 0), readComponentFloat(colours, v, 1),
                                readComponentFloat(colours, v, 2)}
                         : Vec3{1.0F, 1.0F, 1.0F};
+    vertex.alpha = hasColours && colours.components == 4U
+                       ? readComponentFloat(colours, v, 3) : 1.0F;
     vertex.normal = hasNormals
                         ? Vec3{readComponentFloat(normals, v, 0), readComponentFloat(normals, v, 1),
                                readComponentFloat(normals, v, 2)}

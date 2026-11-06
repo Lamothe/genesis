@@ -542,17 +542,18 @@ struct VkRenderer::Impl {
     binding.binding = 0;
     binding.stride = sizeof(RendererVertex);
     binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-    VkVertexInputAttributeDescription attributes[4] = {};
+    VkVertexInputAttributeDescription attributes[5] = {};
     attributes[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(RendererVertex, pos)};
     attributes[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(RendererVertex, normal)};
     attributes[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(RendererVertex, colour)};
     attributes[3] = {3, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(RendererVertex, uv)};
+    attributes[4] = {4, 0, VK_FORMAT_R32_SFLOAT, offsetof(RendererVertex, alpha)};
     VkPipelineVertexInputStateCreateInfo vertexInput =
         vkStruct<VkPipelineVertexInputStateCreateInfo>(
             VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
     vertexInput.vertexBindingDescriptionCount = 1;
     vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 4;
+    vertexInput.vertexAttributeDescriptionCount = 5;
     vertexInput.pVertexAttributeDescriptions = attributes;
 
     VkPipelineInputAssemblyStateCreateInfo inputAssembly =

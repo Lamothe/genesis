@@ -30,6 +30,7 @@ struct MeshVertex {
   Vec3 normal;
   Vec3 colour;
   Vec2 uv;
+  float alpha{1.0F}; // COLOR_0 alpha; VEC3 and absent colours default to 1
 };
 
 struct MeshData {

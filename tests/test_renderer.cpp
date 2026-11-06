@@ -114,6 +114,31 @@ int main() {
     std::printf("renderer test: unlit material changed with lighting\n"); return 1;
   }
 
+  // Vertex alpha participates in BLEND and MASK, but OPAQUE ignores it.
+  MeshData alphaMesh = source;
+  for (auto& v : alphaMesh.vertices) { v.alpha = 0.25F; }
+  item = DrawItem{};
+  item.mesh = renderer.addMesh(alphaMesh);
+  item.model = translationMatrix({0, 0, -3});
+  item.lit = false;
+  if (item.mesh == kInvalidMesh) { return 1; }
+  std::vector<std::uint8_t> opaqueAlpha, maskAlpha, blendAlpha, blankAlpha;
+  if (!render(renderer, camera, item, opaqueAlpha)) { return 1; }
+  item.alpha = AlphaMode::Mask; item.alphaCutoff = 0.5F;
+  if (!render(renderer, camera, item, maskAlpha)) { return 1; }
+  item.alpha = AlphaMode::Blend;
+  if (!render(renderer, camera, item, blendAlpha)) { return 1; }
+  for (auto& v : alphaMesh.vertices) { v.alpha = 0.0F; }
+  item.mesh = renderer.addMesh(alphaMesh);
+  if (item.mesh == kInvalidMesh || !render(renderer, camera, item, blankAlpha)) { return 1; }
+  if (opaqueAlpha[centre] < 240 || maskAlpha[centre] != blankAlpha[centre] ||
+      blendAlpha[centre] <= blankAlpha[centre] + 30 ||
+      blendAlpha[centre] >= opaqueAlpha[centre] - 100) {
+    std::printf("renderer test: vertex alpha modes opaque=%u mask=%u blend=%u blank=%u\n",
+                opaqueAlpha[centre], maskAlpha[centre], blendAlpha[centre], blankAlpha[centre]);
+    return 1;
+  }
+
   // Selection adds a neutral, grazing-only rim, not a warm fill. Use a
   // deliberately edge-on normal and compare actual shader output at centre.
   MeshData rimMesh = source;

@@ -5,6 +5,7 @@ layout(location = 1) in vec3 vColour;
 layout(location = 2) in vec2 vUv;
 layout(location = 3) in vec3 vWorldPos;
 layout(location = 4) flat in float vModelHandedness;
+layout(location = 5) in float vAlpha;
 
 layout(set = 0, binding = 1) uniform sampler2D uTextures[256];
 
@@ -60,7 +61,7 @@ void main() {
   float ndl = max(dot(n, normalize(frame.lightDirectionAmbient.xyz)), 0.0);
   float ambient = clamp(frame.lightDirectionAmbient.w, 0.0, 1.0);
   float light = mix(1.0, ambient + (1.0 - ambient) * ndl, push.params.x);
-  vec4 base = vec4(vColour * light, push.tint.a) * texel;
+  vec4 base = vec4(vColour * light, push.tint.a * vAlpha) * texel;
   float mode = push.params.w;
   if (mode > 0.5 && mode < 1.5 && base.a < push.params.z) {
     discard; // AlphaMode::Mask

@@ -2231,6 +2231,37 @@ void testGlbHairOpacityFamily() {
   }
 }
 
+void testGlbVertexAlpha() {
+  using namespace fixtures;
+  for (int components : {3, 4}) {
+    auto bin = triangleBin(2);
+    bin.resize(44U, 0);
+    for (int i = 0; i < 3; ++i) {
+      bin.push_back(255); bin.push_back(128); bin.push_back(0);
+      if (components == 4) { bin.push_back(static_cast<std::uint8_t>(i * 64)); }
+    }
+    std::string json = kTriangleJson;
+    auto replace = [&](std::string const& old, std::string const& next) {
+      auto const pos = json.find(old);
+      CHECK(pos != std::string::npos);
+      if (pos != std::string::npos) { json.replace(pos, old.size(), next); }
+    };
+    replace(R"("POSITION": 0})", R"("POSITION": 0, "COLOR_0": 2})");
+    replace(R"("type": "SCALAR"}])", std::string(R"("type": "SCALAR"}, {"bufferView": 2, "componentType": 5121, "normalized": true, "count": 3, "type": "VEC)") + std::to_string(components) + R"("}])");
+    replace(R"("byteLength": 6}])", std::string(R"("byteLength": 6}, {"buffer": 0, "byteOffset": 44, "byteLength": )") + std::to_string(components * 3) + "}]");
+    replace(R"("byteLength": 44})", std::string(R"("byteLength": )") + std::to_string(bin.size()) + "}");
+    Model model; std::string error;
+    bool const loaded = loadGlb(buildGlb(json, bin), model, error);
+    CHECK(loaded);
+    if (!loaded) { continue; }
+    CHECK_NEAR3(model.meshes[0].data.vertices[1].colour, {1.0F, 128.0F / 255.0F, 0.0F});
+    CHECK_NEAR(model.meshes[0].data.vertices[1].alpha, components == 4 ? 64.0F / 255.0F : 1.0F, 1e-6F);
+  }
+  Model model; std::string error;
+  CHECK(loadGlb(buildGlb(kTriangleJson, triangleBin(2)), model, error));
+  CHECK_NEAR(model.meshes[0].data.vertices[0].alpha, 1.0F, 1e-6F);
+}
+
 void testGlbInterleavedAccessors() {
   using namespace fixtures;
   // One bufferView with byteStride 24: [pos(12) normal(12)] x3, then indices.
@@ -3136,6 +3167,7 @@ int main() {
   testDecodeSizeCaps();
   testGlbLoader();
   testGlbHairOpacityFamily();
+  testGlbVertexAlpha();
   testGlbInterleavedAccessors();
   testGlbTextureAndUv();
   testGlbSizeWrapRejected();

@@ -379,8 +379,17 @@ void testSkinNormalsAndFallbacks() {
     }
   }
   Vec3 const expectedNormal = normalized(transformVector(transposed, rest.vertices[0].normal));
+  rest.vertices[0].alpha = 0.25F;
+  rest.vertices[0].colour = {0.2F, 0.3F, 0.4F};
+  rest.vertices[0].uv = {0.1F, 0.9F};
   MeshData deformed = rest;
+  deformed.vertices[0].alpha = 1.0F;
+  deformed.vertices[0].colour = {1.0F, 1.0F, 1.0F};
+  deformed.vertices[0].uv = {0.0F, 0.0F};
   CHECK(deformSkinnedMesh(rest, weights, {joint}, deformed));
+  CHECK(near(deformed.vertices[0].alpha, 0.25F));
+  CHECK(near3(deformed.vertices[0].colour, rest.vertices[0].colour));
+  CHECK(near(deformed.vertices[0].uv.x, 0.1F) && near(deformed.vertices[0].uv.y, 0.9F));
   CHECK(near3(deformed.vertices[0].normal, expectedNormal));
   CHECK(near(length(deformed.vertices[0].normal), 1.0F));
   CHECK(near3(deformed.vertices[0].pos, transformPoint(joint, rest.vertices[0].pos)));
