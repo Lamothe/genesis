@@ -219,6 +219,8 @@ struct App {
   // deleting models are undoable exactly like transform drags.
   vredit::UndoHistory<vredit::EditorSnapshot> undo;
   Camera camera;
+  SceneLighting lighting;
+  bool lightingPage{false};
   // Backdrop = the ground grid + the tinted clear colour. Toggled off
   // ("show the model without the background"), the scene is a plain void.
   bool showBackdrop{false}; // passthrough/void is the default; B or menu-hold adds the grid
@@ -944,7 +946,9 @@ bool wholeModelSelection(App const& app) {
 
 // Full editor state for undo/redo: structure + visuals + groups + selection.
 vredit::EditorSnapshot snapshot(App const& app) {
-  return vredit::captureState(app.scene, app.visuals, app.modelGroups, app.selection);
+  auto state = vredit::captureState(app.scene, app.visuals, app.modelGroups, app.selection);
+  state.lighting = app.lighting;
+  return state;
 }
 
 // Delete gestures belong to the selection and UI context in which they began.
@@ -962,6 +966,7 @@ void interruptDeleteGestures(App& app) {
 void applySnapshot(App& app, VkRenderer& renderer, vredit::EditorSnapshot const& state) {
   if (app.selection != state.selection) { interruptDeleteGestures(app); }
   vredit::restoreState(state, app.scene, app.visuals, app.modelGroups, app.selection);
+  app.lighting = state.lighting;
   for (AnimationInstance& instance : app.animations) {
     // Start with the last valid bounds even if a restored joint is missing or
     // deformation fails. A valid changed pose replaces these together with
@@ -1563,6 +1568,7 @@ void galleryOpen(App& app, VkRenderer& renderer) {
   app.leftTriggerWorkflow.interrupt();
   // The gallery owns the trigger while it is open: no tools panel behind it.
   app.menuOwner = MenuOwner::none;
+  app.lightingPage = false;
   app.handPanel.visible = false;
   app.handHover = -1;
   app.panelPress.cancel();
@@ -3919,6 +3925,7 @@ void closeToolMenu(App& app) {
   app.handHover = -1;
   app.handTool = -1;
   app.menuOwner = MenuOwner::none;
+  app.lightingPage = false;
   app.handPanel.visible = false;
   std::printf("[menu] tools panel closed\n");
 }
@@ -4011,19 +4018,46 @@ bool processControllerUiToggles(App& app, VkRenderer& renderer, XrFrameInput con
   return menuToggled;
 }
 
-constexpr std::array<char const*, 12> kHandTools{
-    "Models", "", "", "", "", "", "", "", "Undo", "Redo", "Delete", "Backdrop"};
+constexpr std::array<char const*, 21> kHandTools{
+    "Models", "", "", "", "", "", "", "", "Undo", "Redo", "Delete", "Backdrop",
+    "Lighting", "Back", "Light left", "Light right", "Light up", "Light down",
+    "Ambient -", "Ambient +", "Reset light"};
+
+void applyLightingAction(App& app, ToolPanelPress::Action action) {
+  using Action = ToolPanelPress::Action;
+  if (action == Action::lighting) { app.lightingPage = true; return; }
+  if (action == Action::lightBack) { app.lightingPage = false; return; }
+  LightingAdjustment adjustment;
+  switch (action) {
+  case Action::lightLeft: adjustment = LightingAdjustment::left; break;
+  case Action::lightRight: adjustment = LightingAdjustment::right; break;
+  case Action::lightUp: adjustment = LightingAdjustment::up; break;
+  case Action::lightDown: adjustment = LightingAdjustment::down; break;
+  case Action::ambientDown: adjustment = LightingAdjustment::dimmer; break;
+  case Action::ambientUp: adjustment = LightingAdjustment::brighter; break;
+  case Action::lightReset: adjustment = LightingAdjustment::reset; break;
+  default: return;
+  }
+  endEdits(app);
+  app.undo.begin(snapshot(app));
+  adjustLighting(app.lighting, adjustment);
+  (void)app.undo.commit(snapshot(app));
+}
 
 void drawHandPanel(App const& app, std::vector<RendererVertex>& lines) {
   if (!app.handPanel.visible || app.galleryActive) {
     return;
   }
   auto const& panel = app.handPanel;
-  constexpr int buttons[] = {0, 8, 9, 10, 11};
+  constexpr int mainButtons[] = {0, 8, 9, 10, 11, 12};
+  constexpr int lightButtons[] = {13, 14, 15, 16, 17, 18, 19, 20};
+  auto const* buttons = app.lightingPage ? lightButtons : mainButtons;
+  int const count = app.lightingPage ? 8 : 6;
   auto point = [&](Vec3 local) { return panel.origin + rotate(panel.orientation, local); };
   int const activeButton = app.menuOwner == MenuOwner::controller ? app.panelPress.button()
                                                                   : app.handTool;
-  for (int button : buttons) {
+  for (int i = 0; i < count; ++i) {
+    int const button = buttons[i];
     auto const centre = handPanelButtonCentre(button);
     Vec3 const colour = button == activeButton ? Vec3{1.0F, 0.55F, 0.25F} :
         button == app.handHover ? Vec3{1.0F, 0.9F, 0.4F} : Vec3{0.6F, 0.9F, 1.0F};
@@ -4037,6 +4071,15 @@ void drawHandPanel(App const& app, std::vector<RendererVertex>& lines) {
     constexpr float height = .018F;
     auto at = centre - Vec3{.5F * textLineWidth(kHandTools[button], height), height*.5F, 0};
     appendTextLines(lines, kHandTools[button], trs(point(at), panel.orientation, {1,1,1}), height, colour);
+  }
+  if (app.lightingPage) {
+    char status[128];
+    auto const direction = normalized(app.lighting.direction);
+    std::snprintf(status, sizeof(status), "Light XYZ %.2f %.2f %.2f  Ambient %.0f%%",
+                  direction.x, direction.y, direction.z, app.lighting.ambient * 100.0F);
+    constexpr float height = .012F;
+    Vec3 const at{-0.5F * textLineWidth(status, height), -0.275F, 0};
+    appendTextLines(lines, status, trs(point(at), panel.orientation, {1,1,1}), height, {0.6F, 0.9F, 1.0F});
   }
 }
 
@@ -5011,6 +5054,63 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
     if (!check(overlay.empty(), "VR carousel has no mode HUD")) { return false; }
   }
 
+  // Lighting is a normal history step; no-op at the bound preserves redo.
+  {
+    App lightApp;
+    auto const initial = snapshot(lightApp);
+    applyLightingAction(lightApp, ToolPanelPress::Action::lighting);
+    if (!check(lightApp.lightingPage, "lighting page opens")) { return false; }
+    for (auto owner : {MenuOwner::controller, MenuOwner::hand}) {
+      openToolMenu(lightApp, owner, {0, 1, 0}, {0, 0, -1});
+      lightApp.lightingPage = true;
+      closeToolMenu(lightApp);
+      openToolMenu(lightApp, owner, {0, 1, 0}, {0, 0, -1});
+      if (!check(!lightApp.lightingPage, "menu reopens on main page")) { return false; }
+      closeToolMenu(lightApp);
+    }
+    openToolMenu(lightApp, MenuOwner::hand, {0, 1, 0}, {0, 0, -1});
+    lightApp.lightingPage = true;
+    updateHandPanelTracking(lightApp, false, {});
+    if (!check(!lightApp.lightingPage && !lightApp.handPanel.visible, "hand tracking loss closes lighting page")) { return false; }
+    applyLightingAction(lightApp, ToolPanelPress::Action::lightLeft);
+    auto const changed = snapshot(lightApp);
+    if (!check(!sameSnapshot(initial, changed) && lightApp.undo.canUndo(), "light change in history") ||
+        !check(performUndo(lightApp, renderer) && sameSnapshot(snapshot(lightApp), initial), "light undo") ||
+        !check(performRedo(lightApp, renderer) && sameSnapshot(snapshot(lightApp), changed), "light redo")) { return false; }
+    applyLightingAction(lightApp, ToolPanelPress::Action::ambientUp);
+    if (!check(lightApp.lighting.ambient > changed.lighting.ambient, "ambient change")) { return false; }
+    applyLightingAction(lightApp, ToolPanelPress::Action::lightReset);
+    if (!check(sameLighting(lightApp.lighting, initial.lighting), "lighting reset")) { return false; }
+    applyLightingAction(lightApp, ToolPanelPress::Action::lightBack);
+    if (!check(!lightApp.lightingPage, "lighting page back")) { return false; }
+    lightApp.undo.clear();
+    auto const node = lightApp.scene.create();
+    lightApp.selection = {node};
+    auto const start = snapshot(lightApp);
+    applyLightingAction(lightApp, ToolPanelPress::Action::ambientUp);
+    auto const lit = snapshot(lightApp);
+    lightApp.undo.begin(lit);
+    moveSelectionVertical(lightApp.scene, lightApp.selection, .25F);
+    if (!check(lightApp.undo.commit(snapshot(lightApp)), "model edit after lighting") ||
+        !check(performUndo(lightApp, renderer) && sameSnapshot(snapshot(lightApp), lit), "model undo keeps light") ||
+        !check(performUndo(lightApp, renderer) && sameSnapshot(snapshot(lightApp), start), "light undo keeps model") ||
+        !check(performRedo(lightApp, renderer) && sameSnapshot(snapshot(lightApp), lit), "light redo with model")) { return false; }
+    lightApp.undo.clear();
+    lightApp.lighting = {};
+    applyLightingAction(lightApp, ToolPanelPress::Action::ambientUp);
+    if (!check(performUndo(lightApp, renderer), "light undo for redo test")) { return false; }
+    applyLightingAction(lightApp, ToolPanelPress::Action::lightReset);
+    if (!check(lightApp.undo.canRedo() && !lightApp.undo.canUndo(), "no-op light reset preserves redo")) { return false; }
+    for (int i = 0; i < 40; ++i) { applyLightingAction(lightApp, ToolPanelPress::Action::ambientUp); }
+    if (!check(lightApp.lighting.ambient == 1.0F, "ambient upper clamp")) { return false; }
+    for (int i = 0; i < 40; ++i) { applyLightingAction(lightApp, ToolPanelPress::Action::ambientDown); }
+    if (!check(lightApp.lighting.ambient == 0.0F, "ambient lower clamp")) { return false; }
+    for (int i = 0; i < 100; ++i) { applyLightingAction(lightApp, ToolPanelPress::Action::lightUp); }
+    if (!check(lightApp.lighting.direction.y < 1.0F && lightApp.lighting.direction.y > .99F, "elevation upper clamp")) { return false; }
+    for (int i = 0; i < 100; ++i) { applyLightingAction(lightApp, ToolPanelPress::Action::lightDown); }
+    if (!check(lightApp.lighting.direction.y > -1.0F && lightApp.lighting.direction.y < -.99F, "elevation lower clamp")) { return false; }
+  }
+
   app.handPanel = {{0, .195F, 0}, quatFromAxisAngle({0, 1, 0}, .3F), true};
   auto const normal = rotate(app.handPanel.orientation, {0, 0, 1});
   for (int index : {0, 8, 9, 10, 11}) {
@@ -5025,6 +5125,15 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
              "panel gap and back face miss")) {
     return false;
   }
+  app.lightingPage = true;
+  for (int index = 13; index <= 20; ++index) {
+    auto const c = app.handPanel.origin + rotate(app.handPanel.orientation, handPanelButtonCentre(index));
+    if (!check(app.handPanel.hit({c + normal, -normal}, true) == index, "lighting panel hit")) { return false; }
+  }
+  std::vector<RendererVertex> lightLines;
+  drawHandPanel(app, lightLines);
+  if (!check(!lightLines.empty() && lightLines.size() % 2 == 0, "lighting panel draws")) { return false; }
+  app.lightingPage = false;
   app.handHover = 8;
   std::vector<RendererVertex> lines;
   drawHandPanel(app, lines);
@@ -5398,10 +5507,10 @@ int runXr(char const* shaderDir,
     updateHandPanelTracking(app, input.handActive[0], worldHands[0]);
     int hover = -1;
     if (app.menuOwner != MenuOwner::none && controllerRight) {
-      hover = controllerAimTracked ? app.handPanel.hit(controllerAim) : -1;
+      hover = controllerAimTracked ? app.handPanel.hit(controllerAim, app.lightingPage) : -1;
     } else if (app.menuOwner == MenuOwner::hand) {
       hover = handSignal && input.aimValid[1] && input.aimTracked[1]
-          ? app.handPanel.hit(worldRay) : -1;
+          ? app.handPanel.hit(worldRay, app.lightingPage) : -1;
     }
     if (hover >= 1 && hover <= 7) {
       hover = -1; // spacer cells are not buttons
@@ -5438,6 +5547,8 @@ int runXr(char const* shaderDir,
           app.deleteHolding = false;
         } else if (button == ToolPanelPress::kBackdrop) {
           toggleBackdrop(app, renderer, &shell);
+        } else {
+          applyLightingAction(app, ToolPanelPress::actionFor(button));
         }
       } else if (rightPressed && !handMenuToggled) {
         app.handUiOwned = true; // tool panel owns misses too; do not click through
@@ -5527,7 +5638,9 @@ int runXr(char const* shaderDir,
           toggleBackdrop(app, renderer, &shell);
           break;
         case ToolPanelPress::Action::none:
+          break;
         default:
+          applyLightingAction(app, action);
           break;
         }
       }
@@ -5685,6 +5798,7 @@ int runXr(char const* shaderDir,
                     hand == 0 ? Vec3{0.45F, 0.75F, 1.0F} : Vec3{1.0F, 0.82F, 0.35F});
     }
 
+    renderer.setLighting(app.lighting);
     bool drew = true;
     // Render each raw located eye in the same rig as hands and controllers.
     for (int eye = 0; eye < 2; ++eye) {
@@ -5933,6 +6047,7 @@ int runInteractive(char const* shaderDir,
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;
     assembleFrame(app, items, depthLines, overlayLines);
+    renderer.setLighting(app.lighting);
     if (!renderer.draw(app.camera, items, depthLines, overlayLines)) {
       std::printf("draw failed; exiting\n");
       break;

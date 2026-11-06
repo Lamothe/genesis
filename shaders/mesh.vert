@@ -8,6 +8,7 @@ layout(location = 3) in vec2 inUv;
 layout(set = 0, binding = 0) uniform Frame {
   mat4 viewProj;
   vec4 cameraPos;
+  vec4 lightDirectionAmbient;
 } frame;
 
 layout(push_constant) uniform Push {
@@ -21,11 +22,13 @@ layout(location = 0) out vec3 vNormal;
 layout(location = 1) out vec3 vColour;
 layout(location = 2) out vec2 vUv;
 layout(location = 3) out vec3 vWorldPos;
+layout(location = 4) flat out float vModelHandedness;
 
 void main() {
   vec4 world = push.model * vec4(inPos, 1.0);
   gl_Position = frame.viewProj * world;
   mat3 linear = mat3(push.model);
+  vModelHandedness = determinant(linear) < 0.0 ? -1.0 : 1.0;
   // Scaling first avoids a determinant threshold that depends on model size.
   float scale = max(max(max(abs(linear[0].x), abs(linear[0].y)), abs(linear[0].z)),
                     max(max(max(abs(linear[1].x), abs(linear[1].y)), abs(linear[1].z)),

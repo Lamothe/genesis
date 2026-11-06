@@ -30,7 +30,7 @@ bool sameVisual(NodeVisual const& a, NodeVisual const& b) {
 }
 
 bool sameSnapshot(EditorSnapshot const& a, EditorSnapshot const& b) {
-  if (!sameSnapshot(a.scene, b.scene) || a.visuals.size() != b.visuals.size() ||
+  if (!sameLighting(a.lighting, b.lighting) || !sameSnapshot(a.scene, b.scene) || a.visuals.size() != b.visuals.size() ||
       a.groups != b.groups || a.selection != b.selection) {
     return false;
   }

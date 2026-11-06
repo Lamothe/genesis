@@ -617,7 +617,7 @@ void panels() {
   auto front = [](Vec3 point) { return Ray{point + Vec3{0, 0, 1}, {0, 0, -1}}; };
   CHECK(panel.hit(front(handPanelButtonCentre(0))) == -1);
   panel.visible = true;
-  for (int i : {0, 8, 9, 10, 11}) {
+  for (int i : {0, 8, 9, 10, 11, 12}) {
     auto const centre = handPanelButtonCentre(i);
     int const slot = i == 0 ? 0 : i - 7;
     CHECK(near(centre, {(slot % 2 == 0) ? -0.115F : 0.115F,
@@ -645,7 +645,12 @@ void panels() {
   CHECK(panel.hit({{nan, 0, 1}, {0, 0, -1}}) == -1);
   CHECK(panel.hit({{0, 0, 1}, {0, 0, nan}}) == -1);
   CHECK(near(handPanelButtonCentre(-1), Vec3{}));
-  CHECK(near(handPanelButtonCentre(12), Vec3{}));
+  for (int i = 13; i <= 20; ++i) {
+    auto const c = handPanelButtonCentre(i);
+    CHECK(panel.hit(front(c), true) == i);
+    CHECK(panel.hit(front(c), false) != i);
+  }
+  CHECK(near(handPanelButtonCentre(21), Vec3{}));
   CHECK(near(handPanelButtonCentre(1000000), Vec3{}));
 
   panel.origin = {3, 2, -4};
@@ -1182,6 +1187,13 @@ void toolPanelPress() {
   CHECK(ToolPanelPress::actionFor(ToolPanelPress::kRedo) == A::redo);
   CHECK(ToolPanelPress::actionFor(ToolPanelPress::kDelete) == A::deleteNow);
   CHECK(ToolPanelPress::actionFor(ToolPanelPress::kBackdrop) == A::backdrop);
+  for (int i = ToolPanelPress::kLighting; i <= ToolPanelPress::kLightReset; ++i) {
+    press.press(i);
+    CHECK(press.release(i) == ToolPanelPress::actionFor(i));
+    CHECK(ToolPanelPress::actionFor(i) != A::none);
+    press.press(i);
+    CHECK(press.release(-1) == A::none);
+  }
   CHECK(ToolPanelPress::actionFor(-1) == A::none);
 }
 } // namespace

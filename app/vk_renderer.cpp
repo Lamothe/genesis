@@ -126,6 +126,8 @@ struct VkRenderer::Impl {
     std::vector<MeshVertex> pendingVertices;
   };
 
+  SceneLighting lighting;
+
   // Backdrop void colour (setClearColour).
   float clearR{0.08F};
   float clearA{1.0F};
@@ -1489,7 +1491,7 @@ bool VkRenderer::createCommonResources(char const* shaderDir, VkFormat colourFor
   VkDescriptorBufferInfo bufferInfo{};
   bufferInfo.buffer = g.uniformBuffer;
   bufferInfo.offset = 0;
-  bufferInfo.range = 80; // the Frame block: viewProj (64) + cameraPos (16)
+  bufferInfo.range = 96; // viewProj + cameraPos + direction/ambient
 
   // Texture 0 is the built-in white fallback; every slot starts on it.
   Image white;
@@ -2316,6 +2318,10 @@ bool VkRenderer::resize(std::uint32_t width, std::uint32_t height) {
   g.height = height;
   return g.recreateTargets();
 }
+void VkRenderer::setLighting(SceneLighting const& lighting) {
+  impl_->lighting = lighting;
+}
+
 void VkRenderer::setClearColour(float r, float g, float b, float a) {
   impl_->clearR = r;
   impl_->clearG = g;
@@ -2349,6 +2355,8 @@ bool VkRenderer::draw(Camera const& camera,
   std::memcpy(g.uniformMapped, viewProj.m, sizeof(float) * 16U);
   float const camPos[4] = {camera.position.x, camera.position.y, camera.position.z, 1.0F};
   std::memcpy(static_cast<char*>(g.uniformMapped) + sizeof(float) * 16U, camPos, sizeof(camPos));
+  float const light[4] = {g.lighting.direction.x, g.lighting.direction.y, g.lighting.direction.z, g.lighting.ambient};
+  std::memcpy(static_cast<char*>(g.uniformMapped) + 80U, light, sizeof(light));
 
   std::size_t depthCount = depthLines.size();
   if (depthCount > 0U) {
@@ -2450,6 +2458,8 @@ bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const&
   float const camPos[4] = {cameraPos.x, cameraPos.y, cameraPos.z, 1.0F};
   std::memcpy(static_cast<char*>(g.uniformMapped) + sizeof(float) * 16U, camPos,
               sizeof(camPos));
+  float const light[4] = {g.lighting.direction.x, g.lighting.direction.y, g.lighting.direction.z, g.lighting.ambient};
+  std::memcpy(static_cast<char*>(g.uniformMapped) + 80U, light, sizeof(light));
 
   std::size_t depthCount = depthLines.size();
   if (depthCount > 0U) {

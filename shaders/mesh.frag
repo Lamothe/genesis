@@ -4,6 +4,7 @@ layout(location = 0) in vec3 vNormal;
 layout(location = 1) in vec3 vColour;
 layout(location = 2) in vec2 vUv;
 layout(location = 3) in vec3 vWorldPos;
+layout(location = 4) flat in float vModelHandedness;
 
 layout(set = 0, binding = 1) uniform sampler2D uTextures[256];
 
@@ -12,6 +13,7 @@ layout(location = 0) out vec4 outColour;
 layout(set = 0, binding = 0) uniform Frame {
   mat4 viewProj;
   vec4 cameraPos;
+  vec4 lightDirectionAmbient;
 } frame;
 
 layout(push_constant) uniform Push {
@@ -51,11 +53,13 @@ void main() {
   }
   // The renderer currently draws every material double-sided. Reverse the
   // fully mapped normal on back faces, including its tangent-space components.
-  if (!gl_FrontFacing) {
+  // A mirrored model reverses winding, not its inverse-transpose outward normal.
+  if (gl_FrontFacing != (vModelHandedness > 0.0)) {
     n = -n;
   }
-  float ndl = abs(dot(n, normalize(vec3(0.35, 0.85, 0.45))));
-  float light = mix(1.0, 0.35 + 0.65 * ndl, push.params.x);
+  float ndl = max(dot(n, normalize(frame.lightDirectionAmbient.xyz)), 0.0);
+  float ambient = clamp(frame.lightDirectionAmbient.w, 0.0, 1.0);
+  float light = mix(1.0, ambient + (1.0 - ambient) * ndl, push.params.x);
   vec4 base = vec4(vColour * light, push.tint.a) * texel;
   float mode = push.params.w;
   if (mode > 0.5 && mode < 1.5 && base.a < push.params.z) {

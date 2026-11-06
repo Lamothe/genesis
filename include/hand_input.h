@@ -331,7 +331,9 @@ class HandContactCache {
 // Panel-local coordinates, with the origin at the top centre. Invalid indices
 // return the origin (which is not inside any button).
 inline constexpr Vec3 handPanelButtonCentre(int index) {
-  int const slot = index == 0 ? 0 : index >= 8 && index <= 11 ? index - 7 : -1;
+  int const slot = index == 0 ? 0 : index >= 8 && index <= 12 ? index - 7 :
+                   index == 13 ? 0 : index == 20 ? 1 :
+                   index >= 14 && index <= 19 ? index - 12 : -1;
   if (slot < 0) { return {}; }
   return {(slot % 2 == 0) ? -0.115F : 0.115F,
           -0.065F * (static_cast<float>(slot / 2) + 0.5F), 0.0F};
@@ -342,7 +344,7 @@ struct HandPanel {
   Quat orientation{};
   bool visible{false};
 
-  int hit(Ray const& ray) const {
+  int hit(Ray const& ray, bool lightingPage = false) const {
     if (!visible) {
       return -1;
     }
@@ -357,7 +359,12 @@ struct HandPanel {
     }
     auto const local = rotate(conjugate(orientation),
                               ray.origin + ray.direction * distance - origin);
-    for (int index : {0, 8, 9, 10, 11}) {
+    int const mainButtons[] = {0, 8, 9, 10, 11, 12};
+    int const lightButtons[] = {13, 14, 15, 16, 17, 18, 19, 20};
+    auto const* buttons = lightingPage ? lightButtons : mainButtons;
+    int const count = lightingPage ? 8 : 6;
+    for (int i = 0; i < count; ++i) {
+      int const index = buttons[i];
       auto const centre = handPanelButtonCentre(index);
       if (std::fabs(local.x - centre.x) <= 0.105F &&
           std::fabs(local.y - centre.y) <= 0.028F) {

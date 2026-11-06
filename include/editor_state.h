@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "lighting.h"
 #include "mesh.h"
 #include "picking.h"
 #include "scene.h"
@@ -56,6 +57,7 @@ using ModelGroups = std::vector<std::pair<NodeId, std::uint32_t>>;
 // deleted model; this can, because nodes keep their ids across restore.
 struct EditorSnapshot {
   SceneSnapshot scene;
+  SceneLighting lighting;
   std::vector<NodeVisual> visuals;
   ModelGroups groups;
   std::vector<NodeId> selection;

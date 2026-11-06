@@ -78,6 +78,42 @@ int main() {
     return 1;
   }
 
+  // Render the actual shader with opposed light directions and ambient fill.
+  MeshData lightMesh = source;
+  for (auto& v : lightMesh.vertices) { v.normal = {0, 0, 1}; v.colour = {.5F, .5F, .5F}; }
+  DrawItem lightItem;
+  lightItem.mesh = renderer.addMesh(lightMesh);
+  lightItem.model = translationMatrix({0, 0, -3});
+  SceneLighting lighting;
+  lighting.direction = {0, 0, 1}; lighting.ambient = 0.1F;
+  renderer.setLighting(lighting);
+  std::vector<std::uint8_t> lit, dark, ambient, unlitA, unlitB;
+  if (lightItem.mesh == kInvalidMesh || !render(renderer, camera, lightItem, lit)) { return 1; }
+  lightItem.model = mul(translationMatrix({0, 0, -3}), scaleMatrix({-1, 1, 1}));
+  std::vector<std::uint8_t> mirroredLighting;
+  if (!render(renderer, camera, lightItem, mirroredLighting) ||
+      std::abs(static_cast<int>(mirroredLighting[centre]) - static_cast<int>(lit[centre])) > 1) {
+    std::printf("renderer test: mirrored face lighting mismatch %u vs %u\n", lit[centre], mirroredLighting[centre]);
+    return 1;
+  }
+  lightItem.model = translationMatrix({0, 0, -3});
+  lighting.direction = {0, 0, -1}; renderer.setLighting(lighting);
+  if (!render(renderer, camera, lightItem, dark)) { return 1; }
+  lighting.ambient = 0.6F; renderer.setLighting(lighting);
+  if (!render(renderer, camera, lightItem, ambient)) { return 1; }
+  if (lit[centre] <= dark[centre] + 70 || ambient[centre] <= dark[centre] + 40 ||
+      lit[centre] <= ambient[centre] + 30) {
+    std::printf("renderer test: lighting not applied: %u %u %u\n", lit[centre], dark[centre], ambient[centre]);
+    return 1;
+  }
+  std::printf("renderer lighting RGB centre: directional=%u opposed=%u ambient=%u\n", lit[centre], dark[centre], ambient[centre]);
+  lightItem.lit = false;
+  if (!render(renderer, camera, lightItem, unlitA)) { return 1; }
+  renderer.setLighting({});
+  if (!render(renderer, camera, lightItem, unlitB) || unlitA != unlitB) {
+    std::printf("renderer test: unlit material changed with lighting\n"); return 1;
+  }
+
   // Selection adds a neutral, grazing-only rim, not a warm fill. Use a
   // deliberately edge-on normal and compare actual shader output at centre.
   MeshData rimMesh = source;
@@ -116,6 +152,8 @@ int main() {
     v.pos.x *= -2.0F;
     v.normal = {-0.5F, 1.0F, 1.0F};
   }
+  // A baked mirror must reverse its winding to preserve the original front.
+  std::swap(mirrored.indices[1], mirrored.indices[2]);
   auto const mirrorHandle = renderer.addMesh(mirrored);
   item.mesh = sourceHandle;
   item.model = mul(translationMatrix({0, 0, -3}), scaleMatrix({-2, 1, 1}));

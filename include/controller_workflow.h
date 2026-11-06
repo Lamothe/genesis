@@ -346,9 +346,18 @@ class ToolPanelPress {
   static constexpr int kRedo = 9;
   static constexpr int kDelete = 10;
   static constexpr int kBackdrop = 11;
+  static constexpr int kLighting = 12;
+  static constexpr int kLightBack = 13;
+  static constexpr int kLightLeft = 14;
+  static constexpr int kLightRight = 15;
+  static constexpr int kLightUp = 16;
+  static constexpr int kLightDown = 17;
+  static constexpr int kAmbientDown = 18;
+  static constexpr int kAmbientUp = 19;
+  static constexpr int kLightReset = 20;
   static constexpr float kDeleteHoldSeconds = 0.6F;
 
-  enum class Action : std::uint8_t { none, models, undo, redo, deleteNow, backdrop };
+  enum class Action : std::uint8_t { none, models, undo, redo, deleteNow, backdrop, lighting, lightBack, lightLeft, lightRight, lightUp, lightDown, ambientDown, ambientUp, lightReset };
 
   void press(int button) {
     button_ = button;
@@ -417,6 +426,15 @@ class ToolPanelPress {
     case kUndo: return Action::undo;
     case kRedo: return Action::redo;
     case kBackdrop: return Action::backdrop;
+    case kLighting: return Action::lighting;
+    case kLightBack: return Action::lightBack;
+    case kLightLeft: return Action::lightLeft;
+    case kLightRight: return Action::lightRight;
+    case kLightUp: return Action::lightUp;
+    case kLightDown: return Action::lightDown;
+    case kAmbientDown: return Action::ambientDown;
+    case kAmbientUp: return Action::ambientUp;
+    case kLightReset: return Action::lightReset;
     case kDelete: return Action::deleteNow;
     default: return Action::none;
     }

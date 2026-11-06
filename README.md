@@ -154,13 +154,30 @@ pointing. There is one owner grab at a time, and the controls are:
   real trigger release after tracking returns is required. Profile changes
   and skipped/paused XR frames do the same.
 - **Left Menu:** one press opens/closes the real tools panel (**Models**,
-  **Undo**, **Redo**, **Delete**, **Backdrop**), latched in the world in front of
+  **Undo**, **Redo**, **Delete**, **Backdrop**, **Lighting**), latched in the world in front of
   the viewer so pointing at it is stable. Aim with the right controller and pull
   the trigger: Models/Undo/Redo/Backdrop fire on release over the same button;
   Delete is a 0.6 s hold with the red charge ramp and cancels if released early.
   A miss is captured and swallowed (nothing clicks through). Opening the panel
   commits a live grab; a trigger held across a panel/carousel transition must
   return to release before it can act again.
+- **Lighting:** select Lighting on the tools panel. Light left/right rotates a
+  distant light around the vertical axis; Light up/down adjusts its elevation
+  in 15-degree steps. These are world-space controls, not a movable local lamp:
+  the direction applies equally to the entire scene. Ambient -/+ adjusts the
+  uniform fill in 5% steps (0–100%). Reset light restores the default; Back
+  returns to the tools panel. Each change is an undo/redo step, including
+  reset. Settings last for the current editor session only. Materials use a
+  simple directional diffuse plus ambient approximation, not shadows, light
+  colour, reflections or measured real-world lighting. The controls do not
+  access passthrough imagery. On 06/11/2026 platinum WiVRn Flatpak 26.9
+  returned 61 instance extensions via xrEnumerateInstanceExtensionProperties;
+  none exposed light estimation (including XR_ANDROID_light_estimation). This
+  does not establish capabilities of other runtimes or future WiVRn versions.
+  Meta documents passthrough as a compositor layer without app image access:
+  https://developers.meta.com/vr/documentation/native/android/mobile-passthrough/
+  Khronos describes XR_ANDROID_light_estimation as an unratified extension:
+  https://registry.khronos.org/OpenXR/specs/1.1/man/html/XR_ANDROID_light_estimation.html
 - **Carousel:** **A** or the panel's **Models** button opens it. **Right stick
   X** browses the ring (one step per flick, held repeats every 0.25 s). The
   View loss or a skipped frame pauses browsing; the right stick must return to

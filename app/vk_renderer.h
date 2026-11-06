@@ -9,6 +9,7 @@
 
 #include "camera.h"
 #include "geometry.h"
+#include "lighting.h"
 #include "mesh.h"
 
 namespace vredit {
@@ -83,6 +84,9 @@ public:
 
   // Clear colour for the next frames (the backdrop void colour).
   void setClearColour(float r, float g, float b, float a = 1.0F);
+
+  // Direction is world-space, towards the distant light; ambient is 0..1.
+  void setLighting(SceneLighting const& lighting);
 
   // Renders one frame. Windowed: presents to the swapchain. Offscreen:
   // renders into an internal image available through readback().
