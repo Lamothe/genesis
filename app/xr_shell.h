@@ -94,7 +94,8 @@ struct XrFrameInput {
 // session and per-eye swapchains, plus the Vulkan instance/device handed to
 // VkRenderer::initExternal. Frame flow: beginFrame fills XrFrameInput and
 // acquires both eye images; the app renders via VkRenderer::drawToView into
-// eyeView/eyeImage per eye; endFrame releases the images and composites.
+// eyeView/eyeImage per eye; endFrame composites successful draws, while
+// abortFrame releases the images and submits no layers.
 class XrShell {
 public:
   enum class InitResult {
@@ -146,11 +147,12 @@ public:
   //   Render  — frame begun and ready to draw into the eye targets;
   //   Skipped — frame begun and already ended (nothing to draw this time);
   //   Pump    — no frame begun yet (session starting); retry after a short sleep;
-  //   Exit    — session over or a fatal failure; stop the loop.
+  //   Exit    — session over; stop the loop successfully.
+  //   Failed  — fatal frame or session failure; stop with an error.
   // `shouldRender` is treated as a hint only: the spec allows layers in every
   // xrEndFrame, and zero-layer frames display as a cleared (passthrough) frame
   // on WiVRn, so a skip is never worth a visible blank.
-  enum class FrameStatus { Render, Skipped, Pump, Exit };
+  enum class FrameStatus { Render, Skipped, Pump, Exit, Failed };
   FrameStatus beginFrame(XrFrameInput& inputOut);
   // "Show the model without the background": composite ALPHA_BLEND over the
   // real world instead of an opaque backdrop. Unsupported runtimes keep the
@@ -162,13 +164,17 @@ public:
   VkImageView eyeView(int eye) const { return eyeViews_[eye]; }
   VkImage eyeImage(int eye) const { return eyeImages_[eye]; }
   bool endFrame();
+  bool abortFrame(); // release acquired images and submit zero layers
+
 
   FrameStats const& frameStats() const { return stats_; }
 
 private:
+  friend class XrShellFrameTest;
+  bool finishFrame(bool submitProjection);
   bool createActions();
   bool createSwapchains();
-  void pollEvents(bool& running);
+  void pollEvents(bool& running, bool& failed);
   bool syncActions(XrFrameInput& input, std::uint64_t displayTime);
 
   struct ImplData;
@@ -184,6 +190,7 @@ private:
   VkImage eyeImages_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
   VkImageView eyeViews_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
   bool imagesAcquired_[2] = {false, false};
+  bool imagesWaited_[2] = {false, false};
   bool passthrough_{false};        // setPassthrough: alpha-blend compositing
   bool alphaBlendSupported_{false}; // runtime accepts ALPHA_BLEND (checked at init)
   bool passthroughWarned_{false};

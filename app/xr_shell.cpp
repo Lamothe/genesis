@@ -74,13 +74,14 @@ struct XrShell::ImplData {
   std::vector<XrSwapchainImageVulkan2KHR> images[2];
   std::vector<VkImageView> imageViews[2];
   std::uint32_t acquiredIndex[2] = {0, 0};
-  XrView views[2];
+  XrView views[2]{};
   bool haveGoodViews{false}; // views[] holds the last successfully located pair
   XrViewConfigurationView viewConfig[2];
   XrSessionState sessionState{XR_SESSION_STATE_UNKNOWN};
   bool sessionRunning{false};
   bool sessionVisible{false};
   bool frameBegun{false};
+  bool frameBroken{false}; // cleanup or xrEndFrame failed; do not start another frame
   bool frameReady{false}; // views located and both eye images acquired
   XrTime predictedDisplayTime{0};
   XrFrameState frameState{};
@@ -718,7 +719,7 @@ bool XrShell::createSwapchains() {
   return true;
 }
 
-void XrShell::pollEvents(bool& running) {
+void XrShell::pollEvents(bool& running, bool& failed) {
   XrEventDataBuffer event = xrStruct<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
   while (xrPollEvent(xr_->instance, &event) == XR_SUCCESS) {
     if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
@@ -743,12 +744,14 @@ void XrShell::pollEvents(bool& running) {
           xr_->sessionRunning = true;
         } else {
           running = false; // fatal: the session can never start
+          failed = true;
         }
         break;
       }
       case XR_SESSION_STATE_STOPPING:
         if (!xrOk(xrEndSession(xr_->session), "xrEndSession")) {
           running = false; // fatal: the session can never end cleanly
+          failed = true;
         }
         xr_->sessionRunning = false;
         break;      case XR_SESSION_STATE_EXITING:
@@ -1116,14 +1119,15 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
 }
 
 XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
-  if (xr_ == nullptr) {
-    return FrameStatus::Exit;
+  if (xr_ == nullptr || xr_->frameBegun || xr_->frameBroken) {
+    return FrameStatus::Failed;
   }
   inputOut = XrFrameInput{};
   bool running = true;
-  pollEvents(running);
+  bool failed = false;
+  pollEvents(running, failed);
   if (!running) {
-    return FrameStatus::Exit;
+    return failed ? FrameStatus::Failed : FrameStatus::Exit;
   }
   if (!xr_->sessionRunning) {
     xr_->controllerContinuity.skipFrame();
@@ -1139,11 +1143,11 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   XrFrameWaitInfo waitInfo = xrStruct<XrFrameWaitInfo>(XR_TYPE_FRAME_WAIT_INFO);
   xr_->frameState = xrStruct<XrFrameState>(XR_TYPE_FRAME_STATE);
   if (!xrOk(xrWaitFrame(xr_->session, &waitInfo, &xr_->frameState), "xrWaitFrame")) {
-    return FrameStatus::Exit;
+    return FrameStatus::Failed;
   }
   XrFrameBeginInfo beginInfo = xrStruct<XrFrameBeginInfo>(XR_TYPE_FRAME_BEGIN_INFO);
   if (!xrOk(xrBeginFrame(xr_->session, &beginInfo), "xrBeginFrame")) {
-    return FrameStatus::Exit;
+    return FrameStatus::Failed;
   }
   xr_->frameBegun = true;
   xr_->frameReady = false;
@@ -1159,8 +1163,8 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     xr_->spawnPress.interrupt();
     xr_->undoPress.interrupt();
     xr_->redoPress.interrupt();
-    endFrame(); // endFrame counts the zero-layer outcome
-    return FrameStatus::Skipped;
+    // A failed release or end leaves the runtime in an uncertain state.
+    return abortFrame() ? FrameStatus::Skipped : FrameStatus::Failed;
   };
   // shouldRender is a power hint (spec: "should avoid heavy GPU work"), not a
   // constraint on xrEndFrame. Zero layers mean "clear the display" — WiVRn
@@ -1207,9 +1211,8 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     return failFrame();
   }
 
-  // Acquire both eye images for the app to render into. The image is marked
-  // owned the moment acquire succeeds, so any later failure still releases it
-  // via endFrame.
+  // Mark ownership immediately; abortFrame waits before releasing even if
+  // the initial wait fails.
   for (int eye = 0; eye < 2; ++eye) {
     XrSwapchainImageAcquireInfo acquireInfo = xrStruct<XrSwapchainImageAcquireInfo>(XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO);
     std::uint32_t index = 0;
@@ -1224,10 +1227,15 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     imagesAcquired_[eye] = true;
     XrSwapchainImageWaitInfo imageWait = xrStruct<XrSwapchainImageWaitInfo>(XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO);
     imageWait.timeout = XR_INFINITE_DURATION;
-    if (!xrOk(xrWaitSwapchainImage(xr_->swapchains[eye], &imageWait), "xrWaitSwapchainImage")) {
+    XrResult waitResult;
+    do {
+      waitResult = xrWaitSwapchainImage(xr_->swapchains[eye], &imageWait);
+    } while (waitResult == XR_TIMEOUT_EXPIRED);
+    if (!xrOk(waitResult, "xrWaitSwapchainImage")) {
       ++stats_.acquireFail;
       return failFrame();
     }
+    imagesWaited_[eye] = true;
   }
   xr_->frameReady = true;
   xr_->selectInterruptedPending = false;
@@ -1242,10 +1250,19 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
 }
 
 bool XrShell::endFrame() {
+  return finishFrame(true);
+}
+
+bool XrShell::abortFrame() {
+  return finishFrame(false);
+}
+
+bool XrShell::finishFrame(bool submitProjection) {
   if (xr_ == nullptr || !xr_->frameBegun) {
     return false;
   }
 
+  bool released = true;
   XrCompositionLayerProjectionView projectionViews[2];
   for (int eye = 0; eye < 2; ++eye) {
     projectionViews[eye] =
@@ -1257,10 +1274,27 @@ bool XrShell::endFrame() {
                                                       static_cast<int32_t>(eyeHeight_)};
     projectionViews[eye].subImage.imageArrayIndex = 0;
     if (imagesAcquired_[eye]) {
+      if (!imagesWaited_[eye]) {
+        XrSwapchainImageWaitInfo waitInfo = xrStruct<XrSwapchainImageWaitInfo>(XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO);
+        waitInfo.timeout = XR_INFINITE_DURATION;
+        XrResult waitResult;
+        do {
+          waitResult = xrWaitSwapchainImage(xr_->swapchains[eye], &waitInfo);
+        } while (waitResult == XR_TIMEOUT_EXPIRED);
+        if (!xrOk(waitResult, "xrWaitSwapchainImage during cleanup")) {
+          released = false;
+          continue; // releasing an image that was not waited is invalid
+        }
+        imagesWaited_[eye] = true;
+      }
       XrSwapchainImageReleaseInfo releaseInfo = xrStruct<XrSwapchainImageReleaseInfo>(XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO);
-      xrOk(xrReleaseSwapchainImage(xr_->swapchains[eye], &releaseInfo),
-           "xrReleaseSwapchainImage");
+      if (!xrOk(xrReleaseSwapchainImage(xr_->swapchains[eye], &releaseInfo),
+                "xrReleaseSwapchainImage")) {
+        released = false;
+        continue;
+      }
       imagesAcquired_[eye] = false;
+      imagesWaited_[eye] = false;
     }
   }
 
@@ -1286,9 +1320,8 @@ bool XrShell::endFrame() {
   // endInfo.layers during the call, so the array cannot be scoped to the branch.
   XrCompositionLayerBaseHeader const* layers[] = {
       reinterpret_cast<XrCompositionLayerBaseHeader const*>(&layer)};
-  // frameReady is the only gate: we render despite shouldRender (a hint), and
-  // zero layers mean "clear the display" (passthrough on WiVRn).
-  if (xr_->frameReady) {
+  // A projection is safe only after both draws and releases succeeded.
+  if (submitProjection && xr_->frameReady && released) {
     endInfo.layerCount = 1;
     endInfo.layers = layers;
   } else {
@@ -1301,7 +1334,8 @@ bool XrShell::endFrame() {
   bool ok = xrOk(xrEndFrame(xr_->session, &endInfo), "xrEndFrame");
   xr_->frameBegun = false;
   xr_->frameReady = false;
-  return ok;
+  xr_->frameBroken = !ok || !released;
+  return ok && released;
 }
 
 void XrShell::shutdown() {
@@ -1320,6 +1354,7 @@ void XrShell::shutdown() {
       xr_->swapchains[eye] = XR_NULL_HANDLE;
     }
     imagesAcquired_[eye] = false;
+    imagesWaited_[eye] = false;
   }
   for (XrSpace& aimSpace : xr_->aimSpaces) {
     if (aimSpace != XR_NULL_HANDLE) {

@@ -58,4 +58,9 @@ fi
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
   tests/test_controller_arm_profile.cpp -o .build/test-controller-arm-profile
 ./.build/test-controller-arm-profile
-exec ./.build/test-hand-mesh
+./.build/test-hand-mesh
+
+# Real shell lifecycle with stubbed OpenXR calls; no headset or runtime required.
+"$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude -Iapp -Ithird_party/openxr/include \
+  tests/test_xr_frame.cpp src/camera.cpp -lvulkan -l:libopenxr_loader.so.1 -o .build/test-xr-frame
+./.build/test-xr-frame

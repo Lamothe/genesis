@@ -28,6 +28,7 @@
 #include <xcb/xcb.h>
 
 #include "xr_shell.h"
+#include "xr_app_frame.h"
 #include "vr_locomotion.h"
 
 #include "animation.h"
@@ -6037,7 +6038,7 @@ int runXr(char const* shaderDir,
     XrFrameInput input;
     frameStart = std::chrono::steady_clock::now();
     XrShell::FrameStatus status = shell.beginFrame(input);
-    if (status == XrShell::FrameStatus::Exit) {
+    if (xrAppShouldStop(status, renderFailed)) {
       break;
     }
     if (status == XrShell::FrameStatus::Pump || status == XrShell::FrameStatus::Skipped) {
@@ -6550,9 +6551,8 @@ int runXr(char const* shaderDir,
         if (renderer.hasFatalError()) { break; }
       }
     }
-    if (renderer.hasFatalError()) {
+    if (xrAppAbortOnFatalArmUpdate(shell, renderer)) {
       std::fprintf(stderr, "[xr] renderer fatal during controller visual update\n");
-      shell.endFrame();
       renderFailed = true;
       break;
     }
@@ -6587,25 +6587,23 @@ int runXr(char const* shaderDir,
     }
 
     renderer.setLighting(app.lighting);
-    bool drew = true;
     // Render each raw located eye in the same rig as hands and controllers.
-    for (int eye = 0; eye < 2; ++eye) {
+    bool const frameSucceeded = xrAppDrawAndFinish(shell, [&](int eye) {
       Vec3 eyeWorld{};
       Mat4 view{};
       if (!composeStereoEye(rigWorld, input.eyePos[eye], input.eyeOrient[eye], eyeWorld, view)) {
         std::printf("[xr] eye pose is singular\n");
-        drew = false;
-        break;
+        return false;
       }
       Mat4 viewProj = mul(input.eyeProj[eye], view);
       if (!renderer.drawToView(shell.eyeView(eye), shell.eyeImage(eye), view, viewProj, eyeWorld,
                                items, depthLines, overlayLines)) {
         std::printf("[xr] eye draw failed\n");
-        drew = false;
-        break;
+        return false;
       }
-    }
-    if (!shell.endFrame() || !drew) {
+      return true;
+    });
+    if (!frameSucceeded) {
       renderFailed = true;
       running = false;
     }
@@ -6643,12 +6641,10 @@ int runXr(char const* shaderDir,
 
   renderer.shutdown();
   shell.shutdown();
-  if (renderFailed) { return 2; }
-  if (smoke && framesRendered < 60) {
+  if (!renderFailed && smoke && framesRendered < 60) {
     std::printf("SMOKE FAIL: only %d xr frames rendered\n", framesRendered);
-    return 1;
   }
-  return 0;
+  return xrAppExitCode(renderFailed, smoke, framesRendered);
 }
 
 // Applies held movement keys once per frame (free flight).
