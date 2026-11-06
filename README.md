@@ -27,6 +27,7 @@ renderer bolted on later through the seam contract
 - `app/geometry.*` — cube, floor grid, handle-line geometry
 - `app/editor_app.cpp` — XCB/OpenXR shell input, selection, controller
   workflow, model loading (`.glb`/`.obj` on the command line), smoke modes
+- `include/controller_arm_rig.h` — opt-in controller arm pose and finger solver
 - `include/controller_workflow.h` — controller grip-pose quality, the
   carousel's settled/loaded placement gate, the trigger select-then-grab state
   machine and the tools-panel press/Delete-hold capture
@@ -45,6 +46,7 @@ bash run-editor.sh --smoke-textured      # texture sampling end-to-end
 bash run-editor.sh --smoke-blend         # blended surfaces
 bash run-editor.sh --smoke-perf          # offscreen rendering timings
 bash run-editor.sh --smoke-skinned       # rig: bind pose -> animated deformation
+GENESIS_CONTROLLER_ARMS_GLB=/path/to/rigged.glb bash run-editor.sh --smoke-controller-arms # real asset + depth
 bash run-editor.sh --bench-skin          # CPU skinning cost at 100k/300k/1.2M vertices
 bash run-editor.sh --smoke-window 30     # windowed present path
 bash run-editor.sh --smoke-xr            # XR frame loop (SKIP without a runtime)
@@ -329,12 +331,63 @@ Headset-side appearance still has to be judged by eye.
 A comparison with Centre Stage identified the missing PBR materials,
 transmission, emissive, sRGB material pipeline and studio lighting. This change
 only fixes normal transforms and Vulkan blend-upload synchronisation; it does
-not claim Centre Stage appearance parity. The hands are procedural tracked surfaces, not the downloaded rig; its library
-GLB has no skin, while the original archive contains a rig. Rig retargeting and
-collision need further work. Visible hands/arms and their depth-tested
-rendering are retained in the controller workflow, but no arm-asset work was
-done in this change. Passthrough does not supply real room geometry for
-collision.
+not claim Centre Stage appearance parity. Passthrough does not supply real
+room geometry for collision.
+
+### Optional controller arm visuals
+
+Controller arms are **off by default**. The tested source is Felipe Bueno’s
+[Male Hand Rigged - Human Anatomy](https://sketchfab.com/3d-models/male-hand-rigged-human-anatomy-ecbe20f0d3764050b2e8a0487908ee99).
+The local source archive is a **rip**, not an official download. The
+[Sketchfab model API](https://api.sketchfab.com/v3/models/ecbe20f0d3764050b2e8a0487908ee99)
+reported `isDownloadable: false` and an empty licence on 06/11/2026; the
+archive contains no model licence. Rights to use or redistribute this asset
+remain unverified. Do not redistribute the archive or asset; obtain the
+rights holder’s permission before use. No asset is distributed with this project
+and the application performs no download.
+
+On platinum, if permission has been obtained, extract the skinned GLB from
+the existing archive (this writes or replaces only the specified local build
+file):
+
+```sh
+mkdir -p .build
+unzip -p "$HOME/Downloads/VR/Props/Male_Hand_Rigged_-_Human_Anatomy/original/source-download.zip" \
+  "Male_Hand_Rigged_-_Human_Anatomy.glb" > .build/controller-arm-source.glb
+```
+
+Opt in explicitly with the extracted local path, or another compatible GLB
+for which you have rights:
+
+```sh
+GENESIS_CONTROLLER_ARMS_GLB="$PWD/.build/controller-arm-source.glb" bash run-editor.sh --xr
+GENESIS_CONTROLLER_ARMS_GLB="$PWD/.build/controller-arm-source.glb" bash run-editor.sh --smoke-controller-arms
+```
+
+The library copy described above has no skin and will be rejected; the original
+source archive contains a skinned GLB. The rig must provide both named deform-bone
+chains and separate skinned meshes. Invalid or unavailable files disable the
+visuals with a diagnostic, without affecting the session. Arm visuals are not
+scene objects, pick targets or part of undo/history. They are depth-tested with
+scene geometry; blended materials follow the renderer’s normal transparency
+ordering. The offscreen smoke uses the supplied real asset and checks each
+side, curl, pose motion, front/back occlusion and each side obscured while
+the opposite side remains visible. It requires Vulkan and does
+not verify headset appearance.
+
+Both controller sides use their independently tracked physical grip pose and
+analogue trigger/squeeze values, without changing control actions. A lost grip,
+view or focus hides the affected visuals rather than displaying a stale pose;
+a profile interruption alone does not hide an independently tracked opposite side;
+actual tracked hands and the hand menu remain unchanged and replace the
+controller visual on that side. The shoulder is estimated 20 cm below the head
+with yaw-only orientation; two-bone IK and finger curls are approximations,
+not body or finger tracking. Elbow bend is transported across frames; it is
+path-dependent and may drift, and resets after tracking loss. The wrist currently uses the controller grip pose
+without a device-specific grip-to-wrist calibration, and reach is clamped.
+Expect alignment, elbow and finger shape to need headset/device testing and
+calibration. CPU skinning and large embedded textures have a performance and
+memory cost. No real-world collision is provided.
 
 ## Design notes
 

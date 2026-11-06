@@ -795,6 +795,10 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   auto const select = xr_->selectTrigger.updateTracked(input.viewTracked, syncResult == XR_SUCCESS &&
                                                 XR_SUCCEEDED(triggerResult) && triggerState.isActive &&
                                                 !xr_->selectInterruptedPending, triggerState.currentState);
+  if (syncResult == XR_SUCCESS && XR_SUCCEEDED(triggerResult) && triggerState.isActive &&
+      !xr_->selectInterruptedPending && std::isfinite(triggerState.currentState)) {
+    input.controllerTrigger[1] = std::clamp(triggerState.currentState, 0.0F, 1.0F);
+  }
   input.selectActive = select.active;
   input.selectHeld = select.held;
   input.selectPressed = select.pressed;
@@ -806,6 +810,10 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   auto const leftSelect = xr_->leftSelectTrigger.updateTracked(input.viewTracked, syncResult == XR_SUCCESS &&
       XR_SUCCEEDED(leftTriggerResult) && triggerState.isActive &&
       !xr_->selectInterruptedPending, triggerState.currentState);
+  if (syncResult == XR_SUCCESS && XR_SUCCEEDED(leftTriggerResult) && triggerState.isActive &&
+      !xr_->selectInterruptedPending && std::isfinite(triggerState.currentState)) {
+    input.controllerTrigger[0] = std::clamp(triggerState.currentState, 0.0F, 1.0F);
+  }
   input.leftSelectActive = leftSelect.active;
   input.leftSelectHeld = leftSelect.held;
   input.leftSelectPressed = leftSelect.pressed;
@@ -919,12 +927,23 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   input.deleteActive = syncResult == XR_SUCCESS && XR_SUCCEEDED(deleteResult) && deleteState.isActive;
   input.deleteHeld = input.deleteActive && deleteState.currentState;
   input.deleteInterrupted = xr_->selectInterruptedPending;
+  input.controllerVisualsFocused = xr_->sessionState == XR_SESSION_STATE_FOCUSED;
 
   XrActionStateFloat gripState = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
   getInfo.action = xr_->gripAction;
   getInfo.subactionPath = rightPath;
   xrGetActionStateFloat(xr_->session, &getInfo, &gripState);
   input.gripHeld = gripState.isActive ? gripState.currentState : 0.0F;
+  // Do not change the existing modifier query above. These are visual-only.
+  for (int hand = 0; hand < 2; ++hand) {
+    auto visualGrip = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
+    getInfo.subactionPath = xr_->handPaths[hand];
+    XrResult const result = xrGetActionStateFloat(xr_->session, &getInfo, &visualGrip);
+    if (syncResult == XR_SUCCESS && XR_SUCCEEDED(result) && visualGrip.isActive &&
+        !xr_->selectInterruptedPending && std::isfinite(visualGrip.currentState)) {
+      input.controllerSqueeze[hand] = std::clamp(visualGrip.currentState, 0.0F, 1.0F);
+    }
+  }
 
   // Keep hand-only gestures separate from controllers (including inferred joints).
   XrPath handProfile = XR_NULL_PATH;

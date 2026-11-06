@@ -43,6 +43,7 @@ struct XrFrameInput {
   Vec2 rightStick{0.0F, 0.0F}; // viewer look or carousel browsing
   bool leftStickActive{false};
   bool viewTracked{false}; // fresh position and orientation, both actively tracked
+  bool controllerVisualsFocused{false}; // session focus, not an editing action
   bool rightStickActive{false}; // successful, active, finite right-stick sample
   bool rightStickAbsent{false}; // confirmed simple-controller profile, not a transient loss
   // selectActive is true only for a successful, active, finite trigger
@@ -71,6 +72,9 @@ struct XrFrameInput {
   bool deleteHeld{false};   // X on Touch held: hold-to-delete with red ramp
   // Focus/profile change, even if the current delete query is active.
   bool deleteInterrupted{false};
+  // Visual-only analogue samples; inactive or interrupted actions read as zero.
+  float controllerTrigger[2] = {0.0F, 0.0F};
+  float controllerSqueeze[2] = {0.0F, 0.0F};
   float gripHeld{0.0F};
 };
 

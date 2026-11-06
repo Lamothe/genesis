@@ -31,6 +31,7 @@
 #include "camera.h"
 #include "carousel.h"
 #include "controller_workflow.h"
+#include "controller_arm_rig.h"
 #include "editor_state.h"
 #include "gizmo.h"
 #include "gltf.h"
@@ -1206,6 +1207,288 @@ bool loadModelFile(std::string const& path,
     error = std::string("load failed (") + e.what() + ")";
     return false;
   }
+}
+
+// Controller visuals have no Scene nodes, picking geometry, history or animation.
+struct ControllerArmVisual {
+  struct Primitive { std::size_t node; std::size_t mesh; MeshHandle handle; };
+  Model model;
+  std::vector<Mat4> bindWorld;
+  std::vector<TextureHandle> textures;
+  std::vector<Primitive> primitives[2];
+  Vec3 shoulderCentre{};
+  ControllerArmState bendState[2]{};
+  bool ready{false};
+
+  bool init(VkRenderer& renderer, char const* path) {
+    std::string error;
+    if (path == nullptr || lowerSuffix(path) != ".glb" || !loadModelFile(path, model, error)) {
+      std::printf("[arms] GLB load failed: %s\n", error.empty() ? "expected a GLB path" : error.c_str());
+      return false;
+    }
+    std::vector<Transform> locals;
+    for (auto const& node : model.nodes) { locals.push_back(node.local); }
+    bindWorld.resize(model.nodes.size());
+    std::vector<unsigned char> state(model.nodes.size());
+    ControllerArmPose pose[2];
+    Vec3 shoulders[2]{};
+    for (int side = 0; side < 2; ++side) {
+      ControllerArmInput input;
+      input.side = side == 0 ? ControllerArmSide::Left : ControllerArmSide::Right;
+      std::string const suffix = side == 0 ? "_L_" : "_R_";
+      std::size_t shoulder = model.nodes.size();
+      for (std::size_t n = 0; n < model.nodes.size(); ++n) {
+        if (controller_arm_detail::nameIs(model.nodes[n].name, "Shoulder" + suffix)) { shoulder = n; }
+      }
+      if (shoulder == model.nodes.size() ||
+          !controller_arm_detail::globals(model, locals, shoulder, bindWorld, state) ||
+          !solveControllerArm(model, input, pose[side])) {
+        std::printf("[arms] incompatible rig: missing or invalid deform bones/skins\n");
+        return false;
+      }
+      shoulders[side] = controller_arm_detail::pos(bindWorld[shoulder]);
+    }
+    if (pose[0].skin == pose[1].skin) {
+      std::printf("[arms] incompatible rig: both hands share a skin\n"); return false;
+    }
+    shoulderCentre = (shoulders[0] + shoulders[1]) * 0.5F;
+    for (std::size_t n = 0; n < model.nodes.size(); ++n) {
+      auto const& node = model.nodes[n];
+      if (node.mesh < 0 || node.skin < 0 || static_cast<std::size_t>(node.mesh) >= model.meshes.size()) { continue; }
+      int side = static_cast<std::size_t>(node.skin) == pose[0].skin ? 0 :
+                 static_cast<std::size_t>(node.skin) == pose[1].skin ? 1 : -1;
+      if (side < 0) { continue; }
+      auto const& mesh = model.meshes[static_cast<std::size_t>(node.mesh)];
+      if (node.skinNode < 0 || static_cast<std::size_t>(node.skinNode) >= model.nodes.size() ||
+          mesh.skinWeights.empty() || !skinWeightsMatchSkin(mesh.skinWeights, model.skins[pose[side].skin]) ||
+          !controller_arm_detail::globals(model, locals, static_cast<std::size_t>(node.skinNode), bindWorld, state)) {
+        std::printf("[arms] invalid skinned mesh\n"); return false;
+      }
+      auto handle = renderer.addMesh(mesh.data, true, mesh.alpha == AlphaMode::Blend);
+      if (handle == kInvalidMesh) { std::printf("[arms] mesh registration failed\n"); return false; }
+      primitives[side].push_back({n, static_cast<std::size_t>(node.mesh), handle});
+    }
+    if (primitives[0].empty() || primitives[1].empty()) {
+      std::printf("[arms] compatible meshes for both hands are required\n"); return false;
+    }
+    textures.resize(model.textures.size());
+    for (std::size_t t = 0; t < model.textures.size(); ++t) {
+      auto const& texture = model.textures[t];
+      if (texture.image.width && texture.image.height) {
+        textures[t] = renderer.addTexture(texture.image, texture.repeatU, texture.repeatV);
+        if (textures[t] == kInvalidTexture) { std::printf("[arms] texture registration failed\n"); return false; }
+      }
+    }
+    ready = true;
+    std::printf("[arms] loaded opt-in controller rig: %s\n", path);
+    return true;
+  }
+
+  // Shoulder centre 20 cm below the head; yaw only. The bind asset faces +Z,
+  // so turn it around to face OpenXR forward (-Z).
+  Transform placement(Vec3 head, Vec3 forward) const {
+    Vec3 horizontal{forward.x, 0.0F, forward.z};
+    if (length(horizontal) < 1e-5F) { horizontal = {0, 0, -1}; }
+    float const yaw = std::atan2(-horizontal.x, -horizontal.z);
+    Transform result;
+    result.rotation = quatFromAxisAngle({0, 1, 0}, yaw + 3.14159265358979323846F);
+    result.translation = head + Vec3{0, -0.20F, 0} - rotate(result.rotation, shoulderCentre);
+    return result;
+  }
+
+  bool append(VkRenderer& renderer, int side, ControllerArmInput const& input,
+              std::vector<DrawItem>& items) {
+    if (!ready || side < 0 || side > 1) { return false; }
+    ControllerArmPose pose;
+    auto nextState = bendState[side];
+    if (!solveControllerArm(model, input, pose, &nextState)) { return false; }
+    std::vector<DrawItem> draws;
+    for (auto const& primitive : primitives[side]) {
+      auto const& node = model.nodes[primitive.node];
+      auto const& mesh = model.meshes[primitive.mesh];
+      Mat4 const meshWorld = mul(toMatrix(input.placement), bindWorld[static_cast<std::size_t>(node.skinNode)]);
+      std::vector<Mat4> matrices;
+      MeshData deformed;
+      Aabb bounds{};
+      if (static_cast<std::size_t>(node.skin) != pose.skin ||
+          !computeSkinMatrices(model.skins[pose.skin], meshWorld, pose.jointWorlds, matrices) ||
+          !deformSkinnedMesh(mesh.data, mesh.skinWeights, matrices, deformed, &bounds)) { return false; }
+      Vec3 const centre = (bounds.min + bounds.max) * 0.5F;
+      if (!renderer.updateMeshVertices(primitive.handle, deformed.vertices, &centre)) { return false; }
+      DrawItem item;
+      item.mesh = primitive.handle; item.model = meshWorld; item.colour = mesh.colour;
+      item.alpha = mesh.alpha; item.alphaFactor = mesh.alphaFactor; item.alphaCutoff = mesh.alphaCutoff;
+      if (mesh.texture >= 0 && static_cast<std::size_t>(mesh.texture) < textures.size()) {
+        item.texture = textures[static_cast<std::size_t>(mesh.texture)];
+      }
+      if (mesh.normalTexture >= 0 && static_cast<std::size_t>(mesh.normalTexture) < textures.size() &&
+          textures[static_cast<std::size_t>(mesh.normalTexture)] != 0) {
+        item.normalTexture = textures[static_cast<std::size_t>(mesh.normalTexture)];
+        item.normalMapped = true; item.normalScale = mesh.normalScale;
+      }
+      draws.push_back(item);
+    }
+    items.insert(items.end(), draws.begin(), draws.end());
+    bendState[side] = nextState;
+    return true;
+  }
+};
+
+// Render eligibility is independent per side; edit-action interruptions can
+// originate from either profile and must not hide the other tracked controller.
+bool controllerArmVisible(XrFrameInput const& input, int side, ControllerPose const& grip) {
+  return side >= 0 && side < 2 && input.viewTracked && input.controllerVisualsFocused &&
+         !input.handActive[side] && grip.usable();
+}
+
+// Offline integration check using the user-provided skinned GLB. It
+// exercises the exact visual path, including both GPU uploads and depth.
+int runSmokeControllerArms(char const* shaderDir) {
+  char const* path = std::getenv("GENESIS_CONTROLLER_ARMS_GLB");
+  if (path == nullptr || path[0] == 0) {
+    std::printf("SMOKE FAIL: set GENESIS_CONTROLLER_ARMS_GLB to a rigged GLB\n"); return 1;
+  }
+  VkRenderer renderer;
+  VkRenderer::Config config;
+  config.width = 640; config.height = 640; config.shaderDir = shaderDir;
+  if (!renderer.init(config)) { std::printf("SMOKE FAIL: renderer init\n"); return 1; }
+  ControllerArmVisual arms;
+  if (!arms.init(renderer, path)) { renderer.shutdown(); return 1; }
+  std::vector<Transform> locals;
+  for (auto const& node : arms.model.nodes) { locals.push_back(node.local); }
+  std::vector<Mat4> world(arms.model.nodes.size());
+  std::vector<unsigned char> state(arms.model.nodes.size());
+  ControllerArmInput inputs[2];
+  for (int side = 0; side < 2; ++side) {
+    inputs[side].side = side == 0 ? ControllerArmSide::Left : ControllerArmSide::Right;
+    std::string const stem = side == 0 ? "Wrist_L_" : "Wrist_R_";
+    bool found = false;
+    for (std::size_t n = 0; n < arms.model.nodes.size(); ++n) {
+      if (controller_arm_detail::nameIs(arms.model.nodes[n].name, stem) &&
+          controller_arm_detail::globals(arms.model, locals, n, world, state)) {
+        inputs[side].grip.translation = controller_arm_detail::pos(world[n]);
+        inputs[side].grip.rotation = controller_arm_detail::rotation(world[n]);
+        found = true; break;
+      }
+    }
+    if (!found) { std::printf("SMOKE FAIL: wrist bind pose\n"); renderer.shutdown(); return 1; }
+  }
+  XrFrameInput visibility;
+  visibility.viewTracked = true;
+  visibility.controllerVisualsFocused = true;
+  visibility.deleteInterrupted = true; // a profile change on either side
+  ControllerPose tracked;
+  tracked.valid = tracked.tracked = true;
+  ControllerPose lost = tracked;
+  lost.tracked = false;
+  bool visibilityOk = controllerArmVisible(visibility, 0, tracked) &&
+                      controllerArmVisible(visibility, 1, tracked) &&
+                      !controllerArmVisible(visibility, 0, lost) &&
+                      !controllerArmVisible(visibility, 1, lost);
+  lost = tracked;
+  lost.valid = false;
+  visibilityOk = visibilityOk && !controllerArmVisible(visibility, 0, lost) &&
+                 !controllerArmVisible(visibility, 1, lost);
+  visibility.handActive[0] = true;
+  visibilityOk = visibilityOk && !controllerArmVisible(visibility, 0, tracked) &&
+                 controllerArmVisible(visibility, 1, tracked);
+  visibility.handActive[0] = false;
+  visibility.handActive[1] = true;
+  visibilityOk = visibilityOk && controllerArmVisible(visibility, 0, tracked) &&
+                 !controllerArmVisible(visibility, 1, tracked);
+  visibility.handActive[1] = false;
+  visibility.viewTracked = false;
+  visibilityOk = visibilityOk && !controllerArmVisible(visibility, 0, tracked) &&
+                 !controllerArmVisible(visibility, 1, tracked);
+  visibility.viewTracked = true;
+  visibility.controllerVisualsFocused = false;
+  visibilityOk = visibilityOk && !controllerArmVisible(visibility, 0, tracked) &&
+                 !controllerArmVisible(visibility, 1, tracked);
+  Camera camera;
+  camera.position = {0, 0.35F, 2.0F}; camera.pitch = 0; camera.yaw = 0;
+  std::vector<std::uint8_t> blank, left, right, both, curled, moved, wall, covered, behind, inFront;
+  auto draw = [&](std::vector<DrawItem> const& items, std::vector<std::uint8_t>& pixels) {
+    return renderer.draw(camera, items, {}, {}) && renderer.readback(pixels);
+  };
+  auto different = [](std::vector<std::uint8_t> const& a, std::vector<std::uint8_t> const& b) {
+    std::size_t count = 0;
+    if (a.size() != b.size()) { return count; }
+    for (std::size_t i = 0; i + 3 < a.size(); i += 4) {
+      if (a[i] != b[i] || a[i+1] != b[i+1] || a[i+2] != b[i+2]) { ++count; }
+    }
+    return count;
+  };
+  std::vector<DrawItem> leftItems, rightItems, bothItems;
+  bool ok = arms.append(renderer, 0, inputs[0], leftItems) &&
+            arms.append(renderer, 1, inputs[1], rightItems);
+  bothItems = leftItems; bothItems.insert(bothItems.end(), rightItems.begin(), rightItems.end());
+  ok = ok && draw({}, blank) && draw(leftItems, left) && draw(rightItems, right) && draw(bothItems, both);
+  inputs[0].trigger = inputs[1].trigger = 1.0F;
+  inputs[0].gripValue = inputs[1].gripValue = 1.0F;
+  std::vector<DrawItem> posed;
+  ok = ok && arms.append(renderer, 0, inputs[0], posed) && arms.append(renderer, 1, inputs[1], posed) && draw(posed, curled);
+  inputs[0].grip.translation = inputs[0].grip.translation + Vec3{0.08F, 0.05F, -0.04F};
+  inputs[1].grip.translation = inputs[1].grip.translation + Vec3{-0.08F, 0.05F, -0.04F};
+  std::vector<DrawItem> movedItems;
+  ok = ok && arms.append(renderer, 0, inputs[0], movedItems) &&
+       arms.append(renderer, 1, inputs[1], movedItems) && draw(movedItems, moved);
+  // Render each moved side separately, then cover one half of the view.
+  // Compare against the blocker alone and the other side plus blocker so
+  // depth is checked independently, not just with a wall covering both.
+  std::vector<DrawItem> movedSides[2];
+  std::vector<std::uint8_t> sideImages[2];
+  for (int side = 0; side < 2; ++side) {
+    ok = ok && arms.append(renderer, side, inputs[side], movedSides[side]) &&
+         draw(movedSides[side], sideImages[side]);
+  }
+  std::size_t leftHalf[2]{};
+  for (int side = 0; side < 2; ++side) {
+    if (sideImages[side].size() != blank.size()) { continue; }
+    for (std::size_t i = 0; i + 3 < blank.size(); i += 4) {
+      if ((i / 4) % 640 < 320 &&
+          (sideImages[side][i] != blank[i] || sideImages[side][i+1] != blank[i+1] ||
+           sideImages[side][i+2] != blank[i+2])) { ++leftHalf[side]; }
+    }
+  }
+  std::size_t hiddenErrors[2]{}, oppositeVisible[2]{}, combinedErrors[2]{};
+  for (int side = 0; side < 2; ++side) {
+    DrawItem halfBlocker;
+    bool const coverLeft = leftHalf[side] > different(blank, sideImages[side]) / 2;
+    halfBlocker.model = trs({coverLeft ? -2.0F : 2.0F, 0.35F, 0.9F}, {}, {4, 4, 0.1F});
+    halfBlocker.colour = {0.2F, 0.4F, 0.7F};
+    auto hiddenItems = movedSides[side]; hiddenItems.push_back(halfBlocker);
+    auto visibleItems = movedSides[1 - side]; visibleItems.push_back(halfBlocker);
+    auto allItems = movedItems; allItems.push_back(halfBlocker);
+    std::vector<std::uint8_t> halfWall, hidden, visible, all;
+    ok = ok && draw({halfBlocker}, halfWall) && draw(hiddenItems, hidden) &&
+         draw(visibleItems, visible) && draw(allItems, all);
+    hiddenErrors[side] = different(halfWall, hidden);
+    oppositeVisible[side] = different(halfWall, visible);
+    combinedErrors[side] = different(visible, all);
+  }
+  DrawItem blocker;
+  blocker.model = trs({0, 0.35F, 0.9F}, {}, {4, 4, 0.1F});
+  blocker.colour = {0.2F, 0.4F, 0.7F};
+  auto blocked = movedItems; blocked.push_back(blocker);
+  ok = ok && draw({blocker}, wall) && draw(blocked, covered);
+  blocker.model = trs({0, 0.35F, -0.9F}, {}, {4, 4, 0.1F});
+  auto behindItems = movedItems; behindItems.push_back(blocker);
+  ok = ok && draw({blocker}, behind) && draw(behindItems, inFront);
+  std::size_t const leftPixels = different(blank, left), rightPixels = different(blank, right);
+  std::size_t const posePixels = different(both, curled), motionPixels = different(curled, moved);
+  std::size_t const depthPixels = different(wall, covered), foregroundPixels = different(behind, inFront);
+  ok = ok && visibilityOk && hiddenErrors[0] == 0 && hiddenErrors[1] == 0 &&
+       combinedErrors[0] == 0 && combinedErrors[1] == 0 &&
+       oppositeVisible[0] > 100 && oppositeVisible[1] > 100 &&
+       leftPixels > 100 && rightPixels > 100 && posePixels > 20 && motionPixels > 20 &&
+       depthPixels == 0 && foregroundPixels > 100;
+  std::printf("SMOKE %s: real controller arms left=%zu right=%zu curl=%zu motion=%zu behind=%zu occlusion-errors=%zu pixels\n",
+              ok ? "PASS" : "FAIL", leftPixels, rightPixels, posePixels, motionPixels, foregroundPixels, depthPixels);
+  std::printf("SMOKE %s: per-side visibility=%s left-hidden-errors=%zu right-visible=%zu left-combined-errors=%zu right-hidden-errors=%zu left-visible=%zu right-combined-errors=%zu pixels\n",
+              ok ? "PASS" : "FAIL", visibilityOk ? "PASS" : "FAIL", hiddenErrors[0], oppositeVisible[0],
+              combinedErrors[0], hiddenErrors[1], oppositeVisible[1], combinedErrors[1]);
+  renderer.shutdown();
+  return ok ? 0 : 1;
 }
 
 // The model carousel: a RING of library models around the viewer ("I
@@ -5231,6 +5514,11 @@ int runXr(char const* shaderDir,
   }
   // Passthrough is the default view: the real world with models drawn over it.
   applyBackdrop(app, renderer, &shell);
+  ControllerArmVisual controllerArms;
+  char const* armPath = std::getenv("GENESIS_CONTROLLER_ARMS_GLB");
+  if (armPath != nullptr && armPath[0] != 0 && !controllerArms.init(renderer, armPath)) {
+    std::printf("[arms] disabled; continuing without controller visuals\n");
+  }
   if (!modelPaths.empty()) {
     if (!loadModels(app, renderer, modelPaths)) {
       std::printf(smoke ? "SMOKE FAIL: model loading\n" : "model loading failed\n");
@@ -5281,6 +5569,8 @@ int runXr(char const* shaderDir,
       break;
     }
     if (status == XrShell::FrameStatus::Pump || status == XrShell::FrameStatus::Skipped) {
+      controllerArms.bendState[0] = {};
+      controllerArms.bendState[1] = {};
       locomotion.interrupt();
       lastFrameTime = std::chrono::steady_clock::now();
       // Rendering must not hide a tracking interruption. Commit the live
@@ -5768,6 +6058,25 @@ int runXr(char const* shaderDir,
     std::vector<RendererVertex> overlayLines;
     assembleFrame(app, items, depthLines, overlayLines);
     drawHandPanel(app, overlayLines);
+    if (controllerArms.ready) {
+      for (int side = 0; side < 2; ++side) {
+        ControllerPose const& grip = side == 0 ? leftControllerGrip : controllerGrip;
+        if (!controllerArmVisible(input, side, grip)) {
+          controllerArms.bendState[side] = {};
+          continue;
+        }
+        ControllerArmInput armInput;
+        armInput.side = side == 0 ? ControllerArmSide::Left : ControllerArmSide::Right;
+        armInput.placement = controllerArms.placement(headWorld, headForward);
+        armInput.grip.translation = grip.position;
+        armInput.grip.rotation = grip.orientation;
+        armInput.trigger = input.controllerTrigger[side];
+        armInput.gripValue = input.controllerSqueeze[side];
+        if (!controllerArms.append(renderer, side, armInput, items)) {
+          controllerArms.bendState[side] = {};
+        }
+      }
+    }
     // Two reusable meshes follow current tracked joints and render over models.
     // Do not retain a stale hand when tracking or mesh generation fails.
     for (int hand = 0; hand < 2; ++hand) {
@@ -6071,6 +6380,7 @@ int main(int argc, char** argv) {
     SmokeWindow,
     SmokePerf,
     SmokeSkinned,
+    SmokeControllerArms,
     BenchSkin,
     Xr,
     SmokeXr
@@ -6097,6 +6407,8 @@ int main(int argc, char** argv) {
       mode = Mode::SmokePerf;
     } else if (std::strcmp(arg, "--smoke-skinned") == 0) {
       mode = Mode::SmokeSkinned;
+    } else if (std::strcmp(arg, "--smoke-controller-arms") == 0) {
+      mode = Mode::SmokeControllerArms;
     } else if (std::strcmp(arg, "--bench-skin") == 0) {
       mode = Mode::BenchSkin;
     } else if (std::strcmp(arg, "--smoke-window") == 0) {
@@ -6126,7 +6438,7 @@ int main(int argc, char** argv) {
       std::printf(
           "usage: vr-editor [model.glb|model.obj ...] [--shaders DIR] [--library DIR]\n"
           "                [--xr | --smoke-offscreen | --smoke-textured |\n"
-          "                 --smoke-blend | --smoke-perf | --smoke-skinned | --bench-skin |\n"
+          "                 --smoke-blend | --smoke-perf | --smoke-skinned | --smoke-controller-arms | --bench-skin |\n"
       "                 --smoke-xr |\n"
           "                 --smoke-window [FRAMES]]\n"
           "keys: WASD/QE fly (RMB look), arrows edit: left/right = X (scale in\n"
@@ -6184,6 +6496,8 @@ int main(int argc, char** argv) {
     return runPerfSmoke(shaderDir, modelPaths);
   case Mode::SmokeSkinned:
     return runSmokeSkinned(shaderDir);
+  case Mode::SmokeControllerArms:
+    return runSmokeControllerArms(shaderDir);
   case Mode::BenchSkin:
     return runBenchSkin(shaderDir);
   default:

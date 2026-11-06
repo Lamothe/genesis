@@ -51,4 +51,8 @@ fi
 ./.build/test-xr-bindings
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
   src/hand_mesh.cpp tests/test_hand_mesh.cpp -o .build/test-hand-mesh
+"$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
+  src/scene.cpp src/animation.cpp src/gltf.cpp src/json.cpp src/image.cpp src/skin.cpp tests/test_controller_arm_rig.cpp \
+  -lz -o .build/test-controller-arm-rig
+./.build/test-controller-arm-rig
 exec ./.build/test-hand-mesh
