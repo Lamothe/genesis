@@ -22,7 +22,8 @@ bool sameAabb(Aabb const& a, Aabb const& b) {
 bool sameVisual(NodeVisual const& a, NodeVisual const& b) {
   return a.id == b.id && a.mesh == b.mesh && a.texture == b.texture &&
          a.normalTexture == b.normalTexture && a.normalMapped == b.normalMapped &&
-         a.normalScale == b.normalScale && sameAabb(a.localBounds, b.localBounds) &&
+         a.normalScale == b.normalScale && a.derivedBounds == b.derivedBounds &&
+         (a.derivedBounds || sameAabb(a.localBounds, b.localBounds)) &&
          a.pickGeometry.get() == b.pickGeometry.get() && sameVec3(a.colour, b.colour) &&
          a.alphaFactor == b.alphaFactor && a.alpha == b.alpha && a.alphaCutoff == b.alphaCutoff;
 }

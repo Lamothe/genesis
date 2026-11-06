@@ -1754,6 +1754,81 @@ void testScaleSelectionUniform() {
   CHECK_NEAR3(scene.worldPosition(parent), before);
 }
 
+void testEditorHistoryDerivedBounds() {
+  Scene scene;
+  NodeId const animated = scene.create();
+  NodeId const stationary = scene.create();
+  NodeVisual dynamicVisual;
+  dynamicVisual.id = animated;
+  dynamicVisual.derivedBounds = true;
+  NodeVisual staticVisual;
+  staticVisual.id = stationary;
+  std::vector<NodeVisual> visuals{dynamicVisual, staticVisual};
+  ModelGroups groups;
+  std::vector<NodeId> selection;
+  UndoHistory<EditorSnapshot> history;
+  auto capture = [&]() { return captureState(scene, visuals, groups, selection); };
+  auto apply = [&](EditorSnapshot const& state) {
+    restoreState(state, scene, visuals, groups, selection);
+  };
+
+  history.begin(capture());
+  Transform moved = scene.local(animated);
+  moved.translation.x = 3.0F;
+  scene.setLocal(animated, moved);
+  CHECK(history.commit(capture()));
+  auto state = capture();
+  CHECK(history.undo(state));
+  apply(state);
+  CHECK_NEAR(scene.local(animated).translation.x, 0.0F, 1e-5F);
+  CHECK(history.canRedo() && !history.canUndo());
+
+  // The live derived cache can change while an otherwise empty edit is open.
+  history.begin(capture());
+  scene.setPoseOffset(animated, translationMatrix({1.0F, 0.0F, 0.0F}));
+  visuals[0].localBounds.max.y = 2.0F;
+  CHECK(!history.commit(capture()));
+  CHECK(history.canRedo() && !history.canUndo());
+  state = capture();
+  CHECK(history.redo(state));
+  apply(state);
+  CHECK_NEAR(scene.local(animated).translation.x, 3.0F, 1e-5F);
+  state = capture();
+  CHECK(history.undo(state));
+  apply(state);
+  CHECK_NEAR(scene.local(animated).translation.x, 0.0F, 1e-5F);
+
+  // The source flag itself and static bounds remain meaningful state, even
+  // for a visual with triangle geometry rather than a box picking shape.
+  visuals[1].pickGeometry = std::make_shared<PickGeometry>();
+  auto before = capture();
+  visuals[1].localBounds.max.y = 3.0F;
+  CHECK(!sameSnapshot(before, capture()));
+  auto changedSource = before;
+  changedSource.visuals[0].derivedBounds = false;
+  CHECK(!sameSnapshot(before, changedSource));
+  CHECK(!sameSnapshot(changedSource, before));
+  history.begin(before);
+  CHECK(history.commit(capture()));
+  CHECK(!history.canRedo());
+  state = capture();
+  CHECK(history.undo(state));
+  apply(state);
+  CHECK_NEAR(visuals[1].localBounds.max.y, 0.5F, 1e-5F);
+
+  // A simultaneous animation update must not hide a real transform edit.
+  history.begin(capture());
+  scene.setLocal(animated, moved);
+  scene.setPoseOffset(animated, translationMatrix({2.0F, 0.0F, 0.0F}));
+  visuals[0].localBounds.max.y = 4.0F;
+  CHECK(history.commit(capture()));
+  CHECK(!history.canRedo());
+  state = capture();
+  CHECK(history.undo(state));
+  apply(state);
+  CHECK_NEAR(scene.local(animated).translation.x, 0.0F, 1e-5F);
+}
+
 void testEditorStateOps() {
   using vredit::EditorSnapshot;
   using vredit::ModelGroups;
@@ -2962,6 +3037,7 @@ int main() {
   testMovingSetAndExplicitPivot();
   testViewerRotationAxes();
   testScaleSelectionUniform();
+  testEditorHistoryDerivedBounds();
   testEditorStateOps();
   testHandlePicking();
   testHandlePickingBehindCamera();

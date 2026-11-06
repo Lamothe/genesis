@@ -186,6 +186,7 @@ struct SkinnedMeshBinding {
   std::vector<Mat4> jointMatrices;
   std::vector<Mat4> jointWorlds;       // scratch, reused every frame
   std::vector<Mat4> lastJointMatrices; // empty = never uploaded
+  Aabb deformedBounds{};
   bool warnedUpload{false};
   bool warnedDeform{false};
 };
@@ -426,9 +427,8 @@ std::shared_ptr<vredit::PickGeometry> makePickGeometry(MeshData const& data) {
 }
 
 // Skeletal clips are the useful default when a file carries both a working
-// animation and an unrelated object/rigid clip: prefer the first clip that
-// targets a skin joint, then fall back to the first playable clip (the old
-// behaviour for unrigged models).
+// animation and an unrelated object/rigid clip: prefer a joint-targeting
+// clip, then a joint ancestor, then the first playable clip.
 bool clipTargetsJoint(AnimationClip const& clip, std::vector<bool> const& jointNodes) {
   for (AnimationChannel const& channel : clip.channels) {
     if (channel.node < jointNodes.size() && jointNodes[channel.node]) {
@@ -440,11 +440,23 @@ bool clipTargetsJoint(AnimationClip const& clip, std::vector<bool> const& jointN
 
 AnimationClip const* chooseAnimationClip(Model const& model) {
   std::vector<bool> jointNodes(model.nodes.size(), false);
+  std::vector<bool> directJoints(model.nodes.size(), false);
   for (ModelSkin const& skin : model.skins) {
     for (std::int32_t const joint : skin.joints) {
-      if (joint >= 0 && static_cast<std::size_t>(joint) < jointNodes.size()) {
-        jointNodes[static_cast<std::size_t>(joint)] = true;
+      if (joint >= 0 && static_cast<std::size_t>(joint) < model.nodes.size()) {
+        directJoints[static_cast<std::size_t>(joint)] = true;
       }
+      std::int32_t node = joint;
+      for (std::size_t depth = 0; depth < model.nodes.size() && node >= 0 &&
+           static_cast<std::size_t>(node) < model.nodes.size(); ++depth) {
+        jointNodes[static_cast<std::size_t>(node)] = true;
+        node = model.nodes[static_cast<std::size_t>(node)].parent;
+      }
+    }
+  }
+  for (AnimationClip const& clip : model.clips) {
+    if (!clip.channels.empty() && clipTargetsJoint(clip, directJoints)) {
+      return &clip;
     }
   }
   for (AnimationClip const& clip : model.clips) {
@@ -478,6 +490,8 @@ NodeVisual* findVisual(App& app, NodeId id) {
   return nullptr;
 }
 
+void updateSkinnedInstance(App& app, VkRenderer& renderer, AnimationInstance& instance);
+
 // The insertion itself: copies mesh/pick data and allocates, so it CAN throw
 // on a hostile/huge model. Never let that terminate the process (this runs on
 // arbitrary user files during on-the-fly spawning).
@@ -487,29 +501,14 @@ bool addModelToSceneImpl(App& app,
                          std::vector<NodeId>* rootsOut = nullptr,
                          bool withTextures = true) {
   AnimationClip const* playable = withTextures ? chooseAnimationClip(model) : nullptr;
-  bool animateSkins = false;
-  if (playable != nullptr) {
-    std::vector<bool> jointNodes(model.nodes.size(), false);
-    for (ModelSkin const& skin : model.skins) {
-      for (std::int32_t const joint : skin.joints) {
-        if (joint >= 0 && static_cast<std::size_t>(joint) < jointNodes.size()) {
-          jointNodes[static_cast<std::size_t>(joint)] = true;
-        }
-      }
-    }
-    animateSkins = clipTargetsJoint(*playable, jointNodes);
-  }
-
-  // A node is a skinned animated primitive when its glTF node names a valid
-  // skin and the primitive carries four-influence weights. Static skinned
-  // models (no clip, or a clip with no joint channels) keep the shared cached
-  // mesh because their bind pose never changes.
+  // Placed models evaluate all valid skins, even without a joint-targeting
+  // clip. Geometry-only carousel previews retain their existing cheap path.
   std::vector<bool> nodeSkinned(model.nodes.size(), false);
   std::vector<bool> meshNeedsStatic(model.meshes.size(), false);
   for (std::size_t n = 0; n < model.nodes.size(); ++n) {
     ModelNode const& node = model.nodes[n];
     bool skinned = false;
-    if (animateSkins && node.skin >= 0 && node.mesh >= 0 &&
+    if (withTextures && node.skin >= 0 && node.mesh >= 0 &&
         static_cast<std::size_t>(node.skin) < model.skins.size() &&
         !model.skins[static_cast<std::size_t>(node.skin)].joints.empty() &&
         static_cast<std::size_t>(node.mesh) < model.meshes.size() &&
@@ -610,6 +609,7 @@ bool addModelToSceneImpl(App& app,
       visual.id = id;
       visual.mesh = skinned ? skinnedHandles[n] : meshHandles[static_cast<std::size_t>(node.mesh)];
       visual.localBounds = meshBounds(mesh.data);
+      visual.derivedBounds = skinned;
       visual.pickGeometry = skinned ? skinnedPicks[n] : pickGeometries[static_cast<std::size_t>(node.mesh)];
       visual.colour = mesh.colour;
       visual.alphaFactor = mesh.alphaFactor;
@@ -643,17 +643,19 @@ bool addModelToSceneImpl(App& app,
       }
     }
   }
-  if (withTextures && playable != nullptr) {
-
+  if (withTextures && (playable != nullptr || !bindings.empty())) {
     AnimationInstance instance;
     instance.model.nodes = model.nodes;
     instance.model.skins = model.skins;
-    instance.model.clips.push_back(*playable);
+    if (playable != nullptr) { instance.model.clips.push_back(*playable); }
     instance.nodes = handles;
     instance.skins = std::move(bindings);
-    for (auto const& channel : instance.model.clips.front().channels) {
-      if (!channel.times.empty()) { instance.duration = std::fmax(instance.duration, channel.times.back()); }
+    if (playable != nullptr) {
+      for (auto const& channel : playable->channels) {
+        if (!channel.times.empty()) { instance.duration = std::fmax(instance.duration, channel.times.back()); }
+      }
     }
+    updateSkinnedInstance(app, renderer, instance);
     app.animations.push_back(std::move(instance));
   }
   } catch (...) {
@@ -699,6 +701,8 @@ void updateSkinnedInstance(App& app, VkRenderer& renderer, AnimationInstance& in
       continue;
     }
     if (sameSkinMatrices(binding.jointMatrices, binding.lastJointMatrices)) {
+      NodeVisual* visual = findVisual(app, binding.visual);
+      if (visual != nullptr) { visual->localBounds = binding.deformedBounds; }
       continue; // static key, paused clip or a whole-model move (cancels out)
     }
     Aabb deformedBounds{};
@@ -722,11 +726,13 @@ void updateSkinnedInstance(App& app, VkRenderer& renderer, AnimationInstance& in
       continue;
     }
     binding.lastJointMatrices = binding.jointMatrices;
+    binding.deformedBounds = deformedBounds;
     NodeVisual* visual = findVisual(app, binding.visual);
     if (visual != nullptr) {
       visual->localBounds = deformedBounds;
     }
     if (binding.pickGeometry != nullptr) {
+      binding.pickGeometry->invalidateBvh();
       if (binding.pickGeometry->positions.size() != binding.deformed.vertices.size()) {
         binding.pickGeometry->positions.resize(binding.deformed.vertices.size());
       }
@@ -758,14 +764,17 @@ void tickAnimations(App& app, VkRenderer& renderer, float dt) {
     instance.elapsed += std::fmax(0.0F, dt);
     float const time = instance.duration > 0 ?
         static_cast<float>(std::fmod(instance.elapsed, instance.duration)) : 0.0F;
-    std::vector<Transform> pose;
-    if (!evaluateAnimation(instance.model, instance.model.clips.front(), time, pose)) { continue; }
-    for (auto const& channel : instance.model.clips.front().channels) {
-      auto const index = channel.node;
-      if (index >= instance.nodes.size() || index >= pose.size()) { continue; }
-      Mat4 inverseRest;
-      if (!invertAffine(toMatrix(instance.model.nodes[index].local), inverseRest)) { continue; }
-      app.scene.setPoseOffset(instance.nodes[index], mul(inverseRest, toMatrix(pose[index])));
+    if (!instance.model.clips.empty()) {
+      std::vector<Transform> pose;
+      if (evaluateAnimation(instance.model, instance.model.clips.front(), time, pose)) {
+        for (auto const& channel : instance.model.clips.front().channels) {
+          auto const index = channel.node;
+          if (index >= instance.nodes.size() || index >= pose.size()) { continue; }
+          Mat4 inverseRest;
+          if (!invertAffine(toMatrix(instance.model.nodes[index].local), inverseRest)) { continue; }
+          app.scene.setPoseOffset(instance.nodes[index], mul(inverseRest, toMatrix(pose[index])));
+        }
+      }
     }
     if (!instance.skins.empty()) {
       updateSkinnedInstance(app, renderer, instance);
@@ -937,8 +946,20 @@ vredit::EditorSnapshot snapshot(App const& app) {
   return vredit::captureState(app.scene, app.visuals, app.modelGroups, app.selection);
 }
 
-void applySnapshot(App& app, vredit::EditorSnapshot const& state) {
+void applySnapshot(App& app, VkRenderer& renderer, vredit::EditorSnapshot const& state) {
   vredit::restoreState(state, app.scene, app.visuals, app.modelGroups, app.selection);
+  for (AnimationInstance& instance : app.animations) {
+    // Start with the last valid bounds even if a restored joint is missing or
+    // deformation fails. A valid changed pose replaces these together with
+    // the pick geometry and the renderer's fence-safe pending upload.
+    for (SkinnedMeshBinding const& binding : instance.skins) {
+      NodeVisual* visual = findVisual(app, binding.visual);
+      if (visual != nullptr && !binding.lastJointMatrices.empty()) {
+        visual->localBounds = binding.deformedBounds;
+      }
+    }
+    updateSkinnedInstance(app, renderer, instance);
+  }
 }
 
 // Defined below; pointerPress commits any live edit before starting anew.
@@ -972,7 +993,7 @@ void pointerPress(App& app, PointerTarget const& target, bool partSelect) {
 // stay exactly as they were. Any undo/redo press during a live edit does this
 // and nothing else — going through commit() instead would clear an existing
 // redo branch and make the cancelled edit itself redoable.
-void cancelLiveEdit(App& app) {
+void cancelLiveEdit(App& app, VkRenderer& renderer) {
   app.stickSession = false;
   app.grabActive = false;
   app.grabOwner = GrabOwner::none;
@@ -989,7 +1010,7 @@ void cancelLiveEdit(App& app) {
   }
   vredit::EditorSnapshot state = snapshot(app);
   if (app.undo.cancel(state)) {
-    applySnapshot(app, state);
+    applySnapshot(app, renderer, state);
   }
 }
 
@@ -1031,30 +1052,30 @@ bool deleteSelection(App& app) {
 // rather than committed, so the existing redo branch survives and the
 // cancelled gesture never becomes redoable. Returns true only when the
 // history stack actually moved.
-bool performUndo(App& app) {
+bool performUndo(App& app, VkRenderer& renderer) {
   app.triggerWorkflow.reset();
   if (app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive) {
-    cancelLiveEdit(app);
+    cancelLiveEdit(app, renderer);
     return false;
   }
   vredit::EditorSnapshot state = snapshot(app);
   if (app.undo.undo(state)) {
-    applySnapshot(app, state);
+    applySnapshot(app, renderer, state);
     app.stickArmed = false;
     return true;
   }
   return false;
 }
 
-bool performRedo(App& app) {
+bool performRedo(App& app, VkRenderer& renderer) {
   app.triggerWorkflow.reset();
   if (app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive) {
-    cancelLiveEdit(app);
+    cancelLiveEdit(app, renderer);
     return false;
   }
   vredit::EditorSnapshot state = snapshot(app);
   if (app.undo.redo(state)) {
-    applySnapshot(app, state);
+    applySnapshot(app, renderer, state);
     app.stickArmed = false;
     return true;
   }
@@ -1576,7 +1597,7 @@ bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
   std::vector<vredit::NodeId> roots;
   if (!addModelToScene(app, renderer, model, &roots, /*withTextures=*/true) || roots.empty()) {
     // Roll back to the pre-open state; identical snapshots record no step.
-    applySnapshot(app, app.galleryBefore);
+    applySnapshot(app, renderer, app.galleryBefore);
     (void)app.undo.commit(snapshot(app));
     std::printf("[gallery] cannot place %s\n", file.c_str());
     return false;
@@ -1969,10 +1990,10 @@ void handleEvent(App& app,
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
       // Undo/redo during a live edit cancels that edit first and stops there,
       // leaving both stacks untouched (see performUndo/cancelLiveEdit).
-      (void)((key->state & XCB_MOD_MASK_SHIFT) != 0U ? performRedo(app) : performUndo(app));
+      (void)((key->state & XCB_MOD_MASK_SHIFT) != 0U ? performRedo(app, renderer) : performUndo(app, renderer));
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      (void)performRedo(app);
+      (void)performRedo(app, renderer);
     } else if (keysym == 0xFF1BU) {
       app.running = false;
       stateChanged = true;
@@ -2189,7 +2210,7 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
       std::printf("SMOKE FAIL: undo after delete\n");
       return 1;
     }
-    applySnapshot(app, state);
+    applySnapshot(app, renderer, state);
     items.clear();
     depthLines.clear();
     overlayLines.clear();
@@ -2606,7 +2627,7 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     std::printf("SMOKE FAIL: undo after placement\n");
     return 1;
   }
-  applySnapshot(app, carouselState);
+  applySnapshot(app, renderer, carouselState);
   if (app.visuals.size() != baseVisuals) {
     std::printf("SMOKE FAIL: undo left the placed model in the scene\n");
     return 1;
@@ -2615,7 +2636,7 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     std::printf("SMOKE FAIL: redo after placement undo\n");
     return 1;
   }
-  applySnapshot(app, carouselState);
+  applySnapshot(app, renderer, carouselState);
   if (app.visuals.size() <= baseVisuals) {
     std::printf("SMOKE FAIL: redo did not restore the placed model\n");
     return 1;
@@ -2960,6 +2981,128 @@ int runSmokeSkinned(char const* shaderDir) {
     renderer.shutdown();
     return 1;
   }
+  // A static skin may have a non-identity bind pose. It must be deformed on
+  // insertion, before placement computes bounds, and remain stationary.
+  {
+    App staticApp;
+    Model staticModel = model;
+    staticModel.clips.clear();
+    staticModel.nodes[0].local.translation.x += 3.0F;
+    if (!addModelToScene(staticApp, renderer, staticModel) ||
+        staticApp.animations.size() != 1U || staticApp.animations[0].skins.size() != 1U ||
+        std::fabs(staticApp.animations[0].skins[0].deformed.vertices[0].pos.x - 2.5F) > 0.001F ||
+        std::fabs(findVisual(staticApp, staticApp.animations[0].skins[0].visual)->localBounds.min.x - 2.5F) > 0.001F) {
+      std::printf("SMOKE FAIL: static bind-pose skin or initial bounds\n");
+      renderer.shutdown();
+      return 1;
+    }
+    tickAnimations(staticApp, renderer, 0.5F);
+    if (std::fabs(staticApp.animations[0].skins[0].deformed.vertices[0].pos.x - 2.5F) > 0.001F) {
+      std::printf("SMOKE FAIL: static skin changed on tick\n");
+      renderer.shutdown();
+      return 1;
+    }
+  }
+  // Undo, redo and cancellation must reconcile a changed joint immediately,
+  // before either picking or drawing and without advancing animation.
+  {
+    App historyApp;
+    Model historyModel = model;
+    historyModel.clips.clear();
+    if (!addModelToScene(historyApp, renderer, historyModel) ||
+        historyApp.animations.size() != 1U || historyApp.animations[0].skins.size() != 1U) {
+      std::printf("SMOKE FAIL: history skin setup\n");
+      renderer.shutdown();
+      return 1;
+    }
+    historyApp.camera.position = {0.0F, 0.9F, 4.5F};
+    SkinnedMeshBinding& skin = historyApp.animations[0].skins[0];
+    NodeId const joint = historyApp.animations[0].nodes[3];
+    Transform const original = historyApp.scene.local(joint);
+    Transform shifted = original;
+    shifted.translation.x += 2.0F;
+    Ray const restRay{{0.0F, 1.4F, 2.0F}, {0.0F, 0.0F, -1.0F}};
+    Ray const shiftedRay{{2.0F, 1.4F, 2.0F}, {0.0F, 0.0F, -1.0F}};
+    auto checkPose = [&](bool isShifted) {
+      NodeVisual* current = findVisual(historyApp, skin.visual);
+      if (current == nullptr || skin.pickGeometry == nullptr) { return false; }
+      float const x = isShifted ? 1.5F : -0.5F;
+      if (std::fabs(skin.deformed.vertices[2].pos.x - x) > 0.001F ||
+          std::fabs(skin.pickGeometry->positions[2].x - x) > 0.001F ||
+          std::fabs(current->localBounds.max.x - (isShifted ? 2.5F : 0.5F)) > 0.001F) {
+        return false;
+      }
+      Mat4 const world = historyApp.scene.world(skin.visual);
+      PickCandidate const pick{skin.visual, transformAabb(world, current->localBounds),
+                               world, skin.pickGeometry};
+      return pickClosestSurface(isShifted ? shiftedRay : restRay, {pick}).has_value() &&
+             !pickClosestSurface(isShifted ? restRay : shiftedRay, {pick}).has_value();
+    };
+    auto drawHistory = [&](std::vector<std::uint8_t>& pixels) {
+      std::vector<DrawItem> items;
+      std::vector<RendererVertex> depthLines;
+      std::vector<RendererVertex> overlayLines;
+      assembleFrame(historyApp, items, depthLines, overlayLines);
+      return renderer.draw(historyApp.camera, items, depthLines, overlayLines) &&
+             renderer.readback(pixels);
+    };
+    std::vector<std::uint8_t> originalPixels;
+    std::vector<std::uint8_t> shiftedPixels;
+    std::vector<std::uint8_t> restoredPixels;
+    if (!checkPose(false) || !drawHistory(originalPixels)) {
+      std::printf("SMOKE FAIL: history original pose\n");
+      renderer.shutdown();
+      return 1;
+    }
+    historyApp.undo.begin(snapshot(historyApp));
+    historyApp.scene.setLocal(joint, shifted);
+    updateSkinnedInstance(historyApp, renderer, historyApp.animations[0]);
+    if (!historyApp.undo.commit(snapshot(historyApp)) || !checkPose(true) ||
+        !drawHistory(shiftedPixels) || shiftedPixels == originalPixels ||
+        !performUndo(historyApp, renderer) || !checkPose(false) ||
+        !drawHistory(restoredPixels) || restoredPixels != originalPixels ||
+        !performRedo(historyApp, renderer) || !checkPose(true) ||
+        !drawHistory(restoredPixels) || restoredPixels != shiftedPixels) {
+      std::printf("SMOKE FAIL: immediate joint undo/redo geometry, pick or GPU\n");
+      renderer.shutdown();
+      return 1;
+    }
+    historyApp.undo.begin(snapshot(historyApp));
+    historyApp.stickSession = true;
+    historyApp.scene.setLocal(joint, original);
+    updateSkinnedInstance(historyApp, renderer, historyApp.animations[0]);
+    if (!checkPose(false) || performUndo(historyApp, renderer) ||
+        !checkPose(true) || !drawHistory(restoredPixels) || restoredPixels != shiftedPixels) {
+      std::printf("SMOKE FAIL: immediate joint cancellation geometry, pick or GPU\n");
+      renderer.shutdown();
+      return 1;
+    }
+  }
+  // The first clip is unrelated; the second animates a joint ancestor only.
+  // Selecting the latter and deforming verifies both preference and gating.
+  {
+    App ancestorApp;
+    Model ancestorModel = model;
+    AnimationClip ancestorClip = ancestorModel.clips[0];
+    ancestorClip.channels[0].node = 0U;
+    ancestorModel.clips[0].channels[0].node = 4U;
+    ancestorModel.clips.push_back(ancestorClip);
+    if (!addModelToScene(ancestorApp, renderer, ancestorModel) ||
+        ancestorApp.animations.size() != 1U || ancestorApp.animations[0].skins.size() != 1U ||
+        ancestorApp.animations[0].model.clips[0].channels[0].node != 0U) {
+      std::printf("SMOKE FAIL: ancestor skin animation not selected\n");
+      renderer.shutdown();
+      return 1;
+    }
+    Vec3 const before = ancestorApp.animations[0].skins[0].deformed.vertices[0].pos;
+    tickAnimations(ancestorApp, renderer, 0.5F);
+    Vec3 const after = ancestorApp.animations[0].skins[0].deformed.vertices[0].pos;
+    if (length(after - before) < 0.05F) {
+      std::printf("SMOKE FAIL: ancestor animation did not deform skin\n");
+      renderer.shutdown();
+      return 1;
+    }
+  }
   std::vector<NodeId> roots;
   if (!addModelToScene(app, renderer, model, &roots)) {
     std::printf("SMOKE FAIL: add skinned model\n");
@@ -3028,8 +3171,63 @@ int runSmokeSkinned(char const* shaderDir) {
     return 1;
   }
   Vec3 const pickBefore = binding.pickGeometry->positions[3];
+  PickCandidate candidate{binding.visual, transformAabb(app.scene.world(binding.visual), visual->localBounds),
+                          app.scene.world(binding.visual), binding.pickGeometry};
+  Ray const restRay{{0.0F, 1.25F, 2.0F}, {0.0F, 0.0F, -1.0F}};
+  if (!pickClosestSurface(restRay, {candidate}) || !binding.pickGeometry->bvh) {
+    std::printf("SMOKE FAIL: bind-pose surface pick did not build BVH\n");
+    renderer.shutdown();
+    return 1;
+  }
+  EditorSnapshot const savedRest = snapshot(app);
 
+  // Create a redo branch, then let a real animation tick change the skinned
+  // bounds during a no-op edit. Playback must not become an undo step.
+  app.undo.begin(snapshot(app));
+  Transform moved = app.scene.local(binding.visual);
+  moved.translation.x += 1.0F;
+  app.scene.setLocal(binding.visual, moved);
+  if (!app.undo.commit(snapshot(app))) {
+    std::printf("SMOKE FAIL: skinned transform not recorded\n");
+    renderer.shutdown();
+    return 1;
+  }
+  EditorSnapshot historyState = snapshot(app);
+  if (!app.undo.undo(historyState)) {
+    std::printf("SMOKE FAIL: skinned transform undo\n");
+    renderer.shutdown();
+    return 1;
+  }
+  applySnapshot(app, renderer, historyState);
+  app.undo.begin(snapshot(app));
   tickAnimations(app, renderer, 0.5F);
+  visual = findVisual(app, binding.visual);
+  if (visual == nullptr || !(visual->localBounds.max.y > 1.55F) ||
+      app.undo.commit(snapshot(app)) || !app.undo.canRedo() || app.undo.canUndo()) {
+    std::printf("SMOKE FAIL: animated no-op edit changed history\n");
+    renderer.shutdown();
+    return 1;
+  }
+  historyState = snapshot(app);
+  if (!app.undo.redo(historyState)) {
+    std::printf("SMOKE FAIL: redo lost after animation\n");
+    renderer.shutdown();
+    return 1;
+  }
+  applySnapshot(app, renderer, historyState);
+  if (std::fabs(app.scene.local(binding.visual).translation.x - moved.translation.x) > 0.001F) {
+    std::printf("SMOKE FAIL: redo did not restore transform\n");
+    renderer.shutdown();
+    return 1;
+  }
+  historyState = snapshot(app);
+  if (!app.undo.undo(historyState)) {
+    std::printf("SMOKE FAIL: undo after animation\n");
+    renderer.shutdown();
+    return 1;
+  }
+  applySnapshot(app, renderer, historyState);
+  visual = findVisual(app, binding.visual);
   Vec3 const movedTop = binding.deformed.vertices[2].pos;
   SkinnedMeshBinding& secondBinding = app.animations[1].skins[0];
   Vec3 const secondTop = secondBinding.deformed.vertices[2].pos;
@@ -3051,6 +3249,38 @@ int runSmokeSkinned(char const* shaderDir) {
       std::fabs(pickAfter.x - pickBefore.x) < 0.01F ||
       std::fabs(pickAfter.y - pickBefore.y) < 0.01F || pickAfter.y < 1.55F) {
     std::printf("SMOKE FAIL: skinned bounds/picking did not follow the pose\n");
+    renderer.shutdown();
+    return 1;
+  }
+  // Choose an interior point of the moved upper triangle above the old BVH root. The
+  // broadphase uses current bounds; stale tree bounds would reject this ray.
+  Vec3 const centroid = binding.pickGeometry->positions[3] * 0.9F +
+                        binding.pickGeometry->positions[2] * 0.05F +
+                        binding.pickGeometry->positions[1] * 0.05F;
+  candidate.worldBounds = transformAabb(app.scene.world(binding.visual), visual->localBounds);
+  Vec3 const worldCentroid = transformPoint(candidate.world, centroid);
+  Ray const movedRay{{worldCentroid.x, worldCentroid.y, worldCentroid.z + 2.0F}, {0.0F, 0.0F, -1.0F}};
+  if (centroid.y <= 1.5F || !pickClosestSurface(movedRay, {candidate})) {
+    std::printf("SMOKE FAIL: deformed surface pick missed after BVH was built (%.3f %.3f, bounds %.3f..%.3f)\n", centroid.x, centroid.y, visual->localBounds.min.y, visual->localBounds.max.y);
+    renderer.shutdown();
+    return 1;
+  }
+  // Snapshots contain historical bounds, but geometry and playback are live.
+  // Restoration must immediately reconcile bounds, including stationary ticks.
+  float const movedMaxY = visual->localBounds.max.y;
+  applySnapshot(app, renderer, savedRest);
+  visual = findVisual(app, binding.visual);
+  if (visual == nullptr || std::fabs(visual->localBounds.max.y - movedMaxY) > 0.001F) {
+    std::printf("SMOKE FAIL: snapshot restored stale skinned bounds\n");
+    renderer.shutdown();
+    return 1;
+  }
+  tickAnimations(app, renderer, 0.0F);
+  if (std::fabs(visual->localBounds.max.y - movedMaxY) > 0.001F ||
+      !pickClosestSurface(movedRay, {PickCandidate{binding.visual,
+          transformAabb(app.scene.world(binding.visual), visual->localBounds),
+          app.scene.world(binding.visual), binding.pickGeometry}})) {
+    std::printf("SMOKE FAIL: stationary restored skin bounds/pick\n");
     renderer.shutdown();
     return 1;
   }
@@ -3422,7 +3652,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   updateHandGrab(app, current);
   if (!check(nearMatrix(app.scene.world(cube), handGrabTransform(start, current, start.position, physicalInitial)),
              "physical grab anchored to palm")) { return false; }
-  cancelLiveEdit(app);
+  cancelLiveEdit(app, renderer);
   if (!check(sameSnapshot(snapshot(app), before), "physical grab cancel restores state")) { return false; }
   beginHandGrab(app, start);
   auto const pivot = app.grabPivot;
@@ -3458,12 +3688,12 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   if (!check(app.undo.undo(state), "undo exists")) {
     return false;
   }
-  applySnapshot(app, state);
+  applySnapshot(app, renderer, state);
   if (!check(sameSnapshot(snapshot(app), before) && !app.undo.canUndo(), "exactly one undo restores start") ||
       !check(app.undo.redo(state), "redo exists")) {
     return false;
   }
-  applySnapshot(app, state);
+  applySnapshot(app, renderer, state);
   if (!check(sameSnapshot(snapshot(app), after) && !app.undo.canRedo(), "redo restores grab")) {
     return false;
   }
@@ -3471,7 +3701,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   // Controller grip-pose grab: a separate owner from the hand, driven by the
   // physical position AND orientation through the same view-relative maths.
   // A VALID-but-untracked pose can neither start nor update it.
-  applySnapshot(app, before);
+  applySnapshot(app, renderer, before);
   app.undo.clear();
   ControllerPose controllerStart;
   controllerStart.valid = true;
@@ -3529,7 +3759,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
              "controller grab undo restores start")) {
     return false;
   }
-  applySnapshot(app, controllerState);
+  applySnapshot(app, renderer, controllerState);
   app.undo.clear();
 
   // Motion changes editable placement without cancelling live node animation.
@@ -3543,7 +3773,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   updateHandGrab(app, translated);
   if (!check(nearVector(app.scene.worldPosition(cube), animatedBase + Vec3{.2F,0,0}), "grab keeps live animation") ||
       !check(endEdits(app), "animated grab commits")) { return false; }
-  applySnapshot(app, posedBefore);
+  applySnapshot(app, renderer, posedBefore);
   app.scene.setPoseOffset(cube, Mat4{});
   app.undo.clear();
 
@@ -3576,7 +3806,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   auto scaleState = snapshot(app);
   if (!check(app.undo.undo(scaleState) && sameSnapshot(scaleState, scaleBefore), "scale undo") ||
       !check(app.undo.redo(scaleState) && sameSnapshot(scaleState, scaleAfter), "scale redo")) { return false; }
-  applySnapshot(app, scaleBefore);
+  applySnapshot(app, renderer, scaleBefore);
   app.undo.clear();
 
   // Selecting both an ancestor and a child must transform the subtree once.
@@ -3606,7 +3836,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
              "ancestor moves child exactly once")) {
     return false;
   }
-  cancelLiveEdit(app);
+  cancelLiveEdit(app, renderer);
   if (!check(!app.grabActive &&
              nearMatrix(app.scene.world(child), childWorld) && !app.undo.canUndo(),
              "cancel clears grab and restores hierarchy without history")) {
@@ -3631,7 +3861,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
              "parent-only child rotates about moving subtree centre")) {
     return false;
   }
-  cancelLiveEdit(app);
+  cancelLiveEdit(app, renderer);
 
   // Child-only editing converts captured world back through the rotated,
   // uniformly scaled parent; the unselected parent must remain unchanged.
@@ -3651,7 +3881,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
              "child-only repeat has no drift")) {
     return false;
   }
-  cancelLiveEdit(app);
+  cancelLiveEdit(app, renderer);
   if (!check(sameSnapshot(snapshot(app), childBefore), "child-only cancellation restores snapshot")) {
     return false;
   }
@@ -3695,7 +3925,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
              sameTransform(app.scene.local(child), childLocal),
              "returning grab to identity follows latest animation")) { return false; }
   updateHandGrab(app, translated);
-  cancelLiveEdit(app);
+  cancelLiveEdit(app, renderer);
   if (!check(sameSnapshot(snapshot(app), animatedChildBefore) &&
              nearMatrix(app.scene.world(child), laterBaseline) &&
              nearMatrix(app.scene.poseOffset(parent), laterParentPose) &&
@@ -3740,7 +3970,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
     app.undo.commit(snapshot(app));
     auto historyState = snapshot(app);
     app.undo.undo(historyState);
-    applySnapshot(app, historyState);
+    applySnapshot(app, renderer, historyState);
     app.undo.begin(snapshot(app));
     app.stickSession = true;
     moveSelectionVertical(app.scene, app.selection, .1F);
@@ -3752,7 +3982,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
     if (!check(app.stickSession && app.undo.canRedo(), "history tool preserves live edit for cancellation")) {
       return false;
     }
-    cancelLiveEdit(app);
+    cancelLiveEdit(app, renderer);
     if (!check(sameSnapshot(snapshot(app), baseState) && app.undo.canRedo() && !app.undo.canUndo(),
                "history tool cancellation preserves redo branch")) {
       return false;
@@ -4280,10 +4510,10 @@ int runXr(char const* shaderDir,
           galleryOpen(app, renderer);
           break;
         case ToolPanelPress::Action::undo:
-          (void)performUndo(app);
+          (void)performUndo(app, renderer);
           break;
         case ToolPanelPress::Action::redo:
-          (void)performRedo(app);
+          (void)performRedo(app, renderer);
           break;
         case ToolPanelPress::Action::deleteNow:
           deleteSelection(app);
@@ -4302,12 +4532,12 @@ int runXr(char const* shaderDir,
     if (input.undoPressed || input.redoPressed) { selectionLatch.reset(); graspGate.reset(); rightGrasp.reset(); }
     if (input.undoPressed) {
       cancelledLiveEdit = app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive;
-      (void)performUndo(app);
+      (void)performUndo(app, renderer);
     }
     // Same guard as the desktop keys: one cancel per frame leaves both stacks
     // untouched even if both arrive together.
     if (input.redoPressed && !cancelledLiveEdit) {
-      (void)performRedo(app);
+      (void)performRedo(app, renderer);
     }
 
     // Hand model targeting/grabbing is retired (the maths and its tests still

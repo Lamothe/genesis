@@ -27,18 +27,16 @@ std::optional<PickHit> pickClosest(Ray const& ray,
 struct PickBvh;
 
 // Exact picking geometry in node-local space (positions + triangle indices).
-// A skinned visual owns its geometry and rewrites positions in place as the
-// skeleton moves; callers that cache derived structures must not assume the
-// triangles stay put.
+// Call invalidateBvh before mutating positions or indices after a pick.
 struct PickGeometry {
   std::vector<Vec3> positions;
   std::vector<std::uint32_t> indices;
   // Conservative local-space acceleration tree for exact surface picks. Built
-  // on the first pick and immutable afterwards; picks run on the frame thread,
-  // so the one-time build needs no lock. Do not mutate positions/indices after
-  // the first pick (the tree would no longer match them).
+  // on the first pick; picks and mutations run on the frame thread.
   mutable std::shared_ptr<const PickBvh> bvh;
   mutable bool bvhUnavailable{false}; // build failed once; use the full scan
+
+  void invalidateBvh() { bvh.reset(); bvhUnavailable = false; }
 };
 
 // A pickable visual: world bounds for broadphase plus optional exact geometry.

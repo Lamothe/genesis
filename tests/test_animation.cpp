@@ -385,6 +385,13 @@ void testSkinNormalsAndFallbacks() {
   CHECK(near(length(deformed.vertices[0].normal), 1.0F));
   CHECK(near3(deformed.vertices[0].pos, transformPoint(joint, rest.vertices[0].pos)));
 
+  // Bounds contain only the output, not the original first vertex.
+  Aabb movedBounds{};
+  CHECK(deformSkinnedMesh(rest, weights, {translationMatrix({5.0F, 0.0F, 0.0F})},
+                          deformed, &movedBounds));
+  CHECK(near3(movedBounds.min, {6.0F, 2.0F, 3.0F}));
+  CHECK(near3(movedBounds.max, {6.0F, 2.0F, 3.0F}));
+
   // A singular joint uses the forward 3x3; a normal that collapses to zero
   // keeps its rest direction instead of becoming NaN.
   MeshData singular = rest;

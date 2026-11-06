@@ -190,9 +190,9 @@ transforms cannot currently be animated. There is no clip selector yet.
 
 glTF skins are loaded (`skins`, node `skin`, `inverseBindMatrices`,
 `JOINTS_0`/`WEIGHTS_0`) and animated with four-influence linear blend skinning.
-A clip that targets a skin joint is preferred over an object clip, so a rigged
-character plays its walk cycle rather than a turntable. The clip choice is
-still automatic (first joint-targeting clip); there is no selector.
+A clip targeting a skin joint is preferred, followed by one targeting a joint
+ancestor, then an unrelated object clip. The choice is automatic; there is no
+selector.
 
 Joint matrices are `inverse(meshWorld) * jointWorld * inverseBindMatrix` per
 the glTF spec, built from the scene's live world matrices after the node pose
@@ -203,7 +203,7 @@ draw but does not reskin it. Inverse bind matrices must be MAT4 float, affine
 meshes render rigid instead of hiding the model. `JOINTS_1+` (more than four
 influences), sparse skin accessors, morph targets and joints outside the
 selected scene stay unsupported; those primitives render in the bind pose.
-Models with skins but no playable joint clip keep their bind-pose draw, and
+Placed skins with no playable clip are evaluated at the static pose, and
 `JOINTS_0`/`WEIGHTS_0` are only parsed when the file actually defines skins
 (the static library exports carry unused joint attributes).
 
@@ -228,7 +228,9 @@ path (see Design notes) — spawning and deleting large rigged characters
 repeatedly grows memory for the rest of the session.
 Deform results are re-uploaded only while the joint
 matrices change, and opaque skinned meshes skip the blend-sort key pass.
-Ray picking and selection bounds use the live deformed vertices. Physical hand
+Ray picking and selection bounds use the live deformed vertices. The ray-pick
+BVH is rebuilt lazily after a deformation; repeated picks of large changing
+meshes may therefore be costly. Physical hand
 contact still builds its triangle BVH once per mesh (a build costs ~1 µs per
 triangle, measured: 211 ms at 200k, 2.4 s at 2M), so grasping an *animated*
 character tests the surface from when the hand first reached it, not the
@@ -238,7 +240,8 @@ Design notes).
 
 `--smoke-skinned` renders the synthetic two-joint fixture that
 `run-tests.sh` writes to `.build/test-skinned.glb` (bind pose → animated,
-moved bounds/picking, changed pixels); it needs an offscreen Vulkan device.
+moved bounds/picking, changed pixels, and immediate joint undo/redo/cancel
+picking and rendering without an animation tick); it needs an offscreen Vulkan device.
 Headset-side appearance still has to be judged by eye.
 
 A comparison with Centre Stage identified the missing PBR materials,

@@ -106,11 +106,14 @@ bool deformSkinnedMesh(MeshData const& rest,
   }
 
   Aabb bounds{};
-  if (!rest.vertices.empty()) {
-    bounds.min = rest.vertices.front().pos;
-    bounds.max = rest.vertices.front().pos;
-  }
-  auto extend = [&bounds](Vec3 p) {
+  bool hasBounds = false;
+  auto extend = [&bounds, &hasBounds](Vec3 p) {
+    if (!hasBounds) {
+      bounds.min = p;
+      bounds.max = p;
+      hasBounds = true;
+      return;
+    }
     bounds.min.x = std::min(bounds.min.x, p.x);
     bounds.min.y = std::min(bounds.min.y, p.y);
     bounds.min.z = std::min(bounds.min.z, p.z);

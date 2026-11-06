@@ -22,6 +22,9 @@ struct NodeVisual {
   bool normalMapped{false};
   float normalScale{1.0F};
   Aabb localBounds{{-0.5F, -0.5F, -0.5F}, {0.5F, 0.5F, 0.5F}};
+  // True when localBounds is a live cache derived from mutable geometry, not
+  // editable state. Its owner must reconcile it after restoring a snapshot.
+  bool derivedBounds{false};
   // Exact picking triangles (node-local); shared between visuals that loaded
   // the same mesh. A skinned instance owns its geometry and rewrites it as the
   // skeleton moves. Null for box-shaped visuals (demo cubes), where the bounds
