@@ -102,6 +102,23 @@ int main() {
   // physical roll or rig movement. World-up stick yaw cannot prevent this.
   CHECK(std::fabs(viewRightBeforePhysicalTurn.y) < 1e-4F);
   CHECK(std::fabs(actualRight.y) > 0.2F);
+  // Analytic rigid-composition result (initial world yaw does not change Y).
+  CHECK(near(actualRight.y, std::sin(0.6F) * std::sin(1.1F)));
+  // A head-dependent level-horizon mapping moves a stationary controller
+  // relative to the world when only the head yaws, even with a common rig.
+  Quat const physicalYaw = quatFromAxisAngle({0,1,0}, 1.1F);
+  Quat const pitchRig = quatFromAxisAngle({1,0,0}, 0.6F);
+  Quat const compensatedRig = normalized(physicalYaw * pitchRig * conjugate(physicalYaw));
+  Quat const unrolledHead = normalized(physicalYaw * quatFromAxisAngle({1,0,0}, -0.2F));
+  CHECK(near(rotate(compensatedRig * unrolledHead, {1,0,0}).y, 0.0F));
+  Quat const physicalRoll = quatFromAxisAngle({0,0,1}, 0.3F);
+  Quat const expectedRolled = normalized(physicalYaw * quatFromAxisAngle({1,0,0}, 0.4F) * physicalRoll);
+  CHECK(near(rotate(compensatedRig * unrolledHead * physicalRoll, {1,0,0}),
+             rotate(expectedRolled, {1,0,0})));
+  Vec3 const stationaryRawController = trackedHead + Vec3{0.5F,-0.3F,-0.6F};
+  Vec3 const beforeController = rotate(pitchRig, stationaryRawController - trackedHead);
+  Vec3 const afterController = rotate(compensatedRig, stationaryRawController - trackedHead);
+  CHECK(length(afterController - beforeController) > 0.1F);
   old = spatial.position;
   step(spatialLoc, spatial, trackedHead, tracked, {1,0}, {});
   CHECK(near(spatial.position - old, actualRight * 0.075F));
@@ -118,6 +135,12 @@ int main() {
   tracked = normalized(tracked * quatFromAxisAngle({0,0,1}, 0.45F));
   step(spatialLoc, spatial, trackedHead, tracked, {}, {});
   Quat const beforeYaw = normalized(spatial.orientation * tracked);
+  // Even after virtual pitch, physical yaw and physical roll, strafe follows
+  // the complete rolled view-right vector rather than a ground projection.
+  Vec3 const rolledStrafeStart = spatial.position;
+  step(spatialLoc, spatial, trackedHead, tracked, {1,0}, {});
+  CHECK(near(spatial.position - rolledStrafeStart, rotate(beforeYaw, {1,0,0}) * 0.075F));
+  CHECK(std::fabs((spatial.position - rolledStrafeStart).y) > 0.001F);
   Vec3 const fixedHead = transformPoint(spatial.world(), trackedHead);
   step(spatialLoc, spatial, trackedHead, tracked, {}, {1,0});
   Quat const yawDelta = quatFromAxisAngle({0,1,0}, -0.075F);
