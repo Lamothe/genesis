@@ -38,6 +38,7 @@ renderer bolted on later through the seam contract
 
 ```sh
 bash run-tests.sh        # core + controller/hand state checks; fixtures via ImageMagick
+bash run-xr-frame-tests.sh # shell frame lifecycle with stubbed XR; Vulkan and OpenXR loader libraries
 bash run-editor.sh       # build + interactive editor
 bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
@@ -55,6 +56,8 @@ bash run-editor.sh --smoke-xr            # XR frame loop (SKIP without a runtime
 `run-tests.sh` compiles with `g++ -std=c++20 -Wall -Wextra -Werror`;
 `run-editor.sh` compiles the shell and shaders and runs it. Thin shell launchers
 only: **all project logic is typed C/C++ (project rule — no Python)**.
+The separate XR frame tests need Vulkan headers and Vulkan/OpenXR loader libraries,
+but no active OpenXR runtime or headset; core tests do not link those loaders.
 
 The offscreen renderer regressions are a separate binary because they need a
 live Vulkan 1.3 device and the compiled shaders (build them with

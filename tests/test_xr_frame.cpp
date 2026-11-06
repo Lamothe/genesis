@@ -22,13 +22,14 @@ bool sessionBeginFails = false;
 bool sessionEndFails = false;
 bool frameWaitFails = false;
 bool frameBeginFails = false;
+XrResult pollResult = XR_EVENT_UNAVAILABLE;
 XrSwapchain chain(int eye) { return reinterpret_cast<XrSwapchain>(static_cast<std::uintptr_t>(eye + 1)); }
 int eyeOf(XrSwapchain swapchain) { return static_cast<int>(reinterpret_cast<std::uintptr_t>(swapchain)) - 1; }
 }
 
 extern "C" {
 XRAPI_ATTR XrResult XRAPI_CALL xrPollEvent(XrInstance, XrEventDataBuffer* event) {
-  if (eventState == XR_SESSION_STATE_UNKNOWN) { return XR_EVENT_UNAVAILABLE; }
+  if (eventState == XR_SESSION_STATE_UNKNOWN) { return pollResult; }
   auto* changed = reinterpret_cast<XrEventDataSessionStateChanged*>(event);
   changed->type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED;
   changed->state = eventState;
@@ -110,6 +111,7 @@ public:
       shell.xr_->imageViews[eye].resize(1);
     }
   }
+  static void setSessionRunning(XrShell& shell, bool running) { shell.xr_->sessionRunning = running; }
   static void teardown(XrShell& shell) {
     delete shell.xr_; shell.xr_ = nullptr;
   }
@@ -223,8 +225,39 @@ void testRealShellAppFrames() {
   calls.clear();
 }
 
+void testPollFailures() {
+  using vredit::XrShell;
+  XrShell shell;
+  vredit::XrShellFrameTest::setup(shell);
+  vredit::XrFrameInput input;
+  // Normal empty queue pumps while idle and permits frames while running.
+  vredit::XrShellFrameTest::setSessionRunning(shell, false);
+  calls.clear();
+  assert(shell.beginFrame(input) == XrShell::FrameStatus::Pump && calls.empty());
+  pollResult = XR_ERROR_RUNTIME_FAILURE;
+  bool appFailed = false;
+  auto status = shell.beginFrame(input);
+  assert(status == XrShell::FrameStatus::Failed && calls.empty());
+  assert(vredit::xrAppShouldStop(status, appFailed));
+  assert(vredit::xrAppExitCode(appFailed, false, 0) == 2);
+  // An error after an ordinary queued event is also fatal before waiting for a frame.
+  eventState = XR_SESSION_STATE_FOCUSED;
+  status = shell.beginFrame(input);
+  assert(status == XrShell::FrameStatus::Failed && calls.empty());
+  vredit::XrShellFrameTest::setSessionRunning(shell, true);
+  pollResult = XR_ERROR_INSTANCE_LOST;
+  status = shell.beginFrame(input);
+  assert(status == XrShell::FrameStatus::Failed && calls.empty());
+  pollResult = XR_EVENT_UNAVAILABLE;
+  assert(shell.beginFrame(input) == XrShell::FrameStatus::Render);
+  assert(shell.abortFrame());
+  vredit::XrShellFrameTest::teardown(shell);
+  calls.clear();
+}
+
 int main() {
   testAppDecisions();
+  testPollFailures();
   testRealShellAppFrames();
   using vredit::XrShell;
   XrShell shell;

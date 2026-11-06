@@ -721,7 +721,15 @@ bool XrShell::createSwapchains() {
 
 void XrShell::pollEvents(bool& running, bool& failed) {
   XrEventDataBuffer event = xrStruct<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
-  while (xrPollEvent(xr_->instance, &event) == XR_SUCCESS) {
+  for (;;) {
+    XrResult const result = xrPollEvent(xr_->instance, &event);
+    if (result == XR_EVENT_UNAVAILABLE) { break; }
+    if (result != XR_SUCCESS) {
+      std::printf("[xr] xrPollEvent failed (%d)\n", static_cast<int>(result));
+      running = false;
+      failed = true;
+      return;
+    }
     if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
       auto* changed = reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
       if (xr_->sessionState == XR_SESSION_STATE_FOCUSED &&
@@ -774,6 +782,7 @@ void XrShell::pollEvents(bool& running, bool& failed) {
     } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
       running = false;
     }
+    if (!running) { return; }
     event = xrStruct<XrEventDataBuffer>(XR_TYPE_EVENT_DATA_BUFFER);
   }
 }
