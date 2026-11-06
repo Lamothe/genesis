@@ -27,7 +27,7 @@ renderer bolted on later through the seam contract
 - `app/geometry.*` — cube, floor grid, handle-line geometry
 - `app/editor_app.cpp` — XCB/OpenXR shell input, selection, controller
   workflow, model loading (`.glb`/`.obj` on the command line), smoke modes
-- `include/controller_arm_rig.h` — opt-in controller arm pose and finger solver
+- `include/controller_arm_rig.h` — controller arm pose and finger solver
 - `include/controller_workflow.h` — controller grip-pose quality, the
   carousel's settled/loaded placement gate, the trigger select-then-grab state
   machine and the tools-panel press/Delete-hold capture
@@ -339,7 +339,9 @@ room geometry for collision.
 
 ### Optional controller arm visuals
 
-Controller arms are **off by default**. The tested source is Felipe Bueno’s
+Controller arms load automatically from `.build/controller-arm-source.glb` when
+present. Set `GENESIS_CONTROLLER_ARMS_GLB` to another path, or to an empty value
+to disable them. No asset is bundled. The tested source is Felipe Bueno’s
 [Male Hand Rigged - Human Anatomy](https://sketchfab.com/3d-models/male-hand-rigged-human-anatomy-ecbe20f0d3764050b2e8a0487908ee99).
 The local source archive is a **rip**, not an official download. The
 [Sketchfab model API](https://api.sketchfab.com/v3/models/ecbe20f0d3764050b2e8a0487908ee99)
@@ -355,16 +357,23 @@ file):
 
 ```sh
 mkdir -p .build
-unzip -p "$HOME/Downloads/VR/Props/Male_Hand_Rigged_-_Human_Anatomy/original/source-download.zip" \
-  "Male_Hand_Rigged_-_Human_Anatomy.glb" > .build/controller-arm-source.glb
+tmp="$(mktemp .build/controller-arm-source.XXXXXX)"
+if unzip -p "$HOME/Downloads/VR/Props/Male_Hand_Rigged_-_Human_Anatomy/original/source-download.zip" \
+  "Male_Hand_Rigged_-_Human_Anatomy.glb" > "$tmp" && [ -s "$tmp" ]; then
+  mv -f "$tmp" .build/controller-arm-source.glb
+else
+  rm -f "$tmp"
+  echo "Could not extract controller rig" >&2
+fi
 ```
 
-Opt in explicitly with the extracted local path, or another compatible GLB
-for which you have rights:
+The installed rig is picked up automatically by a normal XR launch. To override
+it with another compatible GLB for which you have rights:
 
 ```sh
-GENESIS_CONTROLLER_ARMS_GLB="$PWD/.build/controller-arm-source.glb" bash run-editor.sh --xr
-GENESIS_CONTROLLER_ARMS_GLB="$PWD/.build/controller-arm-source.glb" bash run-editor.sh --smoke-controller-arms
+bash run-editor.sh --xr
+GENESIS_CONTROLLER_ARMS_GLB="/path/to/other-rig.glb" bash run-editor.sh --xr
+GENESIS_CONTROLLER_ARMS_GLB="" bash run-editor.sh --xr
 ```
 
 The library copy described above has no skin and will be rejected; the original

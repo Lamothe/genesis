@@ -1276,7 +1276,7 @@ struct ControllerArmVisual {
       transaction.active = false;
       static_assert(std::is_nothrow_move_assignable_v<ControllerArmVisual>);
       *this = std::move(staged);
-      std::printf("[arms] loaded opt-in controller rig: %s\n", path);
+      std::printf("[arms] loaded controller rig: %s\n", path);
       return true;
     } catch (std::exception const& e) {
       std::printf("[arms] initialisation failed: %s\n", e.what());
@@ -5982,6 +5982,13 @@ int runXr(char const* shaderDir,
   applyBackdrop(app, renderer, &shell);
   ControllerArmVisual controllerArms;
   char const* armPath = std::getenv("GENESIS_CONTROLLER_ARMS_GLB");
+  // The local owner can install a rig without changing their launcher. An
+  // explicit empty environment value still disables controller-arm visuals.
+  constexpr char kLocalArmRig[] = ".build/controller-arm-source.glb";
+  std::error_code armFileError;
+  if (armPath == nullptr && std::filesystem::is_regular_file(kLocalArmRig, armFileError)) {
+    armPath = kLocalArmRig;
+  }
   if (armPath != nullptr && armPath[0] != 0 && !controllerArms.init(renderer, armPath)) {
     if (controllerArms.rollbackFailed || renderer.hasFatalError()) {
       std::fprintf(stderr, "[xr] controller arm initialisation left renderer unsafe; shutting down\n");
