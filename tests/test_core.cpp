@@ -2474,6 +2474,23 @@ void testCarouselRing() {
   CHECK_NEAR(label0.position.z, model0.position.z, 1e-5F);
   CHECK_NEAR(label0.position.y, model0.position.y - 0.45F, 1e-5F);
   CHECK_NEAR(label0.yaw, model0.yaw, 1e-6F);
+  // Labels tilt towards the world-latched opening eye at steep elevations,
+  // including side slots; they must not collapse to an edge-on plane.
+  for (Vec3 gaze : {vredit::normalized(Vec3{.1F, .98F, -.17F}),
+                    Vec3{0, 1, 0}, Vec3{0, -1, 0}}) {
+    Vec3 heading{gaze.x, 0, gaze.z};
+    if (vredit::length(heading) < 1e-4F) { heading = fwd; }
+    heading = vredit::normalized(heading);
+    Vec3 const origin = eye + gaze * vredit::CarouselRing::kRadius -
+                        heading * vredit::CarouselRing::kRadius;
+    for (int slot : {0, 1}) {
+      auto const label = ring.labelPose(slot, origin, heading, .3F, .04F);
+      auto const face = ring.labelOrientation(label, eye);
+      Vec3 const towards = vredit::normalized(eye - label.position);
+      CHECK_NEAR(vredit::dot(vredit::rotate(face, {0,0,1}), towards), 1.0F, 1e-4F);
+      CHECK_NEAR(vredit::length(vredit::rotate(face, {1,0,0})), 1.0F, 1e-4F);
+    }
+  }
   // A side slot's label follows ITS x, not the centre: the bug this guards
   // against is every label stacking in the middle of the ring.
   vredit::CarouselRing::SlotPose const label1 = ring.labelPose(1, eye, fwd, 0.3F, 0.0F);

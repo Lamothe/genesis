@@ -250,6 +250,7 @@ struct App {
   // It should be stationary."
   bool ringLatched{false};
   Vec3 ringOrigin{0.0F, 0.0F, 0.0F};
+  Vec3 ringOpeningEye{0.0F, 0.0F, 0.0F};
   Vec3 ringForward{0.0F, 0.0F, -1.0F};
   vredit::EditorSnapshot galleryBefore{}; // undo "before" for the placement
   VrCarouselBrowse galleryBrowse;
@@ -1455,16 +1456,20 @@ void galleryTick(App& app, VkRenderer& renderer, float dt, Vec3 const& eye,
     return;
   }
   app.ring.tick(dt);
-  // The ring is world-stationary: latch the viewer's eye and level heading
-  // on the first tick after open; every pose uses the latched frame.
+  // The ring is world-stationary: latch a level heading and a gaze-centred
+  // origin on the first tick after open; every pose uses the latched frame.
   if (!app.ringLatched) {
     app.ringLatched = true;
-    app.ringOrigin = eye;
-    Vec3 f = forward;
-    if (f.x == 0.0F && f.z == 0.0F) {
+    app.ringOpeningEye = eye;
+    Vec3 f = normalized(forward);
+    if (length(Vec3{f.x, 0.0F, f.z}) < 1e-4F) {
       f = {0.0F, 0.0F, -1.0F};
     }
     app.ringForward = normalized(Vec3{f.x, 0.0F, f.z});
+    // Keep the ring and previews upright, but centre the ring on the
+    // actual gaze, including elevation. The anchor remains world-latched.
+    app.ringOrigin = eye + normalized(forward) * CarouselRing::kRadius -
+                     app.ringForward * CarouselRing::kRadius;
     std::printf("[gallery] ring latched (stationary)\n");
   }
   // Evict slots that fell outside the visible window (centre ± 2), using the
@@ -1813,7 +1818,7 @@ void assembleFrame(App& app,
   }
   // The carousel's model names: one label per staged preview, centred on its
   // slot, hung just below the model's own feet (slot.halfHeight, not a fixed
-  // box) and facing the viewer with the model. The centred slot is brighter,
+  // box) and facing the latched opening eye. The centred slot is brighter,
   // so "the name in front of me" is unambiguous. Never drawn for a slot that
   // failed to load — there is nothing above the text to name.
   if (app.galleryActive) {
@@ -1837,7 +1842,7 @@ void assembleFrame(App& app,
       if (unitWidth > 0.0F && unitWidth * height > kLabelMaxWidth) {
         height = kLabelMaxWidth / unitWidth;
       }
-      Quat const face = quatFromAxisAngle(Vec3{0.0F, 1.0F, 0.0F}, label.yaw);
+      Quat const face = app.ring.labelOrientation(label, app.ringOpeningEye);
       // Centre the run: local +X is the viewer's right for this facing, so the
       // origin shifts half a width left and the pen starts at zero.
       Vec3 const right = rotate(face, Vec3{1.0F, 0.0F, 0.0F});
@@ -1846,11 +1851,11 @@ void assembleFrame(App& app,
       Vec3 const colour = centred ? Vec3{1.0F, 0.95F, 0.82F} : Vec3{0.62F, 0.68F, 0.78F};
       appendTextLines(overlayLines, name, trs(at, face, Vec3{1.0F, 1.0F, 1.0F}), height, colour);
       if (centred && app.ring.atRest()) {
-        auto const mid = label.position + Vec3{0, -.035F, 0};
+        Vec3 const up = rotate(face, Vec3{0,1,0});
+        auto const mid = label.position - up * .035F;
         Vec3 const gold{1.0F, .7F, .25F};
-        auto const up = Vec3{0,1,0};
-        for (auto const& point : {mid - right*.035F, mid + Vec3{0,.018F,0},
-                                  mid + Vec3{0,.018F,0}, mid + right*.035F}) {
+        for (auto const& point : {mid - right*.035F, mid + up*.018F,
+                                  mid + up*.018F, mid + right*.035F}) {
           overlayLines.push_back({point, up, gold, {0,0}});
         }
       }
@@ -2487,6 +2492,65 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     std::printf("SMOKE FAIL: carousel staged nothing\n");
     return 1;
   }
+  // A steep opening still puts the upright centre preview along the gaze;
+  // subsequent viewer movement must not move this latched frame.
+  {
+    galleryClose(app);
+    galleryOpen(app, renderer);
+    for (Vec3 const steep : {normalized(Vec3{0.1F, 0.98F, -0.17F}),
+                             Vec3{0, 1, 0}, Vec3{0, -1, 0}}) {
+      galleryTick(app, renderer, 0.0F, hudPos, steep);
+      Vec3 const centre = app.ring.slotPose(app.ring.index, app.ringOrigin, app.ringForward).position;
+      if (length(centre - (hudPos + steep * CarouselRing::kRadius)) > 1e-4F) {
+        std::printf("SMOKE FAIL: steep carousel gaze placement\n"); return 1;
+      }
+      // Every label faces the latched opening eye, even at a vertical gaze;
+      // its orientation must not follow later viewer motion.
+      for (int index : {app.ring.index, app.ring.index + 1}) {
+        auto const label = app.ring.labelPose(index, app.ringOrigin, app.ringForward, .15F, kLabelGap);
+        Quat const face = app.ring.labelOrientation(label, app.ringOpeningEye);
+        Vec3 const toEye = normalized(app.ringOpeningEye - label.position);
+        if (dot(rotate(face, {0,0,1}), toEye) < .9999F) {
+          std::printf("SMOKE FAIL: steep carousel label facing\n"); return 1;
+        }
+      }
+      Vec3 const openingEye = app.ringOpeningEye;
+      Vec3 const anchor = app.ringOrigin;
+      galleryTick(app, renderer, 0.0F, hudPos + Vec3{1, 2, 3}, {1,0,0});
+      if (length(app.ringOrigin - anchor) > 1e-5F ||
+          length(app.ringOpeningEye - openingEye) > 1e-5F) {
+        std::printf("SMOKE FAIL: steep carousel anchor moved\n"); return 1;
+      }
+      galleryClose(app);
+      galleryOpen(app, renderer);
+    }
+    galleryClose(app);
+    galleryOpen(app, renderer);
+    pump();
+  }
+  // Viewer movement must not re-anchor the actual preview nodes or labels.
+  {
+    auto const slot = std::find_if(app.carousel.begin(), app.carousel.end(),
+        [](CarouselSlot const& s) { return s.hasModel && s.wrapper != kInvalidNode; });
+    if (slot == app.carousel.end()) { std::printf("SMOKE FAIL: no stationary slot\n"); return 1; }
+    auto const origin = app.ringOrigin;
+    auto const heading = app.ringForward;
+    auto const before = app.scene.world(slot->wrapper);
+    auto const label = app.ring.labelPose(slot->index, origin, heading, slot->halfHeight, kLabelGap);
+    galleryTick(app, renderer, 0.0F, hudPos + Vec3{2, .3F, -1}, {1, 0, 0});
+    auto const after = app.scene.world(slot->wrapper);
+    auto const labelAfter = app.ring.labelPose(slot->index, app.ringOrigin, app.ringForward,
+                                               slot->halfHeight, kLabelGap);
+    for (int i = 0; i < 16; ++i) {
+      if (std::fabs(before.m[i] - after.m[i]) > 1e-5F) {
+        std::printf("SMOKE FAIL: carousel moved with viewer\n"); return 1;
+      }
+    }
+    if (length(app.ringOrigin - origin) > 1e-5F || length(app.ringForward - heading) > 1e-5F ||
+        length(label.position - labelAfter.position) > 1e-5F) {
+      std::printf("SMOKE FAIL: carousel anchor or label moved\n"); return 1;
+    }
+  }
   // EVERY PREVIEW IS NAMED. With the gallery open the overlay line list holds
   // nothing but the model labels (the mode HUD is suppressed there), so this
   // is a direct check of the production path: the labels exist, they sit
@@ -2609,6 +2673,34 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   }
   if (!previewHit || galleryPointerAction(app, {hudPos, {0,1,0}}) != 0) {
     std::printf("SMOKE FAIL: preview surface-only placement target\n"); return 1;
+  }
+  // A tracked aim ray and each stereo eye use the same translated, rotated
+  // rig. The exact stationary preview surface remains pickable in that frame.
+  {
+    VrRig const rig{{2.3F, -.4F, 1.7F}, normalized(quatFromAxisAngle({0,1,0}, .8F) *
+                                                   quatFromAxisAngle({1,0,0}, -.3F))};
+    Mat4 inverse{};
+    if (!invertAffine(rig.world(), inverse)) { return 1; }
+    Ray const trackedAim{transformPoint(inverse, aimRay.origin),
+                         transformVector(inverse, aimRay.direction)};
+    Ray const worldAim{transformPoint(rig.world(), trackedAim.origin),
+                       normalized(transformVector(rig.world(), trackedAim.direction))};
+    if (galleryPointerAction(app, worldAim) != 2) {
+      std::printf("SMOKE FAIL: rig-space aim misses stationary preview\n"); return 1;
+    }
+    Vec3 const rawHead = transformPoint(inverse, hudPos);
+    Quat const rawEye = normalized(conjugate(rig.orientation) *
+                                   quatFromAxisAngle({0,0,1}, .2F));
+    Vec3 const worldPoint = worldAim.origin + worldAim.direction;
+    for (int eye = 0; eye < 2; ++eye) {
+      Vec3 const rawEyePos = rawHead + rotate(rawEye, {eye == 0 ? -.032F : .032F, 0, 0});
+      Vec3 eyeWorld{}; Mat4 view{};
+      if (!composeStereoEye(rig.world(), rawEyePos, rawEye, eyeWorld, view) ||
+          length(transformPoint(view, worldPoint) -
+                 transformPoint(cameraViewFromPose(eyeWorld, rig.orientation * rawEye), worldPoint)) > 1e-4F) {
+        std::printf("SMOKE FAIL: carousel stereo/pick frame mismatch\n"); return 1;
+      }
+    }
   }
   // The placeable preview's rim is exactly "would a press place?": lit on
   // the settled exact hit, never while the ring eases between slots, never
@@ -3831,8 +3923,8 @@ void closeToolMenu(App& app) {
 
 // Opens the real tools panel (Models, Undo, Redo, Delete, Backdrop). Opening
 // it commits any live grab as its own undo step: the trigger now belongs to
-// the menu, not the scene. A controller panel is latched in the world on this
-// frame (stable to point at); a hand panel follows the palm each frame.
+// the menu, not the scene. Both controller and hand panels are latched in
+// world space on this frame, so they remain stable as the viewer moves.
 void openToolMenu(App& app, MenuOwner owner, Vec3 const& headWorld, Vec3 const& headForward) {
   app.leftTriggerWorkflow.interrupt();
   if (owner == MenuOwner::none) {
@@ -3853,11 +3945,23 @@ void openToolMenu(App& app, MenuOwner owner, Vec3 const& headWorld, Vec3 const& 
   app.handTool = -1;
   app.deleteCharge = 0.0F;
   app.deleteHolding = false;
-  app.handPanel.orientation =
-      quatFromAxisAngle(Vec3{0.0F, 1.0F, 0.0F}, std::atan2(-headForward.x, -headForward.z));
-  app.handPanel.origin = headWorld + headForward * 0.85F + Vec3{0.0F, -0.10F, 0.0F};
+  Vec3 const forward = normalized(headForward);
+  float const yaw = std::atan2(-forward.x, -forward.z);
+  float const pitch = std::asin(std::clamp(forward.y, -1.0F, 1.0F));
+  app.handPanel.orientation = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, yaw) *
+                              quatFromAxisAngle({1.0F, 0.0F, 0.0F}, pitch);
+  app.handPanel.origin = headWorld + forward * 0.85F +
+                         rotate(app.handPanel.orientation, {0.0F, -0.10F, 0.0F});
   std::printf("[menu] tools panel open (%s)\n",
               owner == MenuOwner::controller ? "controller" : "hand");
+}
+
+// A hand-owned panel stays latched, but tracking loss still closes it.
+void updateHandPanelTracking(App& app, bool handActive, HandPose const& palm) {
+  if (app.menuOwner == MenuOwner::hand &&
+      (!handActive || !palm.valid || app.galleryActive)) {
+    closeToolMenu(app);
+  }
 }
 
 // Left Menu: tap toggles the controller-owned panel. If the hand menu or the
@@ -4014,6 +4118,63 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
     }
     return true;
   };
+  // At steep elevation the panel faces the eye and its buttons remain
+  // directly hittable, including looking straight up and down.
+  for (Vec3 direction : {Vec3{0,1,0}, Vec3{0,-1,0}, normalized(Vec3{.2F,.95F,-.1F})}) {
+    Vec3 const eye{1, 2, 3};
+    openToolMenu(app, MenuOwner::controller, eye, direction);
+    Vec3 const normal = rotate(app.handPanel.orientation, {0,0,1});
+    Vec3 const target = app.handPanel.origin +
+                        rotate(app.handPanel.orientation, handPanelButtonCentre(0));
+    if (!check(nearVector(normal, -direction) &&
+               app.handPanel.hit({eye, normalized(target - eye)}) == 0,
+               "steep panel faces viewer and button is hittable")) { return false; }
+    closeToolMenu(app);
+  }
+  // Both menu owners latch one world pose. Move the tracked viewer and aim
+  // from two different rig poses; rendering and panel picking must agree.
+  for (MenuOwner owner : {MenuOwner::controller, MenuOwner::hand}) {
+    VrRig rig{{3, .4F, -2}, quatFromAxisAngle({0,1,0}, .7F)};
+    Vec3 const rawHead{.8F, 1.6F, -.5F};
+    Quat const rawHeadOrient = normalized(quatFromAxisAngle({0,1,0}, -.4F) *
+                                          quatFromAxisAngle({1,0,0}, .25F));
+    auto const head = transformPoint(rig.world(), rawHead);
+    auto const forward = rotate(rig.orientation * rawHeadOrient, {0,0,-1});
+    openToolMenu(app, owner, head, forward);
+    HandPanel const latched = app.handPanel;
+    Vec3 const target = latched.origin + rotate(latched.orientation, handPanelButtonCentre(0));
+    Vec3 const normal = rotate(latched.orientation, {0,0,1});
+    for (int frame = 0; frame < 2; ++frame) {
+      if (frame == 1) {
+        rig.position = rig.position + Vec3{.6F, -.2F, .5F};
+        rig.orientation = normalized(quatFromAxisAngle({0,1,0}, -.5F) * rig.orientation);
+      }
+      HandPose const palm{{2.0F + frame, 1.1F, -1.0F},
+                          quatFromAxisAngle({0,1,0}, .5F * frame), true};
+      updateHandPanelTracking(app, true, palm);
+      Mat4 inverse{};
+      if (!check(invertAffine(rig.world(), inverse), "panel rig invertible")) { return false; }
+      Vec3 const eye = transformPoint(rig.world(), rawHead);
+      Vec3 const rawOrigin = transformPoint(inverse, target + normal);
+      Vec3 const rawDirection = transformVector(inverse, -normal);
+      Ray const worldAim{transformPoint(rig.world(), rawOrigin),
+                         normalized(transformVector(rig.world(), rawDirection))};
+      Vec3 eyeWorld{}; Mat4 view{};
+      if (!check(composeStereoEye(rig.world(), rawHead, rawHeadOrient, eyeWorld, view) &&
+                 nearVector(eyeWorld, eye) && app.handPanel.hit(worldAim) == 0 &&
+                 nearVector(app.handPanel.origin, latched.origin) &&
+                 nearVector(rotate(app.handPanel.orientation, {0,0,1}), normal) &&
+                 nearVector(transformPoint(view, worldAim.origin + worldAim.direction),
+                            transformPoint(view, target)),
+                 "stationary panel rendered and picked in the same world frame")) { return false; }
+    }
+    if (owner == MenuOwner::hand) {
+      updateHandPanelTracking(app, true, HandPose{});
+      if (!check(app.menuOwner == MenuOwner::none, "lost palm closes hand panel")) { return false; }
+    } else {
+      closeToolMenu(app);
+    }
+  }
   buildDemoScene(app); // isolated fixture; renderer mesh 0 is the built-in cube
   auto const cube = app.visuals.front().id;
   app.selection = {cube};
@@ -5200,7 +5361,7 @@ int runXr(char const* shaderDir,
     }
     rightWasHand = handRight;
     bool handMenuToggled = false;
-    palmUp = input.handActive[0] && palmFacingUp(worldHands[0], palmUp);
+    palmUp = input.handActive[0] && palmFacingUp(input.hands[0], palmUp);
     if (leftPressed && palmUp && !handHeld) {
       selectionLatch.reset();
       graspGate.reset();
@@ -5230,17 +5391,9 @@ int runXr(char const* shaderDir,
     if (app.galleryActive && !app.ringLatched) {
       galleryTick(app, renderer, 0.0F, headWorld, headForward);
     }
-    // A hand panel needs the tracked palm and closes with the carousel. The
-    // controller panel stays latched where it opened.
-    if (app.menuOwner == MenuOwner::hand &&
-        (!input.handActive[0] || !worldHands[0].valid || app.galleryActive)) {
-      closeToolMenu(app);
-    }
-    if (app.menuOwner == MenuOwner::hand) {
-      app.handPanel.orientation =
-          quatFromAxisAngle({0, 1, 0}, std::atan2(-headForward.x, -headForward.z));
-      app.handPanel.origin = worldHands[0].position + Vec3{0, .12F, 0};
-    }
+    // Both panels stay at their opening world pose. A hand panel still closes
+    // on lost palm tracking or when the carousel takes ownership.
+    updateHandPanelTracking(app, input.handActive[0], worldHands[0]);
     int hover = -1;
     if (app.menuOwner != MenuOwner::none && controllerRight) {
       hover = controllerAimTracked ? app.handPanel.hit(controllerAim) : -1;

@@ -112,13 +112,16 @@ pointing. There is one owner grab at a time, and the controls are:
   grab start because every update applies the cumulative delta to the captured
   start transforms.
 - **Left trigger:** a left-only press and release clears the selection, regardless of duration without pointing, including when aiming at a skydome. While a right-trigger grab is already active, a fresh left-trigger press joins uniform scaling based on the distance between the two physical controller grip positions. Release the left trigger to resume the right-hand move/rotation without a jump; release the right to commit the whole gesture as one undo step. The scale pivot is the selection bounds centre at join; a 4 cm minimum initial separation avoids unstable ratios. A left press held before the right grab cannot scale or deselect on release. If either pose is lost during scaling, the edit commits at the last tracked pose and requires release before another grab. Menu/carousel transitions suppress held triggers.
-- **Thumbsticks:** left stick flies forward/back along the current combined
-  virtual and physical view direction (including pitch) and strafes level;
-  looking down and moving forward descends. Right stick smoothly looks left,
+- **Thumbsticks:** left stick flies forward/back and strafes left/right along
+  the current combined virtual and physical view axes, even when looking
+  vertically. Looking down and moving forward descends; strafing can also move
+  vertically when the view is tilted or rolled. Right stick smoothly looks left,
   right, up and down around the current head position. Physical head movement
   and roll remain active. Rates are 1.5 m/s and 1.5 rad/s at full deflection,
-  with a radial 0.2 deadzone and a 50 ms maximum locomotion timestep. Sticks
-  never manipulate a selection. The right stick browses exclusively while the
+  with a radial 0.2 deadzone and a 50 ms maximum locomotion timestep. Because
+  virtual pitch tilts the whole tracking space, a subsequent physical head turn
+  can make the horizon appear tilted; removing that effect dynamically would
+  also rotate the scene during physical head movement. Sticks never manipulate a selection. The right stick browses exclusively while the
   carousel is open. Locomotion pauses while using the tools panel or triggers,
   during a grab, and on untracked/stale views or focus/profile interruption;
   after a pause each stick must return to neutral before it can resume. Vive
@@ -167,10 +170,11 @@ pointing. There is one owner grab at a time, and the controls are:
   Neither stick moves, rotates or
   scales a model.
 - **Hands:** tracked hand/arm surfaces still render, depth-tested against the
-  scene, and the **left palm-up pinch** menu still opens the tools panel. Hand
+  scene, and the **left palm-up pinch** (using the physical tracking pose) still opens the tools panel, latched
+  in the scene rather than following the palm. Hand
   pinch/grasp no longer selects, grabs, moves or scales models; the old hand-grab
-  maths and tests are retained for future arm interaction. A hand menu follows
-  the palm and closes on palm tracking loss; the controller menu stays latched where it opened.
+  maths and tests are retained for future arm interaction. The hand menu closes
+  on palm tracking loss.
   Models in the hand-only menu requires switching to the right controller.
 
 **Verification status:** strict build; core, hand, XR-view and hand-mesh tests;
@@ -187,7 +191,7 @@ Runtime bindings and headset usability remain **unverified**.
 The **bounding box is not a click target**: pressing empty space next to a model
 selects nothing. The selection is shown by a neutral angle-based shader rim, not a silhouette border; the mode label is
 desktop-only (there is no fixed MOVE label in VR). The carousel is a
-**stationary ring** of library models: the centred model is staged at eye height
+**stationary, upright ring** of library models: the centred model is staged along the opening view direction
 and the previous/next models sit visible at the sides as cheap geometry-only
 previews (textures load when a model is placed; each preview is labelled with
 its filename stem). The library folder (`~/Downloads/VR` by default,

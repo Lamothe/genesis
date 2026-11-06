@@ -96,4 +96,13 @@ CarouselRing::SlotPose CarouselRing::labelPose(int i, Vec3 const& eye, Vec3 cons
   return SlotPose{Vec3{model.position.x, model.position.y - drop, model.position.z}, model.yaw};
 }
 
+Quat CarouselRing::labelOrientation(SlotPose const& label, Vec3 const& openingEye) const {
+  Vec3 const toEye = openingEye - label.position;
+  float const horizontal = std::hypot(toEye.x, toEye.z);
+  float const yaw = horizontal > 1e-5F ? std::atan2(toEye.x, toEye.z) : label.yaw;
+  float const pitch = -std::atan2(toEye.y, horizontal);
+  return normalized(quatFromAxisAngle({0.0F, 1.0F, 0.0F}, yaw) *
+                    quatFromAxisAngle({1.0F, 0.0F, 0.0F}, pitch));
+}
+
 } // namespace vredit

@@ -81,28 +81,41 @@ public:
     Quat orientation = rig.orientation;
     // Positive X turns right; positive Y looks up. Pitch axis is horizontal
     // viewer-right, independent of physical head roll.
-    orientation = normalized(quatFromAxisAngle({0.0F, 1.0F, 0.0F}, -turn.x * 1.5F * dt) * orientation);
+    Quat const yaw = quatFromAxisAngle({0.0F, 1.0F, 0.0F}, -turn.x * 1.5F * dt);
+    orientation = normalized(yaw * orientation);
     Vec3 forward = normalized(rotate(orientation * headOrientation, {0.0F, 0.0F, -1.0F}));
     Vec3 rightAxis = cross(forward, {0.0F, 1.0F, 0.0F});
     float const horizontal = length(rightAxis);
-    if (horizontal > 1e-4F) {
-      rightAxis = rightAxis / horizontal;
-      float const elevation = std::asin(std::clamp(forward.y, -1.0F, 1.0F));
-      constexpr float limit = 1.50F;
-      float pitch = turn.y * 1.5F * dt;
-      // Never snap a physically tilted head back inside the limit.
-      if (pitch > 0.0F) { pitch = std::min(pitch, std::max(0.0F, limit - elevation)); }
-      else { pitch = std::max(pitch, std::min(0.0F, -limit - elevation)); }
-      orientation = normalized(quatFromAxisAngle(rightAxis, pitch) * orientation);
+    // Use the actual current heading on both sides of a pole. A cached
+    // horizontal axis becomes stale during physical yaw and points the wrong
+    // way after crossing a pole. Only the genuinely singular view needs a
+    // fallback; there is no unique horizontal heading at exactly vertical.
+    Vec3 pitchAxis;
+    if (horizontal > 1e-6F) {
+      pitchAxis = rightAxis / horizontal;
+    } else {
+      Quat const view = normalized(orientation * headOrientation);
+      Vec3 candidate = rotate(view, {1.0F, 0.0F, 0.0F});
+      candidate.y = 0.0F;
+      if (length(candidate) < 0.02F) {
+        Vec3 const viewUp = rotate(view, {0.0F, 1.0F, 0.0F});
+        candidate = cross({0.0F, 1.0F, 0.0F}, viewUp) * (forward.y >= 0.0F ? 1.0F : -1.0F);
+      }
+      pitchAxis = normalized(candidate);
     }
+    float const elevation = std::asin(std::clamp(forward.y, -1.0F, 1.0F));
+    constexpr float limit = 1.50F;
+    float pitch = turn.y * 1.5F * dt;
+    // Never snap a physically tilted head back inside the limit.
+    if (pitch > 0.0F) { pitch = std::min(pitch, std::max(0.0F, limit - elevation)); }
+    else { pitch = std::max(pitch, std::min(0.0F, -limit - elevation)); }
+    orientation = normalized(quatFromAxisAngle(pitchAxis, pitch) * orientation);
     rig.orientation = orientation;
     rig.position = pivot - rotate(orientation, head);
     forward = normalized(rotate(orientation * headOrientation, {0.0F, 0.0F, -1.0F}));
-    // True viewer-relative flight: forward follows head pitch; strafe stays
-    // level, avoiding roll-induced sideways ascent. No diagonal speed boost.
-    rightAxis = cross(forward, {0.0F, 1.0F, 0.0F});
-    if (length(rightAxis) > 1e-4F) { rightAxis = normalized(rightAxis); }
-    else { rightAxis = {}; }
+    // Fly along the actual view axes, even at vertical pitch or head roll.
+    // Strafe can therefore include vertical movement. No diagonal speed boost.
+    rightAxis = normalized(rotate(orientation * headOrientation, {1.0F, 0.0F, 0.0F}));
     rig.position = rig.position + (forward * move.y + rightAxis * move.x) * (1.5F * dt);
   }
 private:

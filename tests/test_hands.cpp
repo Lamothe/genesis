@@ -673,6 +673,13 @@ void palms() {
   CHECK(!palmFacingUp(pose, true));
   pose.orientation = quatFromAxisAngle({0, 0, 1}, 3.14159265F);
   CHECK(palmFacingUp(pose, false));
+  // Gesture is physical: virtual tracking-space pitch must not alter the
+  // raw palm classification, even though its rendered world pose changes.
+  HandPose const raw = pose;
+  HandPose world = raw;
+  world.orientation = normalized(quatFromAxisAngle({1, 0, 0}, 1.5F) * raw.orientation);
+  CHECK(palmFacingUp(raw, false));
+  CHECK(!palmFacingUp(world, false));
   pose.valid = false;
   CHECK(!palmFacingUp(pose, true));
 }
