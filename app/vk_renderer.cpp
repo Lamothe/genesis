@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -22,6 +23,22 @@ namespace vredit {
 namespace {
 
 constexpr std::size_t kMaxLineVerts = 65536U;
+
+// Own partially constructed Vulkan objects until registration succeeds. The
+// callable captures only references and cannot allocate during unwinding.
+template <typename F>
+class ScopeExit {
+public:
+  explicit ScopeExit(F f) : f_(std::move(f)) {}
+  ScopeExit(ScopeExit const&) = delete;
+  ScopeExit& operator=(ScopeExit const&) = delete;
+  ~ScopeExit() { if (active_) { f_(); } }
+  void release() { active_ = false; }
+private:
+  F f_;
+  bool active_{true};
+};
+
 
 bool checkVk(VkResult result, char const* what) {
   if (result != VK_SUCCESS) {
@@ -127,6 +144,17 @@ struct VkRenderer::Impl {
   };
 
   SceneLighting lighting;
+  void destroyMesh(MeshRecord& record) {
+    if (record.updateStagingMapped != nullptr) {
+      vkUnmapMemory(device, record.updateStagingMemory);
+    }
+    vkDestroyBuffer(device, record.updateStaging, nullptr);
+    vkFreeMemory(device, record.updateStagingMemory, nullptr);
+    vkDestroyBuffer(device, record.vertexBuffer, nullptr);
+    vkFreeMemory(device, record.vertexMemory, nullptr);
+    vkDestroyBuffer(device, record.indexBuffer, nullptr);
+    vkFreeMemory(device, record.indexMemory, nullptr);
+  }
 
   // Backdrop void colour (setClearColour).
   float clearR{0.08F};
@@ -134,6 +162,49 @@ struct VkRenderer::Impl {
   float clearG{0.09F};
   float clearB{0.11F};
 
+  bool fatal{false}; // A lost device must not be used for further work.
+
+  bool deviceWait(char const* what) {
+    VkResult result = vkDeviceWaitIdle(device);
+    if (result == VK_ERROR_DEVICE_LOST) { fatal = true; }
+    return checkVk(result, what);
+  }
+
+  // An arbitrary wait error does not establish completion. Fall back to a
+  // device-wide wait; if that also fails, unwinding would cause GPU UAF.
+  // Vulkan treats DEVICE_LOST as success only for in-use/pending lifetimes.
+  void ensureRetired(VkResult waitResult) {
+    if (waitResult == VK_SUCCESS) { return; }
+    if (waitResult == VK_ERROR_DEVICE_LOST) { fatal = true; return; }
+    VkResult fallback = vkDeviceWaitIdle(device);
+    if (fallback == VK_ERROR_DEVICE_LOST) { fatal = true; return; }
+    if (fallback != VK_SUCCESS) {
+      std::fprintf(stderr, "[vk] fatal: cannot establish GPU idle (wait=%d device=%d)\n",
+                   static_cast<int>(waitResult), static_cast<int>(fallback));
+      std::abort();
+    }
+  }
+
+  bool submitUpload(VkSubmitInfo const& info, char const* what) {
+    VkResult submit = vkQueueSubmit(queue, 1, &info, VK_NULL_HANDLE);
+    // Wait even on a failed submit, including unexpected implementation errors.
+    VkResult wait = vkQueueWaitIdle(queue);
+    ensureRetired(wait);
+    if (submit == VK_ERROR_DEVICE_LOST) { fatal = true; }
+    if (submit != VK_SUCCESS || wait != VK_SUCCESS) {
+      std::printf("[vk] %s (submit=%d wait=%d)\n", what,
+                  static_cast<int>(submit), static_cast<int>(wait));
+      return false;
+    }
+    return true;
+  }
+
+  bool ready{false};
+
+  bool checked(VkResult result, char const* what) {
+    if (result == VK_ERROR_DEVICE_LOST) { fatal = true; }
+    return checkVk(result, what);
+  }
   bool windowed{false};
   bool external{false}; // caller-owned instance/device (XR path)
   std::uint32_t width{0};
@@ -172,6 +243,7 @@ struct VkRenderer::Impl {
     VkDeviceMemory memory{VK_NULL_HANDLE};
     VkImageView view{VK_NULL_HANDLE};
     VkSampler sampler{VK_NULL_HANDLE};
+    std::size_t bytes{0};
   };
   std::vector<TextureRecord> textures; // 0 = white fallback
   VkPipeline lineDepthPipeline{VK_NULL_HANDLE};
@@ -201,6 +273,9 @@ struct VkRenderer::Impl {
   VkSwapchainKHR swapchain{VK_NULL_HANDLE};
   std::vector<VkImage> swapchainImages;
   std::vector<VkImageView> swapchainViews;
+  std::shared_ptr<void> checkpointIdentity;
+  std::size_t checkpointMeshes{0};
+  std::size_t checkpointTextures{0};
   std::vector<MeshRecord> meshes; // 0 = built-in cube
   struct HandSlot {
     MeshHandle handle{kInvalidMesh};
@@ -291,7 +366,11 @@ struct VkRenderer::Impl {
     bufferInfo.size = size;
     bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(device, &bufferInfo, nullptr, &buffer));
+    VkResult createResult = vkCreateBuffer(device, &bufferInfo, nullptr, &buffer);
+    if (createResult != VK_SUCCESS) {
+      buffer = VK_NULL_HANDLE; // output is undefined on failure
+      return checked(createResult, "vkCreateBuffer");
+    }
     Requirements reqs = bufferRequirements(buffer);
     VkMemoryRequirements requirements = reqs.memory;
     std::uint32_t memoryType = findMemoryType(requirements.memoryTypeBits, memFlags);
@@ -314,9 +393,10 @@ struct VkRenderer::Impl {
     }
     VkResult allocResult = vkAllocateMemory(device, &allocInfo, nullptr, &memory);
     if (allocResult != VK_SUCCESS) {
+      memory = VK_NULL_HANDLE; // output is undefined on failure
       vkDestroyBuffer(device, buffer, nullptr);
       buffer = VK_NULL_HANDLE;
-      return checkVk(allocResult, "vkAllocateMemory");
+      return checked(allocResult, "vkAllocateMemory");
     }
     VkResult bindResult = vkBindBufferMemory(device, buffer, memory, 0);
     if (bindResult != VK_SUCCESS) {
@@ -324,16 +404,17 @@ struct VkRenderer::Impl {
       memory = VK_NULL_HANDLE;
       vkDestroyBuffer(device, buffer, nullptr);
       buffer = VK_NULL_HANDLE;
-      return checkVk(bindResult, "vkBindBufferMemory");
+      return checked(bindResult, "vkBindBufferMemory");
     }
     if (mapped != nullptr) {
       VkResult mapResult = vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, mapped);
       if (mapResult != VK_SUCCESS) {
-        vkFreeMemory(device, memory, nullptr);
-        memory = VK_NULL_HANDLE;
+        *mapped = nullptr; // output is undefined on failure
         vkDestroyBuffer(device, buffer, nullptr);
         buffer = VK_NULL_HANDLE;
-        return checkVk(mapResult, "vkMapMemory");
+        vkFreeMemory(device, memory, nullptr);
+        memory = VK_NULL_HANDLE;
+        return checked(mapResult, "vkMapMemory");
       }
     }
     return true;
@@ -356,7 +437,7 @@ struct VkRenderer::Impl {
     imageInfo.usage = usage;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(device, &imageInfo, nullptr, &image));
+    if (!checked(vkCreateImage(device, &imageInfo, nullptr, &image), "vkCreateImage")) { return false; }
     VkMemoryRequirements requirements{};
     vkGetImageMemoryRequirements(device, image, &requirements);
     std::uint32_t memoryType =
@@ -368,8 +449,8 @@ struct VkRenderer::Impl {
         vkStruct<VkMemoryAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
     allocInfo.allocationSize = requirements.size;
     allocInfo.memoryTypeIndex = memoryType;
-    VK_CHECK(vkAllocateMemory(device, &allocInfo, nullptr, &memory));
-    VK_CHECK(vkBindImageMemory(device, image, memory, 0));
+    if (!checked(vkAllocateMemory(device, &allocInfo, nullptr, &memory), "vkAllocateMemory")) { return false; }
+    if (!checked(vkBindImageMemory(device, image, memory, 0), "vkBindImageMemory")) { return false; }
     VkImageViewCreateInfo viewInfo =
         vkStruct<VkImageViewCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
     viewInfo.image = image;
@@ -378,7 +459,7 @@ struct VkRenderer::Impl {
     viewInfo.subresourceRange.aspectMask = aspect;
     viewInfo.subresourceRange.levelCount = 1;
     viewInfo.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, &view));
+    if (!checked(vkCreateImageView(device, &viewInfo, nullptr, &view), "vkCreateImageView")) { return false; }
     return true;
   }
 
@@ -479,14 +560,14 @@ struct VkRenderer::Impl {
     createInfo.clipped = VK_TRUE;
     createInfo.oldSwapchain = swapchain;
     VkSwapchainKHR newSwapchain = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateSwapchainKHR(device, &createInfo, nullptr, &newSwapchain));
+    if (!checked(vkCreateSwapchainKHR(device, &createInfo, nullptr, &newSwapchain), "vkCreateSwapchainKHR")) { return false; }
     destroySwapchain();
     swapchain = newSwapchain;
 
     std::uint32_t actualCount = 0;
-    VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &actualCount, nullptr));
+    if (!checked(vkGetSwapchainImagesKHR(device, swapchain, &actualCount, nullptr), "vkGetSwapchainImagesKHR")) { return false; }
     swapchainImages.resize(actualCount);
-    VK_CHECK(vkGetSwapchainImagesKHR(device, swapchain, &actualCount, swapchainImages.data()));
+    if (!checked(vkGetSwapchainImagesKHR(device, swapchain, &actualCount, swapchainImages.data()), "vkGetSwapchainImagesKHR")) { return false; }
     swapchainViews.resize(actualCount);
     for (std::uint32_t i = 0; i < actualCount; ++i) {
       VkImageViewCreateInfo viewInfo =
@@ -497,7 +578,7 @@ struct VkRenderer::Impl {
       viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       viewInfo.subresourceRange.levelCount = 1;
       viewInfo.subresourceRange.layerCount = 1;
-      if (vkCreateImageView(device, &viewInfo, nullptr, &swapchainViews[i]) != VK_SUCCESS) {
+      if (!checked(vkCreateImageView(device, &viewInfo, nullptr, &swapchainViews[i]), "swapchain view")) {
         // A half-filled view array must never reach draw(): retire the whole
         // swapchain so the next frame fails cleanly instead of crashing.
         std::printf("[vk] swapchain view creation failed\n");
@@ -633,7 +714,7 @@ struct VkRenderer::Impl {
     createInfo.pColorBlendState = &blend;
     createInfo.pDynamicState = &dynamic;
     createInfo.layout = pipelineLayout;
-    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &createInfo, nullptr, &pipeline));
+    if (!checked(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &createInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines")) { return false; }
     return true;
   }
 
@@ -652,7 +733,7 @@ struct VkRenderer::Impl {
     VkCommandBufferBeginInfo beginInfo =
         vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(command, &beginInfo));
+    if (!checked(vkBeginCommandBuffer(command, &beginInfo), "frame begin")) { return false; }
 
     VkImageMemoryBarrier2 colourBarrier =
         vkStruct<VkImageMemoryBarrier2>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2);
@@ -1086,7 +1167,7 @@ struct VkRenderer::Impl {
                              readbackBuffer, 1, &copy);
     }
 
-    if (!checkVk(vkEndCommandBuffer(command), "vkEndCommandBuffer")) {
+    if (!checked(vkEndCommandBuffer(command), "vkEndCommandBuffer")) {
       // The recorded copies may never execute: the slot state must not claim
       // sorted contents a later deadband reuse could bind (see the submit).
       for (BlendScratch& slot : blendScratch) {
@@ -1108,7 +1189,7 @@ struct VkRenderer::Impl {
     submit.pCommandBuffers = &command;
     // Reset immediately before submit: any earlier failure leaves the fence
     // signalled, so a failed or skipped frame can never deadlock the next one.
-    if (!checkVk(vkResetFences(device, 1, &fence), "vkResetFences")) {
+    if (!checked(vkResetFences(device, 1, &fence), "vkResetFences")) {
       for (BlendScratch& slot : blendScratch) {
         slot.hasSort = false;
       }
@@ -1116,13 +1197,19 @@ struct VkRenderer::Impl {
     }
     VkResult submitResult = vkQueueSubmit(queue, 1, &submit, fence);
     if (submitResult != VK_SUCCESS) {
+      if (submitResult == VK_ERROR_DEVICE_LOST) {
+        fatal = true;
+        return checkVk(submitResult, "vkQueueSubmit");
+      }
       // A failed submit leaves the fence unsignalled forever: recreate it
       // signalled so the next frame's wait cannot deadlock.
       vkDestroyFence(device, fence, nullptr);
       VkFenceCreateInfo freshInfo = vkStruct<VkFenceCreateInfo>(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
       freshInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
       fence = VK_NULL_HANDLE;
-      vkCreateFence(device, &freshInfo, nullptr, &fence);
+      if (!checked(vkCreateFence(device, &freshInfo, nullptr, &fence), "recreate fence")) {
+        fatal = true;
+      }
       // The copies may not have executed: never leave slots claiming sorted
       // contents — a later deadband reuse would bind stale indices.
       for (BlendScratch& slot : blendScratch) {
@@ -1372,6 +1459,7 @@ bool VkRenderer::init(Config const& config) {
       return false;
     }
   }
+  g.ready = true;
   std::printf("[vk] device: %s (%s)\n", g.deviceName, g.windowed ? "windowed" : "offscreen");
   return true;
 }
@@ -1548,7 +1636,14 @@ void VkRenderer::shutdown() {
   if (g.device == VK_NULL_HANDLE) {
     return;
   }
-  vkDeviceWaitIdle(g.device);
+  VkResult idle = vkDeviceWaitIdle(g.device);
+  if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) {
+    std::fprintf(stderr, "[vk] fatal: shutdown cannot establish GPU idle (%d)\n",
+                 static_cast<int>(idle));
+    std::abort();
+  }
+  g.ready = false;
+  g.checkpointIdentity.reset();
   g.flushFrees();
   for (Impl::BlendScratch& slot : g.blendScratch) {
     if (slot.indexBuffer != VK_NULL_HANDLE) {
@@ -1673,11 +1768,14 @@ void VkRenderer::shutdown() {
 
 MeshHandle VkRenderer::addMesh(MeshData const& data, bool dynamic, bool trackTriangleSums) {
   Impl& g = *impl_;
-  if (g.device == VK_NULL_HANDLE || data.vertices.empty() || data.indices.empty() ||
-      data.indices.size() > UINT32_MAX || data.vertices.size() > UINT32_MAX) {
+  if (g.device == VK_NULL_HANDLE || g.fatal || data.vertices.empty() || data.indices.empty() ||
+      data.indices.size() > UINT32_MAX || data.vertices.size() > UINT32_MAX ||
+      g.meshes.size() >= kInvalidMesh) {
     return kInvalidMesh;
   }
-  vkDeviceWaitIdle(g.device); // buffers may be rewritten between frames
+  if (!g.deviceWait("mesh registration device wait")) {
+    return kInvalidMesh;
+  }
 
   Impl::MeshRecord record{};
   // CPU-side data for the per-view blend sort, built first so a mesh with
@@ -1727,6 +1825,14 @@ MeshHandle VkRenderer::addMesh(MeshData const& data, bool dynamic, bool trackTri
   VkBuffer stagingBuffer = VK_NULL_HANDLE;
   VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
   void* stagingMapped = nullptr;
+  auto stagingCleanup = ScopeExit([&]() {
+    if (stagingMapped != nullptr) {
+      vkUnmapMemory(g.device, stagingMemory);
+    }
+    vkDestroyBuffer(g.device, stagingBuffer, nullptr);
+    vkFreeMemory(g.device, stagingMemory, nullptr);
+  });
+  auto recordCleanup = ScopeExit([&]() { g.destroyMesh(record); });
   bool ok = g.createBuffer(vertexBytes + indexBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                            stagingBuffer, stagingMemory, &stagingMapped);
@@ -1741,25 +1847,6 @@ MeshHandle VkRenderer::addMesh(MeshData const& data, bool dynamic, bool trackTri
                         record.indexMemory, nullptr);
   }
   if (!ok) {
-    // createBuffer cleans its own outputs; drop anything created here.
-    if (stagingBuffer != VK_NULL_HANDLE) {
-      vkDestroyBuffer(g.device, stagingBuffer, nullptr);
-    }
-    if (stagingMemory != VK_NULL_HANDLE) {
-      vkFreeMemory(g.device, stagingMemory, nullptr);
-    }
-    if (record.vertexBuffer != VK_NULL_HANDLE) {
-      vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
-    }
-    if (record.vertexMemory != VK_NULL_HANDLE) {
-      vkFreeMemory(g.device, record.vertexMemory, nullptr);
-    }
-    if (record.indexBuffer != VK_NULL_HANDLE) {
-      vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
-    }
-    if (record.indexMemory != VK_NULL_HANDLE) {
-      vkFreeMemory(g.device, record.indexMemory, nullptr);
-    }
     return kInvalidMesh;
   }
   // Dynamic meshes keep a dedicated host-visible staging slot for their whole
@@ -1772,12 +1859,6 @@ MeshHandle VkRenderer::addMesh(MeshData const& data, bool dynamic, bool trackTri
                         record.updateStaging, record.updateStagingMemory,
                         &record.updateStagingMapped);
     if (!ok) {
-      vkDestroyBuffer(g.device, stagingBuffer, nullptr);
-      vkFreeMemory(g.device, stagingMemory, nullptr);
-      vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
-      vkFreeMemory(g.device, record.vertexMemory, nullptr);
-      vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
-      vkFreeMemory(g.device, record.indexMemory, nullptr);
       return kInvalidMesh;
     }
   }
@@ -1791,23 +1872,8 @@ MeshHandle VkRenderer::addMesh(MeshData const& data, bool dynamic, bool trackTri
   beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   VkBufferCopy vertexCopy{0, 0, vertexBytes};
   VkBufferCopy indexCopy{vertexBytes, 0, indexBytes};
-  if (vkBeginCommandBuffer(g.command, &beginInfo) != VK_SUCCESS) {
+  if (!g.checked(vkBeginCommandBuffer(g.command, &beginInfo), "upload begin")) {
     std::printf("[vk] mesh upload begin failed\n");
-    vkDestroyBuffer(g.device, stagingBuffer, nullptr);
-    vkFreeMemory(g.device, stagingMemory, nullptr);
-    vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
-    vkFreeMemory(g.device, record.vertexMemory, nullptr);
-    vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
-    vkFreeMemory(g.device, record.indexMemory, nullptr);
-    if (record.updateStagingMapped != nullptr) {
-      vkUnmapMemory(g.device, record.updateStagingMemory);
-    }
-    if (record.updateStaging != VK_NULL_HANDLE) {
-      vkDestroyBuffer(g.device, record.updateStaging, nullptr);
-    }
-    if (record.updateStagingMemory != VK_NULL_HANDLE) {
-      vkFreeMemory(g.device, record.updateStagingMemory, nullptr);
-    }
     return kInvalidMesh;
   }
   vkCmdCopyBuffer(g.command, stagingBuffer, record.vertexBuffer, 1, &vertexCopy);
@@ -1826,60 +1892,27 @@ MeshHandle VkRenderer::addMesh(MeshData const& data, bool dynamic, bool trackTri
   dependency.memoryBarrierCount = 1;
   dependency.pMemoryBarriers = &toVertex;
   vkCmdPipelineBarrier2(g.command, &dependency);
-  if (vkEndCommandBuffer(g.command) != VK_SUCCESS) {
+  if (!g.checked(vkEndCommandBuffer(g.command), "upload end")) {
     std::printf("[vk] mesh upload end failed\n");
-    vkDestroyBuffer(g.device, stagingBuffer, nullptr);
-    vkFreeMemory(g.device, stagingMemory, nullptr);
-    vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
-    vkFreeMemory(g.device, record.vertexMemory, nullptr);
-    vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
-    vkFreeMemory(g.device, record.indexMemory, nullptr);
-    if (record.updateStagingMapped != nullptr) {
-      vkUnmapMemory(g.device, record.updateStagingMemory);
-    }
-    if (record.updateStaging != VK_NULL_HANDLE) {
-      vkDestroyBuffer(g.device, record.updateStaging, nullptr);
-    }
-    if (record.updateStagingMemory != VK_NULL_HANDLE) {
-      vkFreeMemory(g.device, record.updateStagingMemory, nullptr);
-    }
     return kInvalidMesh;
   }
   VkSubmitInfo submitInfo = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
   submitInfo.commandBufferCount = 1;
   submitInfo.pCommandBuffers = &g.command;
-  VkResult submitResult = vkQueueSubmit(g.queue, 1, &submitInfo, VK_NULL_HANDLE);
-  VkResult waitResult = vkQueueWaitIdle(g.queue);
-  vkDestroyBuffer(g.device, stagingBuffer, nullptr);
-  vkFreeMemory(g.device, stagingMemory, nullptr);
-  if (submitResult != VK_SUCCESS || waitResult != VK_SUCCESS) {
-    std::printf("[vk] mesh upload submit failed (submit=%d wait=%d)\n",
-                static_cast<int>(submitResult), static_cast<int>(waitResult));
-    vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
-    vkFreeMemory(g.device, record.vertexMemory, nullptr);
-    vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
-    vkFreeMemory(g.device, record.indexMemory, nullptr);
-    if (record.updateStagingMapped != nullptr) {
-      vkUnmapMemory(g.device, record.updateStagingMemory);
-    }
-    if (record.updateStaging != VK_NULL_HANDLE) {
-      vkDestroyBuffer(g.device, record.updateStaging, nullptr);
-    }
-    if (record.updateStagingMemory != VK_NULL_HANDLE) {
-      vkFreeMemory(g.device, record.updateStagingMemory, nullptr);
-    }
+  if (!g.submitUpload(submitInfo, "mesh upload failed")) {
     return kInvalidMesh;
   }
 
   record.indexCount = static_cast<std::uint32_t>(data.indices.size());
   g.meshes.push_back(std::move(record));
+  recordCleanup.release();
   return static_cast<MeshHandle>(g.meshes.size() - 1U);
 }
 
 bool VkRenderer::updateMeshVertices(MeshHandle handle, std::vector<MeshVertex> const& vertices,
                                     Vec3 const* boundsCentre) {
   Impl& g = *impl_;
-  if (g.device == VK_NULL_HANDLE || handle == kInvalidMesh || handle >= g.meshes.size()) {
+  if (g.device == VK_NULL_HANDLE || g.fatal || handle == kInvalidMesh || handle >= g.meshes.size()) {
     return false;
   }
   Impl::MeshRecord& record = g.meshes[handle];
@@ -1914,23 +1947,30 @@ bool VkRenderer::updateMeshVertices(MeshHandle handle, std::vector<MeshVertex> c
   if (!std::isfinite(centre.x) || !std::isfinite(centre.y) || !std::isfinite(centre.z)) {
     return false;
   }
-  // The blend item-order key must follow the moving surface, or a skinned
-  // character sorts against its bind pose.
-  record.boundsCentre = centre;
+  if (record.trackTriangleSums) {
+    for (std::uint32_t index : record.indices) {
+      if (index >= vertices.size()) { return false; }
+    }
+  }
+  // Reserve before modifying any state; later fixed-size copies cannot throw.
+  // Reuse the allocation for subsequent poses rather than allocating per frame.
+  static_assert(std::is_nothrow_default_constructible_v<MeshVertex> &&
+                std::is_nothrow_copy_assignable_v<MeshVertex> &&
+                std::is_nothrow_move_constructible_v<MeshVertex>);
+  record.pendingVertices.reserve(vertices.size());
+  record.pendingVertices.resize(vertices.size());
+  std::copy(vertices.begin(), vertices.end(), record.pendingVertices.begin());
   if (record.trackTriangleSums) {
     for (std::size_t t = 0; t < record.triPosSums.size(); ++t) {
       Vec3 sum{0.0F, 0.0F, 0.0F};
       for (std::size_t k = 0; k < 3U; ++k) {
         std::uint32_t const index = record.indices[3U * t + k];
-        if (index >= vertices.size()) {
-          return false;
-        }
         sum = sum + vertices[index].pos;
       }
       record.triPosSums[t] = sum;
     }
   }
-  record.pendingVertices = vertices;
+  record.boundsCentre = centre;
   record.updatePending = true;
   // The per-triangle depth order of a blended skinned mesh changes when its
   // vertices move; the view/model-keyed reuse cache must not keep the old
@@ -1945,7 +1985,7 @@ bool VkRenderer::updateMeshVertices(MeshHandle handle, std::vector<MeshVertex> c
 
 MeshHandle VkRenderer::updateHandMesh(std::size_t slot, MeshData const& data) {
   Impl& g = *impl_;
-  if (g.device == VK_NULL_HANDLE || g.fence == VK_NULL_HANDLE || slot >= kHandMeshSlots ||
+  if (g.device == VK_NULL_HANDLE || g.fatal || g.fence == VK_NULL_HANDLE || slot >= kHandMeshSlots ||
       data.vertices.size() > kHandMeshMaxVertices || data.indices.size() > kHandMeshMaxIndices ||
       data.indices.size() % 3U != 0U || data.vertices.empty() != data.indices.empty()) {
     return kInvalidMesh;
@@ -1955,7 +1995,7 @@ MeshHandle VkRenderer::updateHandMesh(std::size_t slot, MeshData const& data) {
       return kInvalidMesh;
     }
   }
-  if (!checkVk(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX),
+  if (!g.checked(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX),
                "hand mesh fence wait")) {
     return kInvalidMesh;
   }
@@ -1968,6 +2008,15 @@ MeshHandle VkRenderer::updateHandMesh(std::size_t slot, MeshData const& data) {
     constexpr VkDeviceSize vertexCapacity = sizeof(MeshVertex) * kHandMeshMaxVertices;
     constexpr VkDeviceSize indexCapacity = sizeof(std::uint32_t) * kHandMeshMaxIndices;
     Impl::MeshRecord record{};
+    auto cleanup = ScopeExit([&]() {
+      if (hand.mapped != nullptr) {
+        vkUnmapMemory(g.device, hand.memory);
+      }
+      vkDestroyBuffer(g.device, hand.staging, nullptr);
+      vkFreeMemory(g.device, hand.memory, nullptr);
+      hand = {};
+      g.destroyMesh(record);
+    });
     bool ok = g.createBuffer(vertexCapacity + indexCapacity, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                              hand.staging, hand.memory, &hand.mapped);
@@ -1982,32 +2031,12 @@ MeshHandle VkRenderer::updateHandMesh(std::size_t slot, MeshData const& data) {
                           record.indexMemory, nullptr);
     }
     if (!ok) {
-      if (hand.mapped != nullptr) {
-        vkUnmapMemory(g.device, hand.memory);
-      }
-      if (hand.staging != VK_NULL_HANDLE) {
-        vkDestroyBuffer(g.device, hand.staging, nullptr);
-      }
-      if (hand.memory != VK_NULL_HANDLE) {
-        vkFreeMemory(g.device, hand.memory, nullptr);
-      }
-      if (record.vertexBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(g.device, record.vertexBuffer, nullptr);
-      }
-      if (record.vertexMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(g.device, record.vertexMemory, nullptr);
-      }
-      if (record.indexBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(g.device, record.indexBuffer, nullptr);
-      }
-      if (record.indexMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(g.device, record.indexMemory, nullptr);
-      }
-      hand = {};
       return kInvalidMesh;
     }
-    hand.handle = static_cast<MeshHandle>(g.meshes.size());
+    auto const handle = static_cast<MeshHandle>(g.meshes.size());
     g.meshes.push_back(std::move(record));
+    hand.handle = handle;
+    cleanup.release();
   }
 
   hand.vertexBytes = sizeof(MeshVertex) * data.vertices.size();
@@ -2033,12 +2062,15 @@ static bool needsUploadFit(Image const& image, std::uint32_t maxDim) {
 
 TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repeatV) {
   Impl& g = *impl_;
-  if (g.device == VK_NULL_HANDLE || image.width == 0U || image.height == 0U ||
+  if (g.device == VK_NULL_HANDLE || g.fatal || image.width == 0U || image.height == 0U ||
+      static_cast<std::size_t>(image.width) > SIZE_MAX / 4U / image.height ||
       image.rgba.size() != static_cast<std::size_t>(image.width) * image.height * 4U ||
       g.textures.size() >= Impl::kMaxTextures) {
     return kInvalidTexture;
   }
-  vkDeviceWaitIdle(g.device);
+  if (!g.deviceWait("texture registration device wait")) {
+    return kInvalidTexture;
+  }
 
   // Full mip chain: large textures would otherwise lose their detail to
   // minification (sampling a few texels of an 8K skin map looks smooth).
@@ -2059,17 +2091,17 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   std::uint32_t const mipLevels = static_cast<std::uint32_t>(levels.size() + 1U);
   // VRAM accounting ("we run out of memory after a few models"): every
   // upload reports its footprint and the running total.
-  {
-    std::size_t bytes = static_cast<std::size_t>(source->width) * source->height * 4U;
-    for (Image const& level : levels) {
-      bytes += static_cast<std::size_t>(level.width) * level.height * 4U;
-    }
-    g.textureBytes += bytes;
-    std::printf("[vk] texture VRAM: +%zu MB, total %zu MB\n", bytes / (1024U * 1024U),
-                g.textureBytes / (1024U * 1024U));
-  }
-
   Impl::TextureRecord record{};
+  auto recordCleanup = ScopeExit([&]() {
+    vkDestroySampler(g.device, record.sampler, nullptr);
+    vkDestroyImageView(g.device, record.view, nullptr);
+    vkDestroyImage(g.device, record.image, nullptr);
+    vkFreeMemory(g.device, record.memory, nullptr);
+  });
+  record.bytes = static_cast<std::size_t>(source->width) * source->height * 4U;
+  for (Image const& level : levels) {
+    record.bytes += static_cast<std::size_t>(level.width) * level.height * 4U;
+  }
   VkImageCreateInfo imageInfo = vkStruct<VkImageCreateInfo>(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
   imageInfo.imageType = VK_IMAGE_TYPE_2D;
   imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -2081,7 +2113,8 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (vkCreateImage(g.device, &imageInfo, nullptr, &record.image) != VK_SUCCESS) {
+  if (!g.checked(vkCreateImage(g.device, &imageInfo, nullptr, &record.image), "vkCreateImage")) {
+    record.image = VK_NULL_HANDLE; // output is undefined on failure
     std::printf("[vk] texture image creation failed\n");
     return kInvalidTexture;
   }
@@ -2101,14 +2134,17 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   if (reqs.dedicated || requirements.size >= (64ULL << 20)) {
     allocInfo.pNext = &dedicatedInfo; // big resources never share a slab
   }
-  if (memoryType == UINT32_MAX ||
-      vkAllocateMemory(g.device, &allocInfo, nullptr, &record.memory) != VK_SUCCESS ||
-      vkBindImageMemory(g.device, record.image, record.memory, 0) != VK_SUCCESS) {
+  if (memoryType == UINT32_MAX) {
+    std::printf("[vk] no suitable texture memory type\n");
+    return kInvalidTexture;
+  }
+  if (!g.checked(vkAllocateMemory(g.device, &allocInfo, nullptr, &record.memory), "vkAllocateMemory")) {
+    record.memory = VK_NULL_HANDLE; // output is undefined on failure
     std::printf("[vk] texture memory allocation failed\n");
-    vkDestroyImage(g.device, record.image, nullptr);
-    if (record.memory != VK_NULL_HANDLE) {
-      vkFreeMemory(g.device, record.memory, nullptr);
-    }
+    return kInvalidTexture;
+  }
+  if (!g.checked(vkBindImageMemory(g.device, record.image, record.memory, 0), "vkBindImageMemory")) {
+    std::printf("[vk] texture memory binding failed\n");
     return kInvalidTexture;
   }
 
@@ -2120,10 +2156,9 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   viewInfo.subresourceRange.levelCount = mipLevels;
   viewInfo.subresourceRange.layerCount = 1;
-  if (vkCreateImageView(g.device, &viewInfo, nullptr, &record.view) != VK_SUCCESS) {
+  if (!g.checked(vkCreateImageView(g.device, &viewInfo, nullptr, &record.view), "vkCreateImageView")) {
+    record.view = VK_NULL_HANDLE; // output is undefined on failure
     std::printf("[vk] texture view creation failed\n");
-    vkDestroyImage(g.device, record.image, nullptr);
-    vkFreeMemory(g.device, record.memory, nullptr);
     return kInvalidTexture;
   }
 
@@ -2138,11 +2173,9 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
                                      : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samplerInfo.maxLod = static_cast<float>(mipLevels);
-  if (vkCreateSampler(g.device, &samplerInfo, nullptr, &record.sampler) != VK_SUCCESS) {
+  if (!g.checked(vkCreateSampler(g.device, &samplerInfo, nullptr, &record.sampler), "vkCreateSampler")) {
+    record.sampler = VK_NULL_HANDLE; // output is undefined on failure
     std::printf("[vk] texture sampler creation failed\n");
-    vkDestroyImageView(g.device, record.view, nullptr);
-    vkDestroyImage(g.device, record.image, nullptr);
-    vkFreeMemory(g.device, record.memory, nullptr);
     return kInvalidTexture;
   }
 
@@ -2158,28 +2191,19 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   VkBuffer stagingBuffer = VK_NULL_HANDLE;
   VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
   void* stagingMapped = nullptr;
+  auto stagingCleanup = ScopeExit([&]() {
+    if (stagingMapped != nullptr) {
+      vkUnmapMemory(g.device, stagingMemory);
+    }
+    vkDestroyBuffer(g.device, stagingBuffer, nullptr);
+    vkFreeMemory(g.device, stagingMemory, nullptr);
+  });
   if (!g.createBuffer(kWindowBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       stagingBuffer, stagingMemory, &stagingMapped)) {
-    vkDestroySampler(g.device, record.sampler, nullptr);
-    vkDestroyImageView(g.device, record.view, nullptr);
-    vkDestroyImage(g.device, record.image, nullptr);
-    vkFreeMemory(g.device, record.memory, nullptr);
     return kInvalidTexture;
   }
   auto* window = static_cast<std::uint8_t*>(stagingMapped);
-
-  // Failure cleanup: staging plus the record's Vulkan objects. Without this,
-  // a failed upload would both leak and masquerade as texture 0.
-  auto cleanup = [&]() {
-    vkDestroyBuffer(g.device, stagingBuffer, nullptr);
-    vkFreeMemory(g.device, stagingMemory, nullptr);
-    vkDestroySampler(g.device, record.sampler, nullptr);
-    vkDestroyImageView(g.device, record.view, nullptr);
-    vkDestroyImage(g.device, record.image, nullptr);
-    vkFreeMemory(g.device, record.memory, nullptr);
-    return kInvalidTexture;
-  };
 
   VkImageMemoryBarrier2 toTransfer =
       vkStruct<VkImageMemoryBarrier2>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2);
@@ -2210,7 +2234,7 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
     VkCommandBufferBeginInfo beginInfo =
         vkStruct<VkCommandBufferBeginInfo>(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    if (vkBeginCommandBuffer(g.command, &beginInfo) != VK_SUCCESS) {
+    if (!g.checked(vkBeginCommandBuffer(g.command, &beginInfo), "upload begin")) {
       std::printf("[vk] texture upload begin failed\n");
       return false;
     }
@@ -2229,18 +2253,14 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
       dependency.pImageMemoryBarriers = &toSample;
       vkCmdPipelineBarrier2(g.command, &dependency);
     }
-    if (vkEndCommandBuffer(g.command) != VK_SUCCESS) {
+    if (!g.checked(vkEndCommandBuffer(g.command), "upload end")) {
       std::printf("[vk] texture upload end failed\n");
       return false;
     }
     VkSubmitInfo submitInfo = vkStruct<VkSubmitInfo>(VK_STRUCTURE_TYPE_SUBMIT_INFO);
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &g.command;
-    VkResult submitResult = vkQueueSubmit(g.queue, 1, &submitInfo, VK_NULL_HANDLE);
-    VkResult waitResult = vkQueueWaitIdle(g.queue);
-    if (submitResult != VK_SUCCESS || waitResult != VK_SUCCESS) {
-      std::printf("[vk] texture upload submit failed (submit=%d wait=%d)\n",
-                  static_cast<int>(submitResult), static_cast<int>(waitResult));
+    if (!g.submitUpload(submitInfo, "texture upload failed")) {
       return false;
     }
     regions.clear();
@@ -2260,7 +2280,7 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
         VkDeviceSize tileBytes = static_cast<VkDeviceSize>(tileW) * tileH * 4U;
         if (windowUsed + tileBytes > kWindowBytes) {
           if (!submitBatch(false)) {
-            return cleanup();
+            return kInvalidTexture;
           }
         }
         std::uint8_t* tileDst = window + windowUsed;
@@ -2283,12 +2303,13 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
     }
   }
   if (!submitBatch(true)) {
-    return cleanup();
+    return kInvalidTexture;
   }
-  vkDestroyBuffer(g.device, stagingBuffer, nullptr);
-  vkFreeMemory(g.device, stagingMemory, nullptr);
-
   g.textures.push_back(record);
+  recordCleanup.release();
+  g.textureBytes += record.bytes;
+  std::printf("[vk] texture VRAM: +%zu MB, total %zu MB\n", record.bytes / (1024U * 1024U),
+              g.textureBytes / (1024U * 1024U));
   TextureHandle handle = static_cast<TextureHandle>(g.textures.size() - 1U);
 
   VkDescriptorImageInfo descriptorInfo{record.sampler, record.view,
@@ -2304,15 +2325,114 @@ TextureHandle VkRenderer::addTexture(Image const& image, bool repeatU, bool repe
   return handle;
 }
 
+VkRenderer::ResourceCheckpoint VkRenderer::checkpointResources() {
+  ResourceCheckpoint checkpoint;
+  Impl& g = *impl_;
+  if (!g.ready || g.fatal || g.checkpointIdentity) {
+    return checkpoint;
+  }
+  checkpoint.identity_ = std::make_shared<int>(0);
+  g.checkpointIdentity = checkpoint.identity_;
+  g.checkpointMeshes = g.meshes.size();
+  g.checkpointTextures = g.textures.size();
+  return checkpoint;
+}
+
+bool VkRenderer::commitResources(ResourceCheckpoint const& checkpoint) {
+  Impl& g = *impl_;
+  if (!checkpoint.identity_ || checkpoint.identity_ != g.checkpointIdentity ||
+      g.device == VK_NULL_HANDLE || g.fatal) {
+    return false;
+  }
+  g.checkpointIdentity.reset();
+  return true;
+}
+
+bool VkRenderer::rollbackResources(ResourceCheckpoint const& checkpoint) {
+  Impl& g = *impl_;
+  if (!checkpoint.identity_ || checkpoint.identity_ != g.checkpointIdentity ||
+      g.device == VK_NULL_HANDLE || g.fatal) {
+    return false;
+  }
+  if (!g.deviceWait("resource rollback device wait")) {
+    return false;
+  }
+
+  // Replace only removed descriptors before destroying their images.
+  std::size_t const textureCount = g.textures.size() - g.checkpointTextures;
+  if (textureCount != 0U) {
+    std::array<VkDescriptorImageInfo, Impl::kMaxTextures> fallback{};
+    for (std::size_t i = 0; i < textureCount; ++i) {
+      fallback[i] = {g.textures[0].sampler, g.textures[0].view,
+                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    }
+    VkWriteDescriptorSet write = vkStruct<VkWriteDescriptorSet>(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
+    write.dstSet = g.descriptorSet;
+    write.dstBinding = 1;
+    write.dstArrayElement = static_cast<std::uint32_t>(g.checkpointTextures);
+    write.descriptorCount = static_cast<std::uint32_t>(textureCount);
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = fallback.data();
+    vkUpdateDescriptorSets(g.device, 1, &write, 0, nullptr);
+  }
+  for (std::size_t i = g.checkpointTextures; i < g.textures.size(); ++i) {
+    auto& texture = g.textures[i];
+    vkDestroySampler(g.device, texture.sampler, nullptr);
+    vkDestroyImageView(g.device, texture.view, nullptr);
+    vkDestroyImage(g.device, texture.image, nullptr);
+    vkFreeMemory(g.device, texture.memory, nullptr);
+    g.textureBytes -= texture.bytes;
+  }
+  g.textures.resize(g.checkpointTextures);
+
+  for (auto& hand : g.hands) {
+    if (hand.handle != kInvalidMesh && hand.handle >= g.checkpointMeshes) {
+      if (hand.mapped != nullptr) {
+        vkUnmapMemory(g.device, hand.memory);
+      }
+      vkDestroyBuffer(g.device, hand.staging, nullptr);
+      vkFreeMemory(g.device, hand.memory, nullptr);
+      hand = {};
+    }
+  }
+  for (std::size_t i = g.checkpointMeshes; i < g.meshes.size(); ++i) {
+    auto& mesh = g.meshes[i];
+    vkDestroyBuffer(g.device, mesh.vertexBuffer, nullptr);
+    vkFreeMemory(g.device, mesh.vertexMemory, nullptr);
+    vkDestroyBuffer(g.device, mesh.indexBuffer, nullptr);
+    vkFreeMemory(g.device, mesh.indexMemory, nullptr);
+    if (mesh.updateStagingMapped != nullptr) {
+      vkUnmapMemory(g.device, mesh.updateStagingMemory);
+    }
+    if (mesh.updateStaging != VK_NULL_HANDLE) {
+      vkDestroyBuffer(g.device, mesh.updateStaging, nullptr);
+    }
+    if (mesh.updateStagingMemory != VK_NULL_HANDLE) {
+      vkFreeMemory(g.device, mesh.updateStagingMemory, nullptr);
+    }
+  }
+  // Rolled-back handles can be reused for different geometry. Cached sorted
+  // indices for those handles must not be reused for the replacement mesh.
+  for (auto& slot : g.blendScratch) {
+    if (slot.hasSort && slot.lastMesh >= g.checkpointMeshes) {
+      slot.hasSort = false;
+    }
+  }
+  g.meshes.resize(g.checkpointMeshes);
+  g.checkpointIdentity.reset();
+  return true;
+}
+
 bool VkRenderer::resize(std::uint32_t width, std::uint32_t height) {
   Impl& g = *impl_;
+  if (g.fatal) { return false; }
   if (!g.windowed || width == 0U || height == 0U) {
     return true;
   }
   if (width == g.width && height == g.height) {
     return true;
   }
-  vkDeviceWaitIdle(g.device);
+  if (!g.deviceWait("resize device wait")) { return false; }
   // Requested size is a fallback for surfaces that report no fixed extent;
   // createSwapchain() overwrites it with the extent the swapchain really got.
   g.width = width;
@@ -2336,6 +2456,7 @@ bool VkRenderer::draw(Camera const& camera,
                       std::vector<RendererVertex> const& depthLines,
                       std::vector<RendererVertex> const& overlayLines) {
   Impl& g = *impl_;
+  if (g.fatal || !g.ready) { return false; }
   if (g.meshes.empty()) {
     std::printf("[vk] no meshes registered\n");
     return false;
@@ -2345,7 +2466,7 @@ bool VkRenderer::draw(Camera const& camera,
     return false;
   }
 
-  VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
+  if (!g.checked(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX), "fence wait")) { return false; }
   g.flushFrees(); // completed frame: release retired scratch/staging buffers
   if (g.width == 0U || g.height == 0U) {
     return true; // minimised / zero-extent swapchain: nothing to render
@@ -2373,11 +2494,11 @@ bool VkRenderer::draw(Camera const& camera,
     VkResult acquire = vkAcquireNextImageKHR(g.device, g.swapchain, UINT64_MAX, g.imageAvailable,
                                              VK_NULL_HANDLE, &g.swapchainIndex);
     if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
-      vkDeviceWaitIdle(g.device);
+      if (!g.deviceWait("swapchain device wait")) { return false; }
       return g.recreateTargets();
     }
     if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
-      return checkVk(acquire, "vkAcquireNextImageKHR");
+      return g.checked(acquire, "vkAcquireNextImageKHR");
     }
     colourViewUsed = g.swapchainViews[g.swapchainIndex];
   }
@@ -2406,11 +2527,11 @@ bool VkRenderer::draw(Camera const& camera,
     presentInfo.pImageIndices = &g.swapchainIndex;
     VkResult presentResult = vkQueuePresentKHR(g.queue, &presentInfo);
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
-      vkDeviceWaitIdle(g.device);
+      if (!g.deviceWait("swapchain device wait")) { return false; }
       return g.recreateTargets();
     }
     if (presentResult != VK_SUCCESS) {
-      return checkVk(presentResult, "vkQueuePresentKHR");
+      return g.checked(presentResult, "vkQueuePresentKHR");
     }
   }
   return true;
@@ -2434,6 +2555,7 @@ bool VkRenderer::initExternal(Config const& config, VkInstance instance, VkPhysi
   if (!createCommonResources(config.shaderDir, colourFormat)) {
     return false;
   }
+  g.ready = true;
   std::printf("[vk] device: %s (external)\n", g.deviceName);
   return true;
 }
@@ -2444,6 +2566,7 @@ bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const&
                             std::vector<RendererVertex> const& depthLines,
                             std::vector<RendererVertex> const& overlayLines) {
   Impl& g = *impl_;
+  if (g.fatal || !g.ready) { return false; }
   if (g.meshes.empty()) {
     std::printf("[vk] no meshes registered\n");
     return false;
@@ -2453,7 +2576,7 @@ bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const&
     return false;
   }
 
-  VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
+  if (!g.checked(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX), "fence wait")) { return false; }
   g.flushFrees(); // completed frame: release retired scratch/staging buffers
   std::memcpy(g.uniformMapped, viewProj.m, sizeof(float) * 16U);
   float const camPos[4] = {cameraPos.x, cameraPos.y, cameraPos.z, 1.0F};
@@ -2482,21 +2605,30 @@ bool VkRenderer::drawToView(VkImageView target, VkImage targetImage, Mat4 const&
                         Impl::Target::External, view, cameraPos)) {
     return false;
   }
-  // The caller releases the swapchain image only after rendering completes.
-  VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
+  // Do not return the image to XR until the submitted work is retired, even
+  // when the fence wait fails. Device loss also retires Vulkan object use.
+  VkResult wait = vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX);
+  if (wait != VK_SUCCESS) {
+    g.ensureRetired(wait);
+    return g.checked(wait, "fence wait");
+  }
   return true;
 }
 
 bool VkRenderer::readback(std::vector<std::uint8_t>& pixelsOut) {
   Impl& g = *impl_;
-  if (g.windowed || g.readbackMapped == nullptr) {
+  if (g.fatal || !g.ready || g.windowed || g.readbackMapped == nullptr) {
     return false;
   }
-  VK_CHECK(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX));
+  if (!g.checked(vkWaitForFences(g.device, 1, &g.fence, VK_TRUE, UINT64_MAX), "fence wait")) { return false; }
   std::size_t byteCount = static_cast<std::size_t>(g.width) * g.height * 4U;
   pixelsOut.resize(byteCount);
   std::memcpy(pixelsOut.data(), g.readbackMapped, byteCount);
   return true;
+}
+
+bool VkRenderer::hasFatalError() const {
+  return impl_->fatal;
 }
 
 std::uint32_t VkRenderer::width() const {

@@ -55,4 +55,7 @@ fi
   src/scene.cpp src/animation.cpp src/gltf.cpp src/json.cpp src/image.cpp src/skin.cpp tests/test_controller_arm_rig.cpp \
   -lz -o .build/test-controller-arm-rig
 ./.build/test-controller-arm-rig
+"$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
+  tests/test_controller_arm_profile.cpp -o .build/test-controller-arm-profile
+./.build/test-controller-arm-profile
 exec ./.build/test-hand-mesh

@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -19,6 +20,8 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <stdexcept>
 #include <vector>
 #include <array>
 
@@ -1209,6 +1212,14 @@ bool loadModelFile(std::string const& path,
   }
 }
 
+// These fields were added after the controller-arm branch point.
+template<typename Target, typename Source>
+void copyHairOpacityBoost(Target& target, Source const& source) {
+  if constexpr (requires { target.hairOpacityBoost = source.hairOpacityBoost; }) {
+    target.hairOpacityBoost = source.hairOpacityBoost;
+  }
+}
+
 // Controller visuals have no Scene nodes, picking geometry, history or animation.
 struct ControllerArmVisual {
   struct Primitive { std::size_t node; std::size_t mesh; MeshHandle handle; };
@@ -1219,8 +1230,65 @@ struct ControllerArmVisual {
   Vec3 shoulderCentre{};
   ControllerArmState bendState[2]{};
   bool ready{false};
+  bool rollbackFailed{false};
+  bool disabled[2]{};
+  std::chrono::steady_clock::time_point lastSolverDiagnostic[2]{};
+  bool solverDiagnosticLogged[2]{};
+  bool yawValid{false};
+  bool yawFrozen{false};
+  bool yawRecovering{false};
+  float stableYaw{0.0F};
 
-  bool init(VkRenderer& renderer, char const* path) {
+  enum class SmokeFailure { None, AfterMesh, ThrowAfterTexture, SingularMesh };
+  struct SmokeRegistrations { MeshHandle mesh{kInvalidMesh}; TextureHandle texture{kInvalidTexture}; };
+
+  bool init(VkRenderer& renderer, char const* path,
+            SmokeFailure failure = SmokeFailure::None, SmokeRegistrations* registered = nullptr) {
+    if (ready || rollbackFailed || renderer.hasFatalError()) { return false; }
+    try {
+      auto checkpoint = renderer.checkpointResources();
+      if (!checkpoint) {
+        std::printf("[arms] resource checkpoint unavailable\n");
+        return false;
+      }
+      struct Transaction {
+        VkRenderer& renderer;
+        VkRenderer::ResourceCheckpoint checkpoint;
+        bool& failed;
+        bool active{true};
+        ~Transaction() {
+          if (!active) { return; }
+          for (int attempt = 0; attempt < 3; ++attempt) {
+            if (renderer.rollbackResources(checkpoint)) { return; }
+            if (renderer.hasFatalError()) { break; }
+          }
+          failed = true;
+          std::fprintf(stderr, "[arms] resource rollback failed; stopping renderer\n");
+        }
+      } transaction{renderer, checkpoint, rollbackFailed};
+      ControllerArmVisual staged;
+      if (!staged.initResources(renderer, path, failure, registered)) { return false; }
+      if (!renderer.commitResources(checkpoint)) {
+        std::printf("[arms] resource commit failed\n");
+        return false;
+      }
+      transaction.active = false;
+      static_assert(std::is_nothrow_move_assignable_v<ControllerArmVisual>);
+      *this = std::move(staged);
+      std::printf("[arms] loaded opt-in controller rig: %s\n", path);
+      return true;
+    } catch (std::exception const& e) {
+      std::printf("[arms] initialisation failed: %s\n", e.what());
+      return false;
+    } catch (...) {
+      std::printf("[arms] initialisation failed: unknown exception\n");
+      return false;
+    }
+  }
+
+private:
+  bool initResources(VkRenderer& renderer, char const* path, SmokeFailure failure,
+                     SmokeRegistrations* registered) {
     std::string error;
     if (path == nullptr || lowerSuffix(path) != ".glb" || !loadModelFile(path, model, error)) {
       std::printf("[arms] GLB load failed: %s\n", error.empty() ? "expected a GLB path" : error.c_str());
@@ -1264,12 +1332,30 @@ struct ControllerArmVisual {
           !controller_arm_detail::globals(model, locals, static_cast<std::size_t>(node.skinNode), bindWorld, state)) {
         std::printf("[arms] invalid skinned mesh\n"); return false;
       }
+      Mat4 meshWorld = bindWorld[static_cast<std::size_t>(node.skinNode)];
+      if (failure == SmokeFailure::SingularMesh) { meshWorld = trs({}, {}, {0, 1, 1}); }
+      std::vector<Mat4> matrices;
+      MeshData deformed;
+      Aabb bounds{};
+      if (!computeSkinMatrices(model.skins[pose[side].skin], meshWorld, pose[side].jointWorlds, matrices) ||
+          !deformSkinnedMesh(mesh.data, mesh.skinWeights, matrices, deformed, &bounds)) {
+        std::printf("[arms] invalid mesh transform or deformation\n"); return false;
+      }
       auto handle = renderer.addMesh(mesh.data, true, mesh.alpha == AlphaMode::Blend);
       if (handle == kInvalidMesh) { std::printf("[arms] mesh registration failed\n"); return false; }
+      if (registered != nullptr && registered->mesh == kInvalidMesh) { registered->mesh = handle; }
+      if (failure == SmokeFailure::AfterMesh) { return false; }
       primitives[side].push_back({n, static_cast<std::size_t>(node.mesh), handle});
     }
     if (primitives[0].empty() || primitives[1].empty()) {
       std::printf("[arms] compatible meshes for both hands are required\n"); return false;
+    }
+    if (failure == SmokeFailure::ThrowAfterTexture) {
+      Image image{1, 1, {255, 255, 255, 255}};
+      auto const handle = renderer.addTexture(image, true, true);
+      if (handle == kInvalidTexture) { return false; }
+      if (registered != nullptr) { registered->texture = handle; }
+      throw std::runtime_error("injected texture registration failure");
     }
     textures.resize(model.textures.size());
     for (std::size_t t = 0; t < model.textures.size(); ++t) {
@@ -1277,31 +1363,88 @@ struct ControllerArmVisual {
       if (texture.image.width && texture.image.height) {
         textures[t] = renderer.addTexture(texture.image, texture.repeatU, texture.repeatV);
         if (textures[t] == kInvalidTexture) { std::printf("[arms] texture registration failed\n"); return false; }
+        if (registered != nullptr && registered->texture == kInvalidTexture) { registered->texture = textures[t]; }
       }
     }
     ready = true;
-    std::printf("[arms] loaded opt-in controller rig: %s\n", path);
     return true;
   }
 
+public:
   // Shoulder centre 20 cm below the head; yaw only. The bind asset faces +Z,
   // so turn it around to face OpenXR forward (-Z).
-  Transform placement(Vec3 head, Vec3 forward) const {
-    Vec3 horizontal{forward.x, 0.0F, forward.z};
-    if (length(horizontal) < 1e-5F) { horizontal = {0, 0, -1}; }
-    float const yaw = std::atan2(-horizontal.x, -horizontal.z);
+  Transform placement(Vec3 head, Vec3 forward, float dt) {
+    Vec3 const horizontal{forward.x, 0.0F, forward.z};
+    float const forwardLength = length(forward);
+    float const magnitude = forwardLength > 1e-5F ? length(horizontal) / forwardLength : 0.0F;
+    if (std::isfinite(magnitude)) {
+      if (!yawValid && magnitude < 0.10F) { yawValid = true; }
+      if (yawFrozen ? magnitude > 0.20F : magnitude < 0.10F) {
+        yawFrozen = !yawFrozen;
+        if (yawFrozen) { yawRecovering = true; }
+      }
+      if (!yawFrozen && magnitude > 1e-5F) {
+        float const target = std::atan2(-horizontal.x, -horizontal.z);
+        if (!yawValid) { stableYaw = target; yawValid = true; }
+        else if (yawRecovering) {
+          float const delta = std::atan2(std::sin(target - stableYaw), std::cos(target - stableYaw));
+          float const step = 2.0F * std::clamp(std::isfinite(dt) ? dt : 0.0F, 0.0F, 0.05F);
+          stableYaw += std::clamp(delta, -step, step);
+          if (std::fabs(delta) <= step) { yawRecovering = false; }
+        } else { stableYaw = target; }
+      }
+    }
+    float const yaw = stableYaw;
     Transform result;
     result.rotation = quatFromAxisAngle({0, 1, 0}, yaw + 3.14159265358979323846F);
     result.translation = head + Vec3{0, -0.20F, 0} - rotate(result.rotation, shoulderCentre);
     return result;
   }
 
+  bool appendSafe(VkRenderer& renderer, int side, ControllerArmInput const& input,
+                  std::vector<DrawItem>& items, bool injectException = false) {
+    if (side < 0 || side > 1 || disabled[side]) { return false; }
+    std::size_t const before = items.size();
+    try {
+      if (injectException) { throw std::runtime_error("injected frame failure"); }
+      auto const result = appendDetailed(renderer, side, input, items);
+      if (result == AppendResult::Success) { return true; }
+      if (result == AppendResult::SolverFailure) {
+        items.resize(before);
+        bendState[side] = {};
+        auto const now = std::chrono::steady_clock::now();
+        if (!solverDiagnosticLogged[side] || now - lastSolverDiagnostic[side] >= std::chrono::seconds(5)) {
+          std::fprintf(stderr, "[arms] %s solver failed; hiding and retrying\n", side == 0 ? "left" : "right");
+          lastSolverDiagnostic[side] = now;
+          solverDiagnosticLogged[side] = true;
+        }
+        return false;
+      }
+      std::fprintf(stderr, "[arms] %s visual failed; disabled\n", side == 0 ? "left" : "right");
+    } catch (std::exception const& e) {
+      std::fprintf(stderr, "[arms] %s visual exception: %s; disabled\n", side == 0 ? "left" : "right", e.what());
+    } catch (...) {
+      std::fprintf(stderr, "[arms] %s visual unknown exception; disabled\n", side == 0 ? "left" : "right");
+    }
+    items.resize(before);
+    disabled[side] = true;
+    bendState[side] = {};
+    return false;
+  }
+
+  enum class AppendResult { Success, SolverFailure, VisualFailure };
+
   bool append(VkRenderer& renderer, int side, ControllerArmInput const& input,
               std::vector<DrawItem>& items) {
-    if (!ready || side < 0 || side > 1) { return false; }
+    return appendDetailed(renderer, side, input, items) == AppendResult::Success;
+  }
+
+  AppendResult appendDetailed(VkRenderer& renderer, int side, ControllerArmInput const& input,
+                              std::vector<DrawItem>& items) {
+    if (!ready || side < 0 || side > 1) { return AppendResult::VisualFailure; }
     ControllerArmPose pose;
     auto nextState = bendState[side];
-    if (!solveControllerArm(model, input, pose, &nextState)) { return false; }
+    if (!solveControllerArm(model, input, pose, &nextState)) { return AppendResult::SolverFailure; }
     std::vector<DrawItem> draws;
     for (auto const& primitive : primitives[side]) {
       auto const& node = model.nodes[primitive.node];
@@ -1312,12 +1455,13 @@ struct ControllerArmVisual {
       Aabb bounds{};
       if (static_cast<std::size_t>(node.skin) != pose.skin ||
           !computeSkinMatrices(model.skins[pose.skin], meshWorld, pose.jointWorlds, matrices) ||
-          !deformSkinnedMesh(mesh.data, mesh.skinWeights, matrices, deformed, &bounds)) { return false; }
+          !deformSkinnedMesh(mesh.data, mesh.skinWeights, matrices, deformed, &bounds)) { return AppendResult::VisualFailure; }
       Vec3 const centre = (bounds.min + bounds.max) * 0.5F;
-      if (!renderer.updateMeshVertices(primitive.handle, deformed.vertices, &centre)) { return false; }
+      if (!renderer.updateMeshVertices(primitive.handle, deformed.vertices, &centre)) { return AppendResult::VisualFailure; }
       DrawItem item;
       item.mesh = primitive.handle; item.model = meshWorld; item.colour = mesh.colour;
       item.alpha = mesh.alpha; item.alphaFactor = mesh.alphaFactor; item.alphaCutoff = mesh.alphaCutoff;
+      copyHairOpacityBoost(item, mesh);
       if (mesh.texture >= 0 && static_cast<std::size_t>(mesh.texture) < textures.size()) {
         item.texture = textures[static_cast<std::size_t>(mesh.texture)];
       }
@@ -1330,20 +1474,52 @@ struct ControllerArmVisual {
     }
     items.insert(items.end(), draws.begin(), draws.end());
     bendState[side] = nextState;
-    return true;
+    return AppendResult::Success;
   }
 };
+
+std::optional<Transform> controllerArmPlacement(ControllerArmVisual& arms, XrFrameInput const& input,
+                                                Vec3 head, Vec3 forward, float dt) {
+  if (!input.viewTracked || !input.controllerVisualsFocused) { return std::nullopt; }
+  return arms.placement(head, forward, dt);
+}
 
 // Render eligibility is independent per side; edit-action interruptions can
 // originate from either profile and must not hide the other tracked controller.
 bool controllerArmVisible(XrFrameInput const& input, int side, ControllerPose const& grip) {
   return side >= 0 && side < 2 && input.viewTracked && input.controllerVisualsFocused &&
+         input.controllerProfileIsController[side] && input.controllerGripPoseActive[side] &&
          !input.handActive[side] && grip.usable();
+}
+
+bool prepareControllerArm(ControllerArmVisual& arms, XrFrameInput const& input,
+                          int side, ControllerPose const& grip) {
+  if (side < 0 || side > 1) { return false; }
+  bool const visible = controllerArmVisible(input, side, grip);
+  if (input.controllerVisualsInterrupted || input.controllerProfileChanged[side] ||
+      input.controllerTrackingInterrupted[side] || !visible) {
+    arms.bendState[side] = {};
+  }
+  return visible;
 }
 
 // Offline integration check using the user-provided skinned GLB. It
 // exercises the exact visual path, including both GPU uploads and depth.
 int runSmokeControllerArms(char const* shaderDir) {
+  struct MockMaterial { bool hairOpacityBoost; };
+  struct LegacyMaterial {};
+  MockMaterial mockSource{true}, mockTarget{false};
+  copyHairOpacityBoost(mockTarget, mockSource);
+  bool mockHairOk = mockTarget.hairOpacityBoost;
+  mockSource.hairOpacityBoost = false;
+  copyHairOpacityBoost(mockTarget, mockSource);
+  mockHairOk = mockHairOk && !mockTarget.hairOpacityBoost;
+  LegacyMaterial legacy;
+  copyHairOpacityBoost(legacy, legacy);
+  copyHairOpacityBoost(legacy, mockSource);
+  copyHairOpacityBoost(mockTarget, legacy);
+  std::printf("SMOKE %s: arm hair opacity copy with and without fields\n", mockHairOk ? "PASS" : "FAIL");
+  if (!mockHairOk) { return 1; }
   char const* path = std::getenv("GENESIS_CONTROLLER_ARMS_GLB");
   if (path == nullptr || path[0] == 0) {
     std::printf("SMOKE FAIL: set GENESIS_CONTROLLER_ARMS_GLB to a rigged GLB\n"); return 1;
@@ -1352,8 +1528,62 @@ int runSmokeControllerArms(char const* shaderDir) {
   VkRenderer::Config config;
   config.width = 640; config.height = 640; config.shaderDir = shaderDir;
   if (!renderer.init(config)) { std::printf("SMOKE FAIL: renderer init\n"); return 1; }
+  Image const sentinelImage{1, 1, {42, 171, 63, 255}};
+  auto const sentinelTexture = renderer.addTexture(sentinelImage, true, true);
+  MeshData sentinelData;
+  appendCube(sentinelData.vertices);
+  for (std::size_t i = 0; i < sentinelData.vertices.size(); ++i) {
+    sentinelData.indices.push_back(static_cast<std::uint32_t>(i));
+  }
+  auto const sentinelMesh = renderer.addMesh(sentinelData, true);
+  Camera sentinelCamera;
+  sentinelCamera.position = {0, 0, 3}; sentinelCamera.pitch = 0; sentinelCamera.yaw = 0;
+  DrawItem sentinelItem;
+  sentinelItem.mesh = sentinelMesh; sentinelItem.texture = sentinelTexture; sentinelItem.lit = false;
+  std::vector<std::uint8_t> sentinelBefore, sentinelAfter;
+  auto const renderSentinel = [&](std::vector<std::uint8_t>& pixels) {
+    return renderer.draw(sentinelCamera, {sentinelItem}, {}, {}) && renderer.readback(pixels);
+  };
+  bool transactionOk = sentinelMesh != kInvalidMesh && sentinelTexture != kInvalidTexture &&
+                       renderSentinel(sentinelBefore);
   ControllerArmVisual arms;
-  if (!arms.init(renderer, path)) { renderer.shutdown(); return 1; }
+  auto outer = renderer.checkpointResources();
+  transactionOk = transactionOk && static_cast<bool>(outer) &&
+                  !arms.init(renderer, path) && renderer.rollbackResources(outer);
+  ControllerArmVisual::SmokeRegistrations failedMesh, failedTexture;
+  bool const meshFailed = !arms.init(renderer, path, ControllerArmVisual::SmokeFailure::AfterMesh, &failedMesh);
+  bool const textureFailed = !arms.init(renderer, path, ControllerArmVisual::SmokeFailure::ThrowAfterTexture, &failedTexture);
+  auto probe = renderer.checkpointResources();
+  auto const reusedTexture = renderer.addTexture(sentinelImage, true, true);
+  bool const probeRolledBack = renderer.rollbackResources(probe);
+  transactionOk = transactionOk && static_cast<bool>(probe) && probeRolledBack &&
+                  reusedTexture == failedTexture.texture &&
+                  renderer.updateMeshVertices(sentinelMesh, sentinelData.vertices) &&
+                  meshFailed && textureFailed && !arms.ready &&
+                  failedMesh.mesh != kInvalidMesh && failedTexture.mesh == failedMesh.mesh &&
+                  failedTexture.texture == sentinelTexture + 1U &&
+                  renderSentinel(sentinelAfter) && sentinelBefore == sentinelAfter;
+  bool const singularRejected = !arms.init(renderer, path, ControllerArmVisual::SmokeFailure::SingularMesh) &&
+                                !arms.rollbackFailed && !renderer.hasFatalError();
+  transactionOk = transactionOk && singularRejected;
+  std::printf("SMOKE %s: real rig mesh inversion and deformation validation, singular rejection\n",
+              singularRejected ? "PASS" : "FAIL");
+  bool const initOk = arms.init(renderer, path);
+  transactionOk = transactionOk && initOk && !arms.primitives[0].empty() &&
+                  !arms.primitives[1].empty();
+  if (initOk) {
+    bool reused = false;
+    for (auto const& side : arms.primitives) {
+      for (auto const& primitive : side) { reused = reused || primitive.handle == failedMesh.mesh; }
+    }
+    transactionOk = transactionOk && reused && renderSentinel(sentinelAfter) &&
+                    sentinelBefore == sentinelAfter;
+    auto after = renderer.checkpointResources();
+    transactionOk = transactionOk && static_cast<bool>(after) && renderer.rollbackResources(after);
+  }
+  std::printf("SMOKE %s: arm resource rollback, exception, checkpoint and existing asset preservation\n",
+              transactionOk ? "PASS" : "FAIL");
+  if (!transactionOk) { renderer.shutdown(); return 1; }
   std::vector<Transform> locals;
   for (auto const& node : arms.model.nodes) { locals.push_back(node.local); }
   std::vector<Mat4> world(arms.model.nodes.size());
@@ -1373,15 +1603,204 @@ int runSmokeControllerArms(char const* shaderDir) {
     }
     if (!found) { std::printf("SMOKE FAIL: wrist bind pose\n"); renderer.shutdown(); return 1; }
   }
+  bool yawOk = true;
+  // Follow ordinary 5 rad/s turns immediately, including atan2 wrap.
+  for (int direction : {-1, 1}) {
+    ControllerArmVisual normal;
+    for (int i = 0; i <= 150; ++i) {
+      float const yaw = static_cast<float>(direction * i) * 0.05F;
+      Vec3 const forward{-std::sin(yaw), 0, -std::cos(yaw)};
+      auto const placed = normal.placement({}, forward, 0.01F);
+      yawOk = yawOk && dot(rotate(placed.rotation, {0, 0, 1}), forward) > 0.99999F &&
+              !normal.yawFrozen && !normal.yawRecovering;
+    }
+  }
+  for (int direction : {-1, 1}) {
+    ControllerArmVisual heading;
+    Vec3 previous{};
+    bool first = true;
+    for (int i = 0; i <= 200; ++i) {
+      float const pitch = static_cast<float>(direction) * 3.14159265358979323846F * static_cast<float>(i) / 200.0F;
+      auto const placed = heading.placement({}, {0, std::sin(pitch), -std::cos(pitch)}, 0.01F);
+      Vec3 const current = rotate(placed.rotation, {0, 0, 1});
+      if (!first && dot(previous, current) < std::cos(0.021F)) { yawOk = false; }
+      previous = current;
+      first = false;
+    }
+    for (int i = 0; i < 200; ++i) {
+      auto const placed = heading.placement({}, {0, 0, 1}, 0.01F);
+      Vec3 const current = rotate(placed.rotation, {0, 0, 1});
+      if (dot(previous, current) < std::cos(0.021F)) { yawOk = false; }
+      previous = current;
+    }
+    yawOk = yawOk && dot(previous, Vec3{0, 0, 1}) > 0.999F;
+    for (int i = 200; i >= 0; --i) {
+      float const pitch = static_cast<float>(direction) * 3.14159265358979323846F * static_cast<float>(i) / 200.0F;
+      auto const placed = heading.placement({}, {0, std::sin(pitch), -std::cos(pitch)}, 0.01F);
+      Vec3 const current = rotate(placed.rotation, {0, 0, 1});
+      if (dot(previous, current) < std::cos(0.021F)) { yawOk = false; }
+      previous = current;
+    }
+    for (int i = 0; i < 200; ++i) {
+      auto const placed = heading.placement({}, {0, 0, -1}, 0.01F);
+      Vec3 const current = rotate(placed.rotation, {0, 0, 1});
+      if (dot(previous, current) < std::cos(0.021F)) { yawOk = false; }
+      previous = current;
+    }
+    yawOk = yawOk && dot(previous, Vec3{0, 0, -1}) > 0.999F;
+  }
+  ControllerArmVisual hysteresis;
+  hysteresis.placement({}, {0, 0, -1}, 0.01F);
+  hysteresis.placement({}, {0.05F, 1, 0}, 0.01F);
+  float const frozenYaw = hysteresis.stableYaw;
+  for (float horizontal : {0.12F, 0.08F, 0.19F, 0.11F}) {
+    hysteresis.placement({}, {horizontal, 1, 0}, 0.01F);
+    yawOk = yawOk && hysteresis.yawFrozen && hysteresis.stableYaw == frozenYaw;
+  }
+  hysteresis.placement({}, {0.25F, 1, 0}, 0.01F);
+  yawOk = yawOk && !hysteresis.yawFrozen && hysteresis.yawRecovering &&
+          std::fabs(hysteresis.stableYaw - frozenYaw) <= 0.021F &&
+          hysteresis.stableYaw != frozenYaw;
+  for (int i = 0; i < 200; ++i) { hysteresis.placement({}, {1, 0, 0}, 0.01F); }
+  yawOk = yawOk && !hysteresis.yawRecovering;
+  auto const afterRecovery = hysteresis.placement({}, {0, 0, -1}, 0.01F);
+  yawOk = yawOk && dot(rotate(afterRecovery.rotation, {0, 0, 1}), Vec3{0, 0, -1}) > 0.99999F;
+  for (float vertical : {-1.0F, 1.0F}) {
+    ControllerArmVisual startup;
+    auto const initial = startup.placement({}, {0, vertical, 0}, 0.01F);
+    Vec3 previous = rotate(initial.rotation, {0, 0, 1});
+    for (int i = 0; i < 200; ++i) {
+      auto const placed = startup.placement({}, {1, 0, 0}, 0.01F);
+      Vec3 const current = rotate(placed.rotation, {0, 0, 1});
+      yawOk = yawOk && dot(previous, current) >= std::cos(0.021F);
+      previous = current;
+    }
+    yawOk = yawOk && dot(previous, Vec3{1, 0, 0}) > 0.999F;
+  }
+  ControllerArmVisual gated;
+  XrFrameInput view;
+  view.viewTracked = true;
+  view.controllerVisualsFocused = true;
+  auto const firstPlacement = controllerArmPlacement(gated, view, {}, {1, 0, 0}, 0.01F);
+  yawOk = yawOk && firstPlacement.has_value() && std::fabs(gated.stableYaw) > 1.0F;
+  float const savedYaw = gated.stableYaw;
+  bool const savedFrozen = gated.yawFrozen;
+  view.viewTracked = false;
+  yawOk = yawOk && !controllerArmPlacement(gated, view, {}, {0, 1, 0}, 0.05F);
+  view.viewTracked = true;
+  view.controllerVisualsFocused = false;
+  yawOk = yawOk && !controllerArmPlacement(gated, view, {}, {0, 0, 1}, 0.05F);
+  yawOk = yawOk && gated.yawValid && gated.yawFrozen == savedFrozen && gated.stableYaw == savedYaw;
+  view.controllerVisualsFocused = true;
+  auto const resumed = controllerArmPlacement(gated, view, {}, {0, 0, 1}, 0.01F);
+  yawOk = yawOk && resumed.has_value() && dot(rotate(resumed->rotation, {0, 0, 1}), Vec3{0, 0, 1}) > 0.99999F;
+  ControllerArmVisual uninitialised;
+  view.viewTracked = false;
+  yawOk = yawOk && !controllerArmPlacement(uninitialised, view, {}, {0, 1, 0}, 0.01F) &&
+          !uninitialised.yawValid && !uninitialised.yawFrozen;
+  std::printf("SMOKE %s: arm yaw fast tracking, vertical recovery and focused gate\n", yawOk ? "PASS" : "FAIL");
+  if (!yawOk) { renderer.shutdown(); return 1; }
+  std::vector<DrawItem> retryItems(1);
+  ControllerArmInput invalidInput = inputs[0];
+  invalidInput.trigger = std::numeric_limits<float>::quiet_NaN();
+  arms.bendState[0].valid = true;
+  bool retryOk = !arms.appendSafe(renderer, 0, invalidInput, retryItems) && retryItems.size() == 1 &&
+                 !arms.disabled[0] && !arms.bendState[0].valid && arms.solverDiagnosticLogged[0];
+  auto const diagnosticTime = arms.lastSolverDiagnostic[0];
+  retryOk = retryOk && !arms.appendSafe(renderer, 0, invalidInput, retryItems) &&
+            retryItems.size() == 1 && arms.lastSolverDiagnostic[0] == diagnosticTime;
+  retryOk = retryOk && arms.appendSafe(renderer, 1, inputs[1], retryItems) && retryItems.size() > 1;
+  std::size_t const beforeRecovery = retryItems.size();
+  retryOk = retryOk && arms.appendSafe(renderer, 0, inputs[0], retryItems) &&
+            retryItems.size() > beforeRecovery && !arms.disabled[0];
+  std::printf("SMOKE %s: transient arm solver failure hides and recovers independently\n", retryOk ? "PASS" : "FAIL");
+  if (!retryOk) { renderer.shutdown(); return 1; }
+  arms.bendState[0] = arms.bendState[1] = {};
+  std::vector<DrawItem> exceptionItems;
+  bool const exceptionOk = !arms.appendSafe(renderer, 0, inputs[0], exceptionItems, true) &&
+                           exceptionItems.empty() && arms.disabled[0] && !arms.disabled[1] &&
+                           !arms.appendSafe(renderer, 0, inputs[0], exceptionItems) && exceptionItems.empty() &&
+                           arms.appendSafe(renderer, 1, inputs[1], exceptionItems) && !exceptionItems.empty();
+  std::printf("SMOKE %s: arm frame exception isolates side\n", exceptionOk ? "PASS" : "FAIL");
+  if (!exceptionOk) { renderer.shutdown(); return 1; }
+  arms.disabled[0] = false;
+  arms.bendState[1] = {};
   XrFrameInput visibility;
   visibility.viewTracked = true;
   visibility.controllerVisualsFocused = true;
+  visibility.controllerProfileKnown[0] = visibility.controllerProfileKnown[1] = true;
+  visibility.controllerProfileIsController[0] = visibility.controllerProfileIsController[1] = true;
+  visibility.controllerGripPoseActive[0] = visibility.controllerGripPoseActive[1] = true;
   visibility.deleteInterrupted = true; // a profile change on either side
   ControllerPose tracked;
   tracked.valid = tracked.tracked = true;
   ControllerPose lost = tracked;
   lost.tracked = false;
-  bool visibilityOk = controllerArmVisible(visibility, 0, tracked) &&
+  arms.bendState[0].valid = arms.bendState[1].valid = true;
+  visibility.controllerProfileChanged[0] = true;
+  bool continuityOk = prepareControllerArm(arms, visibility, 0, tracked) &&
+                      prepareControllerArm(arms, visibility, 1, tracked) &&
+                      !arms.bendState[0].valid && arms.bendState[1].valid;
+  visibility.controllerProfileChanged[0] = false;
+  arms.bendState[0].valid = true;
+  visibility.controllerProfileKnown[0] = false;
+  visibility.controllerProfileIsController[0] = false;
+  continuityOk = continuityOk && !prepareControllerArm(arms, visibility, 0, tracked) &&
+                 prepareControllerArm(arms, visibility, 1, tracked) &&
+                 !arms.bendState[0].valid && arms.bendState[1].valid;
+  visibility.controllerProfileKnown[0] = true;
+  visibility.controllerProfileIsController[0] = true;
+  arms.bendState[0].valid = true;
+  visibility.controllerProfileChanged[1] = true;
+  continuityOk = continuityOk && prepareControllerArm(arms, visibility, 0, tracked) &&
+                 prepareControllerArm(arms, visibility, 1, tracked) &&
+                 arms.bendState[0].valid && !arms.bendState[1].valid;
+  visibility.controllerProfileChanged[1] = false;
+  arms.bendState[1].valid = true;
+  visibility.controllerProfileKnown[1] = false;
+  visibility.controllerProfileIsController[1] = false;
+  continuityOk = continuityOk && prepareControllerArm(arms, visibility, 0, tracked) &&
+                 !prepareControllerArm(arms, visibility, 1, tracked) &&
+                 arms.bendState[0].valid && !arms.bendState[1].valid;
+  visibility.controllerProfileKnown[1] = true;
+  visibility.controllerProfileIsController[1] = true;
+  arms.bendState[1].valid = true;
+  visibility.handActive[0] = true;
+  continuityOk = continuityOk && !prepareControllerArm(arms, visibility, 0, tracked) &&
+                 prepareControllerArm(arms, visibility, 1, tracked) &&
+                 !arms.bendState[0].valid && arms.bendState[1].valid;
+  visibility.handActive[0] = false;
+  arms.bendState[0].valid = true;
+  visibility.controllerVisualsInterrupted = true;
+  continuityOk = continuityOk && prepareControllerArm(arms, visibility, 0, tracked) &&
+                 prepareControllerArm(arms, visibility, 1, tracked) &&
+                 !arms.bendState[0].valid && !arms.bendState[1].valid;
+  visibility.controllerVisualsInterrupted = false;
+  arms.bendState[0].valid = arms.bendState[1].valid = true;
+  visibility.controllerTrigger[0] = 0.7F;
+  visibility.controllerTrigger[1] = 0.4F;
+  visibility.controllerSqueeze[0] = 0.6F;
+  visibility.controllerSqueeze[1] = 0.3F;
+  visibility.controllerTrackingInterrupted[0] = visibility.controllerTrackingInterrupted[1] = true;
+  continuityOk = continuityOk && prepareControllerArm(arms, visibility, 0, tracked) &&
+                 prepareControllerArm(arms, visibility, 1, tracked) &&
+                 !arms.bendState[0].valid && !arms.bendState[1].valid &&
+                 visibility.controllerTrigger[0] == 0.7F && visibility.controllerTrigger[1] == 0.4F &&
+                 visibility.controllerSqueeze[0] == 0.6F && visibility.controllerSqueeze[1] == 0.3F;
+  visibility.controllerTrackingInterrupted[1] = false;
+  arms.bendState[0].valid = arms.bendState[1].valid = true;
+  visibility.controllerTrackingInterrupted[0] = true;
+  continuityOk = continuityOk && prepareControllerArm(arms, visibility, 0, tracked) &&
+                 prepareControllerArm(arms, visibility, 1, tracked) &&
+                 !arms.bendState[0].valid && arms.bendState[1].valid;
+  visibility.controllerTrackingInterrupted[0] = false;
+  arms.bendState[0].valid = true;
+  visibility.controllerGripPoseActive[0] = false;
+  continuityOk = continuityOk && !prepareControllerArm(arms, visibility, 0, tracked) &&
+                 prepareControllerArm(arms, visibility, 1, tracked) &&
+                 !arms.bendState[0].valid && arms.bendState[1].valid;
+  visibility.controllerGripPoseActive[0] = true;
+  bool visibilityOk = continuityOk && controllerArmVisible(visibility, 0, tracked) &&
                       controllerArmVisible(visibility, 1, tracked) &&
                       !controllerArmVisible(visibility, 0, lost) &&
                       !controllerArmVisible(visibility, 1, lost);
@@ -1404,6 +1823,8 @@ int runSmokeControllerArms(char const* shaderDir) {
   visibility.controllerVisualsFocused = false;
   visibilityOk = visibilityOk && !controllerArmVisible(visibility, 0, tracked) &&
                  !controllerArmVisible(visibility, 1, tracked);
+  arms.bendState[0] = {};
+  arms.bendState[1] = {};
   Camera camera;
   camera.position = {0, 0.35F, 2.0F}; camera.pitch = 0; camera.yaw = 0;
   std::vector<std::uint8_t> blank, left, right, both, curled, moved, wall, covered, behind, inFront;
@@ -1418,9 +1839,53 @@ int runSmokeControllerArms(char const* shaderDir) {
     }
     return count;
   };
+  auto const testMeshIndex = arms.primitives[0][0].mesh;
+  auto& testMaterial = arms.model.meshes[testMeshIndex];
+  auto const originalAlpha = testMaterial.alpha;
+  float const originalFactor = testMaterial.alphaFactor;
+  float const originalCutoff = testMaterial.alphaCutoff;
+  testMaterial.alpha = AlphaMode::Blend;
+  testMaterial.alphaFactor = 0.37F;
+  testMaterial.alphaCutoff = 0.61F;
+  std::vector<DrawItem> materialItems;
+  bool const materialFlagOk = arms.append(renderer, 0, inputs[0], materialItems) &&
+      !materialItems.empty() && materialItems[0].alpha == AlphaMode::Blend &&
+      materialItems[0].alphaFactor == 0.37F && materialItems[0].alphaCutoff == 0.61F;
+  auto const realHairOk = [&]<typename Material, typename Item>(Material& material, Item const&) {
+    if constexpr (requires { material.hairOpacityBoost; Item{}.hairOpacityBoost; }) {
+      bool const original = material.hairOpacityBoost;
+      bool result = true;
+      for (bool flag : {true, false}) {
+        material.hairOpacityBoost = flag;
+        std::vector<Item> items;
+        bool const appended = arms.append(renderer, 0, inputs[0], items);
+        result = result && appended && !items.empty() && items[0].hairOpacityBoost == flag;
+      }
+      material.hairOpacityBoost = original;
+      return result;
+    } else {
+      return true;
+    }
+  }(testMaterial, DrawItem{});
+  testMaterial.alpha = originalAlpha;
+  testMaterial.alphaFactor = originalFactor;
+  testMaterial.alphaCutoff = originalCutoff;
   std::vector<DrawItem> leftItems, rightItems, bothItems;
   bool ok = arms.append(renderer, 0, inputs[0], leftItems) &&
             arms.append(renderer, 1, inputs[1], rightItems);
+  bool materialOk = ok && materialFlagOk && realHairOk;
+  for (int side = 0; side < 2; ++side) {
+    auto const& items = side == 0 ? leftItems : rightItems;
+    materialOk = materialOk && items.size() == arms.primitives[side].size();
+    for (std::size_t i = 0; i < items.size() && i < arms.primitives[side].size(); ++i) {
+      auto const& mesh = arms.model.meshes[arms.primitives[side][i].mesh];
+      materialOk = materialOk && items[i].alpha == mesh.alpha &&
+                   items[i].alphaFactor == mesh.alphaFactor &&
+                   items[i].alphaCutoff == mesh.alphaCutoff;
+    }
+  }
+  std::printf("SMOKE %s: arm material alpha mode, factor, cutoff and available hair flag\n", materialOk ? "PASS" : "FAIL");
+  ok = ok && materialOk;
   bothItems = leftItems; bothItems.insert(bothItems.end(), rightItems.begin(), rightItems.end());
   ok = ok && draw({}, blank) && draw(leftItems, left) && draw(rightItems, right) && draw(bothItems, both);
   inputs[0].trigger = inputs[1].trigger = 1.0F;
@@ -5517,6 +5982,12 @@ int runXr(char const* shaderDir,
   ControllerArmVisual controllerArms;
   char const* armPath = std::getenv("GENESIS_CONTROLLER_ARMS_GLB");
   if (armPath != nullptr && armPath[0] != 0 && !controllerArms.init(renderer, armPath)) {
+    if (controllerArms.rollbackFailed || renderer.hasFatalError()) {
+      std::fprintf(stderr, "[xr] controller arm initialisation left renderer unsafe; shutting down\n");
+      renderer.shutdown();
+      shell.shutdown();
+      return 2;
+    }
     std::printf("[arms] disabled; continuing without controller visuals\n");
   }
   if (!modelPaths.empty()) {
@@ -5543,6 +6014,7 @@ int runXr(char const* shaderDir,
   VrLocomotion locomotion;
 
   bool running = true;
+  bool renderFailed = false;
   int framesRendered = 0;
   bool controllerAimWarned = false;
   bool controllerGripWarned = false;
@@ -6059,23 +6531,30 @@ int runXr(char const* shaderDir,
     assembleFrame(app, items, depthLines, overlayLines);
     drawHandPanel(app, overlayLines);
     if (controllerArms.ready) {
+      auto const armPlacement = controllerArmPlacement(controllerArms, input, headWorld, headForward, dt);
       for (int side = 0; side < 2; ++side) {
         ControllerPose const& grip = side == 0 ? leftControllerGrip : controllerGrip;
-        if (!controllerArmVisible(input, side, grip)) {
-          controllerArms.bendState[side] = {};
+        if (!prepareControllerArm(controllerArms, input, side, grip) || !armPlacement) {
           continue;
         }
         ControllerArmInput armInput;
         armInput.side = side == 0 ? ControllerArmSide::Left : ControllerArmSide::Right;
-        armInput.placement = controllerArms.placement(headWorld, headForward);
+        armInput.placement = *armPlacement;
         armInput.grip.translation = grip.position;
         armInput.grip.rotation = grip.orientation;
         armInput.trigger = input.controllerTrigger[side];
         armInput.gripValue = input.controllerSqueeze[side];
-        if (!controllerArms.append(renderer, side, armInput, items)) {
+        if (!controllerArms.appendSafe(renderer, side, armInput, items)) {
           controllerArms.bendState[side] = {};
         }
+        if (renderer.hasFatalError()) { break; }
       }
+    }
+    if (renderer.hasFatalError()) {
+      std::fprintf(stderr, "[xr] renderer fatal during controller visual update\n");
+      shell.endFrame();
+      renderFailed = true;
+      break;
     }
     // Two reusable meshes follow current tracked joints and render over models.
     // Do not retain a stale hand when tracking or mesh generation fails.
@@ -6127,6 +6606,7 @@ int runXr(char const* shaderDir,
       }
     }
     if (!shell.endFrame() || !drew) {
+      renderFailed = true;
       running = false;
     }
     double frameMs =
@@ -6135,7 +6615,7 @@ int runXr(char const* shaderDir,
     frameMsTotal += frameMs;
     frameMsMax = frameMs > frameMsMax ? frameMs : frameMsMax;
     ++framesRendered;
-    if (smoke && framesRendered >= 60) {
+    if (smoke && !renderFailed && framesRendered >= 60) {
       std::printf("SMOKE PASS (xr, %d frames)\n", framesRendered);
       break;
     }
@@ -6163,6 +6643,7 @@ int runXr(char const* shaderDir,
 
   renderer.shutdown();
   shell.shutdown();
+  if (renderFailed) { return 2; }
   if (smoke && framesRendered < 60) {
     std::printf("SMOKE FAIL: only %d xr frames rendered\n", framesRendered);
     return 1;

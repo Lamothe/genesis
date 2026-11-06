@@ -367,21 +367,45 @@ GENESIS_CONTROLLER_ARMS_GLB="$PWD/.build/controller-arm-source.glb" bash run-edi
 The library copy described above has no skin and will be rejected; the original
 source archive contains a skinned GLB. The rig must provide both named deform-bone
 chains and separate skinned meshes. Invalid or unavailable files disable the
-visuals with a diagnostic, without affecting the session. Arm visuals are not
+visuals with a diagnostic. Initialisation checkpoints renderer registrations and
+rolls back registered meshes and textures on failure or exception, preserving
+existing assets. A failed rollback is retried up to three times unless the
+renderer reports device loss; if it cannot be completed, the XR session shuts
+down rather than reusing the renderer. Shutdown must establish GPU idle (or
+device loss); an unexpected persistent wait failure still aborts rather than
+risking GPU use-after-free. A per-frame solver failure hides only that side for the frame, resets its elbow
+continuity and retries on later frames; its diagnostic is limited to once per
+five seconds per side. Mesh/renderer update failures and exceptions disable only
+the affected side with a diagnostic; a fatal renderer error stops the XR session. Arm
+visuals are not
 scene objects, pick targets or part of undo/history. They are depth-tested with
 scene geometry; blended materials follow the renderer’s normal transparency
 ordering. The offscreen smoke uses the supplied real asset and checks each
-side, curl, pose motion, front/back occlusion and each side obscured while
+side, mesh inversion and deformation validation including a singular transform,
+yaw trajectories across both verticals in both directions, vertical startup
+and focused/tracked placement gating, transient solver recovery, frame exception
+isolation, material alpha, transactional rollback and reuse, curl, pose motion,
+front/back occlusion and each side obscured while
 the opposite side remains visible. It requires Vulkan and does
 not verify headset appearance.
 
 Both controller sides use their independently tracked physical grip pose and
 analogue trigger/squeeze values, without changing control actions. A lost grip,
 view or focus hides the affected visuals rather than displaying a stale pose;
-a profile interruption alone does not hide an independently tracked opposite side;
+an unknown profile hides only that side and clears its elbow continuity. Profile
+changes reset the affected elbow; an OpenXR global profile-change event resets
+both because it does not identify a side, including an unobserved round trip.
+A focus interruption resets both, even if focus has already returned. These
+resets do not hide independently tracked controllers or alter their inputs;
 actual tracked hands and the hand menu remain unchanged and replace the
 controller visual on that side. The shoulder is estimated 20 cm below the head
-with yaw-only orientation; two-bone IK and finger curls are approximations,
+with yaw-only orientation. Near vertical gaze, yaw freezes below a normalised
+horizontal-forward length of 0.10 and resumes above 0.20. Ordinary tracked yaw
+follows immediately; after vertical gaze, recovery is limited to 2 radians per
+second (with a 50 ms timestep cap) until caught up. This avoids a sudden
+180-degree flip, though shoulders can lag during recovery. Starting vertically
+uses a default heading until a reliable one is
+available. Two-bone IK and finger curls are approximations,
 not body or finger tracking. Elbow bend is transported across frames; it is
 path-dependent and may drift, and resets after tracking loss. The wrist currently uses the controller grip pose
 without a device-specific grip-to-wrist calibration, and reach is clamped.
@@ -391,7 +415,7 @@ memory cost. No real-world collision is provided.
 
 ## Design notes
 
-- **Renderer resources are registered, never released** (there is no
+- **Committed renderer resources are registered, never individually released** (there is no
   removeMesh/removeTexture API): image-content dedupe means re-staging or
   re-placing a model reuses its registrations, but distinct models
   accumulate. The texture registry holds 256 (a device-limit check at init

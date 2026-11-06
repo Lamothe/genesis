@@ -35,6 +35,10 @@ public:
   VkRenderer& operator=(VkRenderer const&) = delete;
 
   bool init(Config const& config);
+  // Device loss (or unrecoverable renderer synchronisation) requires shutdown.
+  // If rollback fails, retain its token and retry; do not continue as if it
+  // succeeded. A fatal error requires stopping rendering and shutting down.
+  bool hasFatalError() const;
   void shutdown();
 
   bool resize(std::uint32_t width, std::uint32_t height);
@@ -46,7 +50,8 @@ public:
   // false for material that is always opaque, which makes each dynamic update
   // skip an O(triangles) pass (a blended draw of such a mesh then uses index
   // order, as every unsortable mesh already does). Safe to call at any time;
-  // internally synchronises with in-flight frames.
+  // internally synchronises with in-flight frames. C++ allocation exceptions
+  // propagate; a failed registration releases its unregistered resources.
   MeshHandle addMesh(MeshData const& data, bool dynamic = false,
                      bool trackTriangleSums = true);
 
@@ -59,7 +64,8 @@ public:
   // value the caller already computed saves a full read of the vertices (it
   // only affects blend ordering, never geometry). Returns false (and leaves
   // the old GPU data intact) for a static mesh, a vertex-count change,
-  // non-finite data or a Vulkan failure.
+  // non-finite data or a Vulkan failure. Allocation exceptions propagate and
+  // leave the previous pending pose and blend ordering unchanged.
   bool updateMeshVertices(MeshHandle handle, std::vector<MeshVertex> const& vertices,
                           Vec3 const* boundsCentre = nullptr);
 
@@ -79,8 +85,30 @@ public:
   MeshHandle updateHandMesh(std::size_t slot, MeshData const& data);
 
   // Registers an RGBA8 texture and returns a handle (0 is the built-in white
-  // fallback). Up to 256 textures; safe to call at any time.
+  // fallback). Up to 256 textures; safe to call at any time. C++ allocation
+  // exceptions propagate; a failed registration releases its resources.
   TextureHandle addTexture(Image const& image, bool repeatU, bool repeatV);
+
+  // One active checkpoint per renderer, on the renderer thread. A default or
+  // rejected token is invalid. Copies refer to the same transaction; commit or
+  // rollback succeeds once only and rejects tokens from other renderers.
+  // Shutdown invalidates tokens. Rollback waits for the device, restores removed
+  // texture descriptor slots to white and frees meshes, textures and hand slots
+  // first registered since the checkpoint. In-place updates to existing assets
+  // and other renderer state are not reverted. Rolled-back handles can be reused:
+  // callers must discard them. A failed GPU wait leaves the transaction active; retry unless hasFatalError().
+  class ResourceCheckpoint {
+  public:
+    ResourceCheckpoint() = default;
+    // Reports whether creation succeeded, not whether a copy was consumed.
+    explicit operator bool() const { return static_cast<bool>(identity_); }
+  private:
+    friend class VkRenderer;
+    std::shared_ptr<void> identity_;
+  };
+  ResourceCheckpoint checkpointResources();
+  bool commitResources(ResourceCheckpoint const& checkpoint);
+  bool rollbackResources(ResourceCheckpoint const& checkpoint);
 
   // Clear colour for the next frames (the backdrop void colour).
   void setClearColour(float r, float g, float b, float a = 1.0F);

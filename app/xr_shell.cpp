@@ -1,6 +1,7 @@
 #include "xr_shell.h"
 #include "xr_view.h"
 #include "controller_workflow.h"
+#include "controller_arm_profile.h"
 #include "vr_locomotion.h"
 
 #include <openxr/openxr.h>
@@ -86,6 +87,8 @@ struct XrShell::ImplData {
   SelectTriggerLatch selectTrigger;
   SelectTriggerLatch leftSelectTrigger;
   bool selectInterruptedPending{false};
+  ControllerArmProfileTracker controllerProfiles;
+  ControllerArmContinuity controllerContinuity;
   BooleanPressLatch menuPress;
   BooleanPressLatch spawnPress;
   BooleanPressLatch undoPress;
@@ -730,6 +733,7 @@ void XrShell::pollEvents(bool& running) {
         xr_->redoPress.interrupt();
         xr_->selectInterruptedPending = true;
       }
+      xr_->controllerProfiles.observeFocus(changed->state == XR_SESSION_STATE_FOCUSED);
       xr_->sessionState = changed->state;
       switch (changed->state) {
       case XR_SESSION_STATE_READY: {
@@ -756,6 +760,7 @@ void XrShell::pollEvents(bool& running) {
       }
     } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
       // A profile can change without an inactive sample in between.
+      xr_->controllerContinuity.profileChanged();
       xr_->selectTrigger.interrupt();
       xr_->leftSelectTrigger.interrupt();
       xr_->menuPress.interrupt();
@@ -785,6 +790,23 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   xrStringToPath(xr_->instance, "/user/hand/left", &leftPath);
   xrStringToPath(xr_->instance, "/user/hand/right", &rightPath);
 
+  XrPath handProfile = XR_NULL_PATH;
+  bool const handProfileKnown = XR_SUCCEEDED(xrStringToPath(
+      xr_->instance, "/interaction_profiles/ext/hand_interaction_ext", &handProfile));
+  for (int hand = 0; hand < 2; ++hand) {
+    auto profile = xrStruct<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
+    bool const ok = xr_->handPaths[hand] != XR_NULL_PATH &&
+        XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_->session, xr_->handPaths[hand], &profile));
+    xr_->controllerProfiles.sample(hand, ok, profile.interactionProfile);
+    input.controllerProfileKnown[hand] = xr_->controllerProfiles.known(hand);
+    input.controllerProfileChanged[hand] = xr_->controllerProfiles.changed(hand);
+    auto const classification = classifyControllerArmProfile(
+        ok, profile.interactionProfile, handProfileKnown, handProfile);
+    input.controllerProfileIsController[hand] = classification == ControllerArmProfile::controller;
+    input.handActive[hand] = xr_->handInteraction && classification == ControllerArmProfile::hand;
+  }
+  input.controllerVisualsInterrupted = xr_->controllerProfiles.focusInterrupted();
+
   XrActionStateGetInfo getInfo = xrStruct<XrActionStateGetInfo>(XR_TYPE_ACTION_STATE_GET_INFO);
 
   XrActionStateFloat triggerState = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
@@ -795,10 +817,8 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   auto const select = xr_->selectTrigger.updateTracked(input.viewTracked, syncResult == XR_SUCCESS &&
                                                 XR_SUCCEEDED(triggerResult) && triggerState.isActive &&
                                                 !xr_->selectInterruptedPending, triggerState.currentState);
-  if (syncResult == XR_SUCCESS && XR_SUCCEEDED(triggerResult) && triggerState.isActive &&
-      !xr_->selectInterruptedPending && std::isfinite(triggerState.currentState)) {
-    input.controllerTrigger[1] = std::clamp(triggerState.currentState, 0.0F, 1.0F);
-  }
+  input.controllerTrigger[1] = controllerArmVisualSample(syncResult == XR_SUCCESS,
+      XR_SUCCEEDED(triggerResult), triggerState.isActive, triggerState.currentState);
   input.selectActive = select.active;
   input.selectHeld = select.held;
   input.selectPressed = select.pressed;
@@ -810,10 +830,8 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   auto const leftSelect = xr_->leftSelectTrigger.updateTracked(input.viewTracked, syncResult == XR_SUCCESS &&
       XR_SUCCEEDED(leftTriggerResult) && triggerState.isActive &&
       !xr_->selectInterruptedPending, triggerState.currentState);
-  if (syncResult == XR_SUCCESS && XR_SUCCEEDED(leftTriggerResult) && triggerState.isActive &&
-      !xr_->selectInterruptedPending && std::isfinite(triggerState.currentState)) {
-    input.controllerTrigger[0] = std::clamp(triggerState.currentState, 0.0F, 1.0F);
-  }
+  input.controllerTrigger[0] = controllerArmVisualSample(syncResult == XR_SUCCESS,
+      XR_SUCCEEDED(leftTriggerResult), triggerState.isActive, triggerState.currentState);
   input.leftSelectActive = leftSelect.active;
   input.leftSelectHeld = leftSelect.held;
   input.leftSelectPressed = leftSelect.pressed;
@@ -939,22 +957,12 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
     auto visualGrip = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
     getInfo.subactionPath = xr_->handPaths[hand];
     XrResult const result = xrGetActionStateFloat(xr_->session, &getInfo, &visualGrip);
-    if (syncResult == XR_SUCCESS && XR_SUCCEEDED(result) && visualGrip.isActive &&
-        !xr_->selectInterruptedPending && std::isfinite(visualGrip.currentState)) {
-      input.controllerSqueeze[hand] = std::clamp(visualGrip.currentState, 0.0F, 1.0F);
-    }
+    input.controllerSqueeze[hand] = controllerArmVisualSample(syncResult == XR_SUCCESS,
+        XR_SUCCEEDED(result), visualGrip.isActive, visualGrip.currentState);
   }
 
   // Keep hand-only gestures separate from controllers (including inferred joints).
-  XrPath handProfile = XR_NULL_PATH;
-  if (xr_->handInteraction) {
-    xrStringToPath(xr_->instance, "/interaction_profiles/ext/hand_interaction_ext", &handProfile);
-  }
   for (int hand = 0; hand < 2; ++hand) {
-    auto profile = xrStruct<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
-    input.handActive[hand] = handProfile != XR_NULL_PATH &&
-        XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_->session, xr_->handPaths[hand], &profile)) &&
-        profile.interactionProfile == handProfile;
     auto pinch = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
     getInfo.action = xr_->pinchAction;
     getInfo.subactionPath = xr_->handPaths[hand];
@@ -1046,6 +1054,13 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
       input.aimValid[hand] = true;
       input.aimTracked[hand] = (location.locationFlags & aimTrackedFlags) == aimTrackedFlags;
     }
+    // The pose-action state gates only the visual; controller editing remains unchanged.
+    auto gripPoseState = xrStruct<XrActionStatePose>(XR_TYPE_ACTION_STATE_POSE);
+    getInfo.action = xr_->gripPoseAction;
+    getInfo.subactionPath = xr_->handPaths[hand];
+    XrResult const poseResult = xrGetActionStatePose(xr_->session, &getInfo, &gripPoseState);
+    input.controllerGripPoseActive[hand] = controllerArmGripActive(
+        XR_SUCCEEDED(poseResult), gripPoseState.isActive);
     // The physical grip pose is measured independently: a VALID-but-untracked
     // pose is recorded as exactly that, never silently promoted to usable.
     XrSpaceLocation grip = xrStruct<XrSpaceLocation>(XR_TYPE_SPACE_LOCATION);
@@ -1060,6 +1075,12 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
       input.controllerGrip[hand].tracked =
           (grip.locationFlags & aimTrackedFlags) == aimTrackedFlags;
     }
+  }
+  for (int hand = 0; hand < 2; ++hand) {
+    xr_->controllerContinuity.sample(hand, input.viewTracked && input.controllerVisualsFocused &&
+        input.controllerProfileIsController[hand] && input.controllerGripPoseActive[hand] &&
+        input.controllerGrip[hand].usable());
+    input.controllerTrackingInterrupted[hand] = xr_->controllerContinuity.interrupted(hand);
   }
   // Head gaze fallback uses the same raw eye pose as the rendered view.
   input.pointerRay = xrPointerRay(input.aimValid[1], input.aimRays[1], xr_->views[0]);
@@ -1105,6 +1126,7 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     return FrameStatus::Exit;
   }
   if (!xr_->sessionRunning) {
+    xr_->controllerContinuity.skipFrame();
     xr_->selectTrigger.interrupt();
     xr_->leftSelectTrigger.interrupt();
     xr_->menuPress.interrupt();
@@ -1130,6 +1152,7 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   // Pairing rule: every xrBeginFrame gets exactly one xrEndFrame. When a
   // frame cannot be rendered, end it here (zero layers) before bailing.
   auto failFrame = [this]() {
+    xr_->controllerContinuity.skipFrame();
     xr_->selectTrigger.interrupt();
     xr_->leftSelectTrigger.interrupt();
     xr_->menuPress.interrupt();
@@ -1208,6 +1231,8 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   }
   xr_->frameReady = true;
   xr_->selectInterruptedPending = false;
+  xr_->controllerProfiles.consume();
+  xr_->controllerContinuity.consume();
   // The app consumes this frame's button presses now; never replay them.
   xr_->undoPress.consume();
   xr_->redoPress.consume();

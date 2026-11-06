@@ -43,7 +43,18 @@ struct XrFrameInput {
   Vec2 rightStick{0.0F, 0.0F}; // viewer look or carousel browsing
   bool leftStickActive{false};
   bool viewTracked{false}; // fresh position and orientation, both actively tracked
-  bool controllerVisualsFocused{false}; // session focus, not an editing action
+  bool controllerVisualsFocused{false}; // current session focus, not an editing action
+  // True for a successful profile query this frame, including XR_NULL_PATH
+  // (no active profile). False means unknown, not a profile switch.
+  bool controllerProfileKnown[2] = {false, false};
+  // A successful per-side profile change since the last delivered frame; the
+  // first successful observation establishes a baseline without a change.
+  bool controllerProfileChanged[2] = {false, false};
+  bool controllerProfileIsController[2] = {false, false};
+  bool controllerGripPoseActive[2] = {false, false}; // visual-only; editing pose unchanged
+  bool controllerTrackingInterrupted[2] = {false, false};
+  // Focus was lost since the previous delivered frame, even if regained.
+  bool controllerVisualsInterrupted{false};
   bool rightStickActive{false}; // successful, active, finite right-stick sample
   bool rightStickAbsent{false}; // confirmed simple-controller profile, not a transient loss
   // selectActive is true only for a successful, active, finite trigger
@@ -72,7 +83,8 @@ struct XrFrameInput {
   bool deleteHeld{false};   // X on Touch held: hold-to-delete with red ramp
   // Focus/profile change, even if the current delete query is active.
   bool deleteInterrupted{false};
-  // Visual-only analogue samples; inactive or interrupted actions read as zero.
+  // Visual-only analogue samples; failed, inactive or non-finite samples read
+  // as zero, independently of the editing interruption latch.
   float controllerTrigger[2] = {0.0F, 0.0F};
   float controllerSqueeze[2] = {0.0F, 0.0F};
   float gripHeld{0.0F};
