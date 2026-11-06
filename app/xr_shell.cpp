@@ -1,6 +1,7 @@
 #include "xr_shell.h"
 #include "xr_view.h"
 #include "controller_workflow.h"
+#include "vr_locomotion.h"
 
 #include <openxr/openxr.h>
 
@@ -57,6 +58,7 @@ struct XrShell::ImplData {
   XrAction graspReadyAction{XR_NULL_HANDLE};
   XrAction leftStickAction{XR_NULL_HANDLE};
   XrAction rightStickAction{XR_NULL_HANDLE};
+  XrAction trackpadTouchAction{XR_NULL_HANDLE};
   XrAction menuAction{XR_NULL_HANDLE};
   XrAction undoAction{XR_NULL_HANDLE}; // B on Touch
   XrAction redoAction{XR_NULL_HANDLE}; // Y on Touch
@@ -82,15 +84,12 @@ struct XrShell::ImplData {
   XrTime predictedDisplayTime{0};
   XrFrameState frameState{};
   SelectTriggerLatch selectTrigger;
+  SelectTriggerLatch leftSelectTrigger;
   bool selectInterruptedPending{false};
-  bool menuPrev{false};
-  bool undoPrev{false};
-  bool redoPrev{false};
-  bool spawnPrev{false};
-  bool undoPending{false}; // latched until a frame renders and consumes it
-  bool redoPending{false};
-  bool spawnPending{false};
-  bool menuPending{false}; // latched menu press (the tap/hold start)
+  BooleanPressLatch menuPress;
+  BooleanPressLatch spawnPress;
+  BooleanPressLatch undoPress;
+  BooleanPressLatch redoPress;
   bool handTracking{false};
   XrHandTrackerEXT trackers[2]{XR_NULL_HANDLE, XR_NULL_HANDLE};
   PFN_xrCreateHandTrackerEXT createHandTracker{nullptr};
@@ -484,7 +483,8 @@ bool XrShell::createActions() {
   };
 
   if (!makeFloat("trigger", &xr_->triggerAction) || !makeFloat("pinch", &xr_->pinchAction) || !makeBool("pinch_ready", &xr_->pinchReadyAction) || !makeFloat("hand_grasp", &xr_->graspAction) || !makeBool("grasp_ready", &xr_->graspReadyAction) || !makeVec2("leftstick", &xr_->leftStickAction) ||
-      !makeVec2("rightstick", &xr_->rightStickAction) || !makeBool("menu", &xr_->menuAction) ||
+      !makeVec2("rightstick", &xr_->rightStickAction) ||
+      !makeBool("trackpad_touch", &xr_->trackpadTouchAction) || !makeBool("menu", &xr_->menuAction) ||
       !makeBool("undo", &xr_->undoAction) || !makeBool("redo", &xr_->redoAction) ||
       !makeBool("spawn", &xr_->spawnAction) || !makeBool("delete", &xr_->deleteAction) ||
       !makeFloat("grip", &xr_->gripAction) || !makePose("aim", &xr_->aimAction) ||
@@ -533,15 +533,15 @@ bool XrShell::createActions() {
         {"/user/hand/left/input/trigger/click", xr_->triggerAction},
         {"/user/hand/left/input/trackpad", xr_->leftStickAction},
         {"/user/hand/right/input/trackpad", xr_->rightStickAction},
+        {"/user/hand/left/input/trackpad/touch", xr_->trackpadTouchAction},
+        {"/user/hand/right/input/trackpad/touch", xr_->trackpadTouchAction},
         {"/user/hand/left/input/menu/click", xr_->menuAction},
         {"/user/hand/right/input/squeeze/click", xr_->gripAction},
         {"/user/hand/left/input/squeeze/click", xr_->gripAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
         {"/user/hand/left/input/aim/pose", xr_->aimAction},
         {"/user/hand/right/input/grip/pose", xr_->gripPoseAction},
-        {"/user/hand/left/input/grip/pose", xr_->gripPoseAction},
-        {"/user/hand/right/input/trackpad/click", xr_->undoAction},
-        {"/user/hand/left/input/trackpad/click", xr_->redoAction}}},
+        {"/user/hand/left/input/grip/pose", xr_->gripPoseAction}}}, // trackpad clicks are not history shortcuts
   };
   if (xr_->handInteraction) {
     // Preserve aim activation for the existing trigger path, but use the
@@ -723,6 +723,11 @@ void XrShell::pollEvents(bool& running) {
       if (xr_->sessionState == XR_SESSION_STATE_FOCUSED &&
           changed->state != XR_SESSION_STATE_FOCUSED) {
         xr_->selectTrigger.interrupt();
+        xr_->leftSelectTrigger.interrupt();
+        xr_->menuPress.interrupt();
+        xr_->spawnPress.interrupt();
+        xr_->undoPress.interrupt();
+        xr_->redoPress.interrupt();
         xr_->selectInterruptedPending = true;
       }
       xr_->sessionState = changed->state;
@@ -752,6 +757,11 @@ void XrShell::pollEvents(bool& running) {
     } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
       // A profile can change without an inactive sample in between.
       xr_->selectTrigger.interrupt();
+      xr_->leftSelectTrigger.interrupt();
+      xr_->menuPress.interrupt();
+      xr_->spawnPress.interrupt();
+      xr_->undoPress.interrupt();
+      xr_->redoPress.interrupt();
       xr_->selectInterruptedPending = true;
     } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
       running = false;
@@ -782,7 +792,7 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   getInfo.subactionPath = rightPath;
   XrResult const triggerResult = xrGetActionStateFloat(xr_->session, &getInfo, &triggerState);
   // Hysteresis prevents chatter; inactive or failed queries are not releases.
-  auto const select = xr_->selectTrigger.update(syncResult == XR_SUCCESS &&
+  auto const select = xr_->selectTrigger.updateTracked(input.viewTracked, syncResult == XR_SUCCESS &&
                                                 XR_SUCCEEDED(triggerResult) && triggerState.isActive &&
                                                 !xr_->selectInterruptedPending, triggerState.currentState);
   input.selectActive = select.active;
@@ -790,43 +800,79 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   input.selectPressed = select.pressed;
   input.selectReleased = select.released;
 
-  XrActionStateVector2f leftStickState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
-  getInfo.action = xr_->leftStickAction;
+  triggerState = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
   getInfo.subactionPath = leftPath;
-  xrGetActionStateVector2f(xr_->session, &getInfo, &leftStickState);
-  if (leftStickState.isActive) {
-    input.leftStick = {leftStickState.currentState.x, leftStickState.currentState.y};
+  XrResult const leftTriggerResult = xrGetActionStateFloat(xr_->session, &getInfo, &triggerState);
+  auto const leftSelect = xr_->leftSelectTrigger.updateTracked(input.viewTracked, syncResult == XR_SUCCESS &&
+      XR_SUCCEEDED(leftTriggerResult) && triggerState.isActive &&
+      !xr_->selectInterruptedPending, triggerState.currentState);
+  input.leftSelectActive = leftSelect.active;
+  input.leftSelectHeld = leftSelect.held;
+  input.leftSelectPressed = leftSelect.pressed;
+  input.leftSelectReleased = leftSelect.released;
+
+  XrPath viveProfile = XR_NULL_PATH;
+  bool const vivePathValid = XR_SUCCEEDED(xrStringToPath(
+      xr_->instance, "/interaction_profiles/htc/vive_controller", &viveProfile));
+  auto sampleStick = [&](XrAction action, XrPath hand) {
+    auto state = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
+    getInfo.action = action;
+    getInfo.subactionPath = hand;
+    XrResult const result = xrGetActionStateVector2f(xr_->session, &getInfo, &state);
+    auto profile = xrStruct<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
+    bool const profileValid = vivePathValid &&
+        XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_->session, hand, &profile));
+    bool const trackpad = profileValid && profile.interactionProfile == viveProfile;
+    auto touch = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
+    bool touchActive = false;
+    if (trackpad) {
+      getInfo.action = xr_->trackpadTouchAction;
+      touchActive = XR_SUCCEEDED(xrGetActionStateBoolean(xr_->session, &getInfo, &touch)) &&
+                    touch.isActive;
+    }
+    return vrNormaliseStick({state.currentState.x, state.currentState.y},
+        profileValid && syncResult == XR_SUCCESS && XR_SUCCEEDED(result) && state.isActive &&
+            !xr_->selectInterruptedPending, trackpad, touchActive, touch.currentState);
+  };
+  auto const leftStick = sampleStick(xr_->leftStickAction, leftPath);
+  auto const rightStick = sampleStick(xr_->rightStickAction, rightPath);
+  input.leftStickActive = leftStick.active;
+  input.leftStick = leftStick.value;
+  input.rightStickActive = rightStick.active;
+  input.rightStick = rightStick.value;
+  if (input.leftStickActive) {
     stats_.leftXMax = std::max(stats_.leftXMax, std::abs(input.leftStick.x));
     stats_.leftYMax = std::max(stats_.leftYMax, std::abs(input.leftStick.y));
   }
-
-  XrActionStateVector2f rightStickState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
-  getInfo.action = xr_->rightStickAction;
-  getInfo.subactionPath = rightPath;
-  XrResult const rightStickResult = xrGetActionStateVector2f(xr_->session, &getInfo, &rightStickState);
-  input.rightStickActive = syncResult == XR_SUCCESS && XR_SUCCEEDED(rightStickResult) &&
-                           rightStickState.isActive &&
-                           std::isfinite(rightStickState.currentState.x) &&
-                           std::isfinite(rightStickState.currentState.y);
   if (input.rightStickActive) {
-    input.rightStick = {rightStickState.currentState.x, rightStickState.currentState.y};
     stats_.rightXMax = std::max(stats_.rightXMax, std::abs(input.rightStick.x));
     stats_.rightYMax = std::max(stats_.rightYMax, std::abs(input.rightStick.y));
   }
+  // Inactivity alone does not prove a stick is absent: allow the fallback
+  // only for a successfully identified simple-controller profile. Query on
+  // every inactive sample so profile switches cannot leave stale permission.
+  if (!input.rightStickActive && syncResult == XR_SUCCESS &&
+      input.viewTracked && !xr_->selectInterruptedPending) {
+    XrPath simpleProfile = XR_NULL_PATH;
+    auto profile = xrStruct<XrInteractionProfileState>(XR_TYPE_INTERACTION_PROFILE_STATE);
+    input.rightStickAbsent =
+        XR_SUCCEEDED(xrStringToPath(xr_->instance, "/interaction_profiles/khr/simple_controller", &simpleProfile)) &&
+        XR_SUCCEEDED(xrGetCurrentInteractionProfile(xr_->session, rightPath, &profile)) &&
+        profile.interactionProfile == simpleProfile;
+  }
 
-  // The carousel/backdrop button is the LEFT controller's menu only (the
-  // user's binding). The press edge is LATCHED like undo/redo so a skipped
-  // frame cannot swallow a tap; the held state stays raw for the tap/hold
-  // split.
+  // Both toggle actions need a tracked view and an active physical release
+  // after any interruption. Never carry a press across a lost/skipped frame.
+  bool const toggleSafe = input.viewTracked && syncResult == XR_SUCCESS &&
+      xr_->sessionState == XR_SESSION_STATE_FOCUSED && !xr_->selectInterruptedPending;
   XrActionStateBoolean menuLeft = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
   getInfo.action = xr_->menuAction;
   getInfo.subactionPath = leftPath;
-  xrGetActionStateBoolean(xr_->session, &getInfo, &menuLeft);
-  bool menuNow = menuLeft.isActive && menuLeft.currentState;
-  xr_->menuPending = xr_->menuPending || (menuNow && !xr_->menuPrev);
-  xr_->menuPrev = menuNow;
-  input.menuPressed = xr_->menuPending;
-  input.menuHeld = menuNow;
+  XrResult const menuResult = xrGetActionStateBoolean(xr_->session, &getInfo, &menuLeft);
+  xr_->menuPress.updateTracked(toggleSafe, XR_SUCCEEDED(menuResult) && menuLeft.isActive,
+                               menuLeft.currentState);
+  input.menuPressed = xr_->menuPress.pending();
+  input.menuHeld = toggleSafe && XR_SUCCEEDED(menuResult) && menuLeft.isActive && menuLeft.currentState;
   // "The menu button does nothing" has two very different causes: the button
   // never reaches us (the runtime has the hand on a profile without a menu
   // binding, or reserved the button), or it reaches us and the app drops it.
@@ -840,38 +886,32 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
     xr_->menuSigPrev = menuSig;
   }
 
-  // Undo/redo: face buttons on Touch (B = undo, Y = redo), trackpad click on
-  // Vive. The press is latched until a frame actually renders, so a
-  // skipped/acquire-failed frame cannot swallow it, and an inactive action
-  // keeps its previous state rather than manufacturing a new edge.
+  // B/Y history uses the same interruption-aware edge semantics as Menu/A.
+  // Failed or inactive queries are not releases; an active release on a safe
+  // frame must rearm each button before a later press can trigger history.
   XrActionStateBoolean undoState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
   getInfo.action = xr_->undoAction;
   getInfo.subactionPath = rightPath;
-  xrGetActionStateBoolean(xr_->session, &getInfo, &undoState);
-  bool undoNow = undoState.isActive ? undoState.currentState : xr_->undoPrev;
-  xr_->undoPending = xr_->undoPending || (undoNow && !xr_->undoPrev);
-  xr_->undoPrev = undoNow;
+  XrResult const undoResult = xrGetActionStateBoolean(xr_->session, &getInfo, &undoState);
+  xr_->undoPress.updateTracked(toggleSafe, XR_SUCCEEDED(undoResult) && undoState.isActive,
+                               undoState.currentState);
+  input.undoPressed = xr_->undoPress.pending();
   XrActionStateBoolean redoState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
   getInfo.action = xr_->redoAction;
   getInfo.subactionPath = leftPath;
-  xrGetActionStateBoolean(xr_->session, &getInfo, &redoState);
-  bool redoNow = redoState.isActive ? redoState.currentState : xr_->redoPrev;
-  xr_->redoPending = xr_->redoPending || (redoNow && !xr_->redoPrev);
-  xr_->redoPrev = redoNow;
-  input.undoPressed = xr_->undoPending;
-  input.redoPressed = xr_->redoPending;
+  XrResult const redoResult = xrGetActionStateBoolean(xr_->session, &getInfo, &redoState);
+  xr_->redoPress.updateTracked(toggleSafe, XR_SUCCEEDED(redoResult) && redoState.isActive,
+                               redoState.currentState);
+  input.redoPressed = xr_->redoPress.pending();
 
-  // Spawn (A on Touch): latched like undo/redo so a skipped frame cannot
-  // swallow it. Delete (X on Touch) is a HELD state — the app turns the hold
-  // into a charge ramp and fires at full charge.
+  // A toggles the carousel under the same interruption rules as Menu.
   XrActionStateBoolean spawnState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
   getInfo.action = xr_->spawnAction;
   getInfo.subactionPath = rightPath;
-  xrGetActionStateBoolean(xr_->session, &getInfo, &spawnState);
-  bool spawnNow = spawnState.isActive ? spawnState.currentState : xr_->spawnPrev;
-  xr_->spawnPending = xr_->spawnPending || (spawnNow && !xr_->spawnPrev);
-  xr_->spawnPrev = spawnNow;
-  input.spawnPressed = xr_->spawnPending;
+  XrResult const spawnResult = xrGetActionStateBoolean(xr_->session, &getInfo, &spawnState);
+  xr_->spawnPress.updateTracked(toggleSafe, XR_SUCCEEDED(spawnResult) && spawnState.isActive,
+                                spawnState.currentState);
+  input.spawnPressed = xr_->spawnPress.pending();
   XrActionStateBoolean deleteState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
   getInfo.action = xr_->deleteAction;
   getInfo.subactionPath = leftPath;
@@ -1047,6 +1087,11 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   }
   if (!xr_->sessionRunning) {
     xr_->selectTrigger.interrupt();
+    xr_->leftSelectTrigger.interrupt();
+    xr_->menuPress.interrupt();
+    xr_->spawnPress.interrupt();
+    xr_->undoPress.interrupt();
+    xr_->redoPress.interrupt();
     return FrameStatus::Pump; // session still starting; keep pumping
   }
 
@@ -1067,6 +1112,11 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   // frame cannot be rendered, end it here (zero layers) before bailing.
   auto failFrame = [this]() {
     xr_->selectTrigger.interrupt();
+    xr_->leftSelectTrigger.interrupt();
+    xr_->menuPress.interrupt();
+    xr_->spawnPress.interrupt();
+    xr_->undoPress.interrupt();
+    xr_->redoPress.interrupt();
     endFrame(); // endFrame counts the zero-layer outcome
     return FrameStatus::Skipped;
   };
@@ -1105,6 +1155,10 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   // Render and submit the same raw located poses, preserving the natural
   // eye baseline and roll in the same tracking space as hands and controllers.
   inputFromXrViews(xr_->views, inputOut);
+  std::uint32_t const trackedFlags = XR_VIEW_STATE_POSITION_TRACKED_BIT |
+                                     XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+  inputOut.viewTracked = locateOk && viewCount == 2U &&
+      (viewState.viewStateFlags & (poseFlags | trackedFlags)) == (poseFlags | trackedFlags);
 
   if (!syncActions(inputOut, static_cast<std::uint64_t>(xr_->frameState.predictedDisplayTime))) {
     ++stats_.actionFail;
@@ -1135,12 +1189,11 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   }
   xr_->frameReady = true;
   xr_->selectInterruptedPending = false;
-  // The app consumes this frame's undo/redo presses now; a later skip must
-  // not swallow a fresh press or replay this one.
-  xr_->undoPending = false;
-  xr_->redoPending = false;
-  xr_->spawnPending = false;
-  xr_->menuPending = false;
+  // The app consumes this frame's button presses now; never replay them.
+  xr_->undoPress.consume();
+  xr_->redoPress.consume();
+  xr_->spawnPress.consume();
+  xr_->menuPress.consume();
   return FrameStatus::Render;
 }
 

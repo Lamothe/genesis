@@ -70,7 +70,7 @@ void main() {
   }
   // State highlight: 6 = the carousel's placeable centre preview (a subtle
   // COOL rim on grazing-angle pixels plus a faint wash so flat faces read
-  // too — no banner, no heavy fill tint), 5 = selected (a THIN warm rim on grazing-angle
+  // too — no banner, no heavy fill tint), 5 = selected (a THIN neutral rim on grazing-angle
   // pixels — the model's own shading is untouched; the user rejected fill
   // tints as too heavy), 3..4 = delete charge (red ramp: 3.0 means charge
   // 0, 4.0 means "about to delete").
@@ -85,8 +85,8 @@ void main() {
                vec3(0.55, 0.85, 1.0) * rim * 0.55;
   } else if (highlight > 4.5) {
     vec3 toCamera = normalize(frame.cameraPos.xyz - vWorldPos);
-    float rim = pow(1.0 - abs(dot(n, toCamera)), 3.0);
-    base.rgb += vec3(0.95, 0.62, 0.25) * rim * 0.55;
+    float rim = pow(1.0 - abs(dot(n, toCamera)), 6.0);
+    base.rgb += vec3(0.75) * rim * 0.55;
   } else if (highlight > 2.5) {
     float charge = clamp(highlight - 3.0, 0.0, 1.0);
     base.rgb = mix(base.rgb, vec3(1.0, 0.12, 0.08), 0.30 + 0.45 * charge);

@@ -92,8 +92,8 @@ over browsing. Otherwise, clicking anywhere left or right of centre browses
 one model per click (previous on the left, next on the right — there is no
 central dead zone; a grazing clip is inert). **N**
 closes without placing), **Delete** removes the selection (model or part),
-**Esc** quits. The selection is marked by a thin warm rim in the shader (a
-part selection marks the part) and the current mode's name shows as
+**Esc** quits. The selection is marked by a neutral angle-based shader rim (not a silhouette border) (a
+part selection marks the part and its descendants) and the current mode's name shows as
 sans-serif text floating in front of the camera.
 
 In VR the right controller's **physical grip pose** is the manipulation input;
@@ -108,14 +108,28 @@ pointing. There is one owner grab at a time, and the controls are:
   grab used: lateral motion follows the controller in view, and depth changes by
   the same fraction as the grip's distance from the eye. The pivot is the picked
   surface point; release commits one undo step. A press on a different model
-  selects it; the grab can start without pointing back at the selection. Nothing snaps on
+  selects it; the grab can start without pointing back at the selection only when the tracked ray misses other models. An untracked or unavailable aim consumes a new press without selecting or grabbing; release and press again once tracking returns. Losing aim during an active grab does not stop it while the grip and view remain tracked. A pickable surrounding skydome therefore currently blocks an off-target grab. Nothing snaps on
   grab start because every update applies the cumulative delta to the captured
   start transforms.
+- **Left trigger:** a left-only press and release clears the selection, regardless of duration without pointing, including when aiming at a skydome. While a right-trigger grab is already active, a fresh left-trigger press joins uniform scaling based on the distance between the two physical controller grip positions. Release the left trigger to resume the right-hand move/rotation without a jump; release the right to commit the whole gesture as one undo step. The scale pivot is the selection bounds centre at join; a 4 cm minimum initial separation avoids unstable ratios. A left press held before the right grab cannot scale or deselect on release. If either pose is lost during scaling, the edit commits at the last tracked pose and requires release before another grab. Menu/carousel transitions suppress held triggers.
+- **Thumbsticks:** left stick flies forward/back along the current combined
+  virtual and physical view direction (including pitch) and strafes level;
+  looking down and moving forward descends. Right stick smoothly looks left,
+  right, up and down around the current head position. Physical head movement
+  and roll remain active. Rates are 1.5 m/s and 1.5 rad/s at full deflection,
+  with a radial 0.2 deadzone and a 50 ms maximum locomotion timestep. Sticks
+  never manipulate a selection. The right stick browses exclusively while the
+  carousel is open. Locomotion pauses while using the tools panel or triggers,
+  during a grab, and on untracked/stale views or focus/profile interruption;
+  after a pause each stick must return to neutral before it can resume. Vive
+  trackpads use touch: an active, untouched pad is neutral; an inactive pad or
+  touch action is not treated as a release.
 - **Grip pose quality:** the shell locates a separate grip action space for each
   controller and records VALID and TRACKED independently. A VALID-but-untracked
   grip can neither start nor update a grab, and there is no head-gaze fallback
-  for the physical pose. Losing tracking during a grab commits at the last good
-  pose and requires a real trigger release before another grab. Profile changes
+  for the physical pose. Losing grip or head/view tracking during a grab commits
+  at the last good pose. Selection and new grabs are disabled while the view is untracked; a
+  real trigger release after tracking returns is required. Profile changes
   and skipped/paused XR frames do the same.
 - **Left Menu:** one press opens/closes the real tools panel (**Models**,
   **Undo**, **Redo**, **Delete**, **Backdrop**), latched in the world in front of
@@ -127,19 +141,31 @@ pointing. There is one owner grab at a time, and the controls are:
   return to release before it can act again.
 - **Carousel:** **A** or the panel's **Models** button opens it. **Right stick
   X** browses the ring (one step per flick, held repeats every 0.25 s). The
+  View loss or a skipped frame pauses browsing; the right stick must return to
+  neutral after tracking resumes before it can browse again. The
   **right trigger loads the centred model — no pointing at it** — but only once
-  the ring is at rest, the right stick is active and neutral, and that centre slot has finished
-  loading and rested for 0.12 s. A trigger press while it is loading or
+  the ring is at rest, the right stick is active and neutral (or the right
+  controller is confirmed as a stick-less simple controller), and that centre
+  slot has finished loading and rested for 0.12 s. A trigger press while it is loading or
   unsettled is consumed: it never replays when the load completes, so it cannot
   place a different model than the one visible at the press. The centre
   preview wears the cool rim while a trigger press would place now (readiness,
-  not aim). Profiles without an active right stick cannot place from the carousel.
+  not aim). A temporarily inactive or invalid stick on other profiles cannot
+  authorise placement. A simple controller can place the centred item, but
+  cannot browse using a stick.
   Placement is at natural size on the floor below the centred preview,
   one undo step, and closes the carousel.
+- **Menu**, **A**, **B** and **Y** require a tracked view and an active physical release after
+  an inactive action, focus/profile interruption or skipped frame before a new
+  press can toggle the panel or carousel or invoke undo/redo. Interrupted presses are discarded.
 - **A** still opens/closes the carousel directly, undo (**B**)/redo (**Y**) and
   hold-**X** delete remain, and **grip** remains the part-selection modifier.
-  Thumbstick clicks do nothing. The VR thumbsticks never move, rotate or scale a
-  model: the right stick only browses the carousel and the left stick is unused.
+  Thumbstick clicks do nothing. Vive trackpad clicks are not undo/redo: use
+  the tools panel instead, so navigation cannot accidentally alter history.
+  Quest face-button shortcuts are unchanged. A view interruption cancels a
+  Delete hold; release after tracking returns is required before another hold.
+  Neither stick moves, rotates or
+  scales a model.
 - **Hands:** tracked hand/arm surfaces still render, depth-tested against the
   scene, and the **left palm-up pinch** menu still opens the tools panel. Hand
   pinch/grasp no longer selects, grabs, moves or scales models; the old hand-grab
@@ -148,17 +174,18 @@ pointing. There is one owner grab at a time, and the controls are:
   Models in the hand-only menu requires switching to the right controller.
 
 **Verification status:** strict build; core, hand, XR-view and hand-mesh tests;
-state-machine regressions for carousel placement gating (loading, settling,
-browsing, held-trigger latch, changed index), trigger select-then-grab,
-untracked poses, tools-panel capture/Delete hold and history; offscreen,
+state-machine regressions for carousel placement gating (including stick-less
+placement, loading, settling, browsing and held-trigger latch), trigger
+select-then-grab, head and controller tracking loss, Vive/Quest bindings,
+tools-panel capture/Delete hold and history; offscreen,
 textured, blend and perf smokes. The offscreen smoke also renders and checks the
-panel, and covers a controller-owner grab with position+orientation, refusal of
+panel, and covers controller move/rotation, joined scaling and hierarchy, refusal of
 an untracked pose, undo and release. The **XR frame smoke was not available**:
 it was not run during this handover to avoid disturbing the active XR session.
 Runtime bindings and headset usability remain **unverified**.
 
 The **bounding box is not a click target**: pressing empty space next to a model
-selects nothing. The selection is shown by a thin warm rim; the mode label is
+selects nothing. The selection is shown by a neutral angle-based shader rim, not a silhouette border; the mode label is
 desktop-only (there is no fixed MOVE label in VR). The carousel is a
 **stationary ring** of library models: the centred model is staged at eye height
 and the previous/next models sit visible at the sides as cheap geometry-only
@@ -166,16 +193,19 @@ previews (textures load when a model is placed; each preview is labelled with
 its filename stem). The library folder (`~/Downloads/VR` by default,
 `--library DIR`) is rescanned every time the carousel opens — drop a file in and
 place it without restarting. **Hold X** to delete: the selection ramps red and
-the delete fires at full charge (0.6 s); release before that to cancel. **B**
+the delete fires at full charge (0.6 s); release before that to cancel. Changing
+the selection or opening or closing the carousel or tools panel cancels the
+charge; release X and press it again before deleting. **B**
 (right) / **Y** (left) on Touch undo/redo, trackpad click on Vive. Passthrough
 is the DEFAULT view: the real world with the models drawn over it (the
-**Backdrop** button, or desktop **B**, toggles the grid back). There are no
-flight controls in VR by design: passthrough means you walk around the real
-world with the models placed in it, so locomotion is physical — you walk, turn
-and crouch. The sticks never edit or drive locomotion (their output is still
-logged at session end as controller diagnostics). The view uses the headset's
-located eye poses, including head roll, while the world rig remains level with
-gravity. Desktop keeps its keyboard
+**Backdrop** button, or desktop **B**, toggles the grid back). VR flight and look change the virtual tracking-to-world rig, not the physical
+room. In passthrough, virtual models will no longer align with physical surroundings
+after stick movement or rotation; artificial pitch also tilts the virtual world
+against gravity. This can be disorienting and create collision risk: move slowly,
+keep a clear physical play area, and rely on the headset boundary, not virtual
+models, for real-world safety. There is no real-room collision detection or
+rig reset control. The compositor receives the original eye poses, retaining
+stereo and physical head roll. Desktop keeps its keyboard
 flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
 
 ## Animation and rendering status

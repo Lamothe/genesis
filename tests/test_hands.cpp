@@ -34,6 +34,45 @@ bool near(Mat4 const& a, Mat4 const& b) {
 }
 
 
+void leftTriggerWorkflow() {
+  using A = LeftTriggerWorkflow::Action;
+  LeftTriggerWorkflow w;
+  auto sample = [&](bool enabled, bool active, bool held, bool pressed, bool released,
+                    bool right, bool grabbing, bool poses, float dt = .1F) {
+    return w.update(enabled, active, held, pressed, released, right, grabbing, poses, dt);
+  };
+  CHECK(sample(true, true, true, true, false, false, false, true) == A::none);
+  CHECK(sample(true, true, false, false, true, false, false, true) == A::none);
+  CHECK(sample(true, true, true, true, false, false, false, true) == A::none);
+  CHECK(sample(true, true, false, false, true, false, false, true) == A::clearSelection);
+  CHECK(sample(true, true, true, true, false, false, false, true) == A::none);
+  CHECK(sample(true, true, true, false, false, false, false, true, .4F) == A::none);
+  CHECK(sample(true, true, false, false, true, false, false, true) == A::clearSelection);
+  CHECK(sample(true, true, true, true, false, true, true, true) == A::beginScale);
+  CHECK(w.scaling());
+  CHECK(sample(true, true, true, false, false, true, true, true) == A::none);
+  CHECK(sample(true, true, false, false, true, true, true, true) == A::endScale);
+  CHECK(!w.scaling());
+  CHECK(sample(true, true, true, true, false, true, true, false) == A::none);
+  CHECK(sample(true, true, false, false, true, true, true, true) == A::none);
+  CHECK(sample(true, true, true, true, false, true, true, true) == A::beginScale);
+  CHECK(sample(true, true, true, false, false, true, true, false) == A::trackingLost);
+  CHECK(sample(true, true, true, false, false, true, true, true) == A::none);
+  CHECK(sample(true, true, false, false, true, false, false, true) == A::none);
+  CHECK(sample(true, true, true, true, false, false, false, true) == A::none);
+  CHECK(sample(false, true, true, false, false, false, false, true) == A::none);
+  CHECK(sample(true, true, false, false, true, false, false, true) == A::none);
+  CHECK(sample(true, true, true, true, false, false, false, true) == A::none);
+  CHECK(sample(true, true, true, false, false, true, true, true) == A::none);
+  CHECK(sample(true, true, false, false, true, true, true, true) == A::none);
+  CHECK(sample(true, true, true, true, false, true, true, true) == A::beginScale);
+  CHECK(sample(true, true, true, false, false, false, false, true) == A::none);
+  CHECK(sample(true, true, false, false, true, false, false, true) == A::none);
+  CHECK(sample(true, true, true, true, false, true, true, true) == A::beginScale);
+  CHECK(sample(true, false, true, false, false, true, true, true) == A::trackingLost);
+}
+
+
 void booleanRearmLatch() {
   BooleanRearmLatch latch;
   // No initial hold can start until an active release has been observed.
@@ -66,6 +105,15 @@ void booleanRearmLatch() {
   CHECK(!latch.update(true, false));
   CHECK(latch.update(true, true));
 
+  // View loss while charging cancels and blocks until a release on a tracked
+  // frame. An apparent release during view loss must not rearm it.
+  CHECK(!latch.updateTracked(false, true, false));
+  CHECK(!latch.updateTracked(true, true, true));
+  CHECK(!latch.updateTracked(true, false, false));
+  CHECK(!latch.updateTracked(true, true, true));
+  CHECK(!latch.updateTracked(true, true, false));
+  CHECK(latch.updateTracked(true, true, true));
+
   // An interrupt after a hold has fired also blocks repeat until release.
   latch.interrupt();
   CHECK(!latch.update(true, true));
@@ -75,6 +123,129 @@ void booleanRearmLatch() {
   CHECK(latch.update(true, true));
 }
 
+
+void togglePressInterruptions() {
+  // Menu and A use identical edge semantics. No input query failure, inactive
+  // action, focus/profile interruption, skipped frame or lost view is a release.
+  for (int button = 0; button < 2; ++button) {
+    BooleanPressLatch latch;
+    latch.updateTracked(true, true, true);
+    CHECK(!latch.pending());
+    latch.updateTracked(true, true, false);
+    latch.updateTracked(true, true, true);
+    CHECK(latch.pending());
+    latch.consume();
+    latch.updateTracked(true, true, true);
+    CHECK(!latch.pending());
+
+    // A held button that becomes inactive cannot manufacture a second edge.
+    latch.updateTracked(true, false, false);
+    latch.updateTracked(true, true, true);
+    CHECK(!latch.pending());
+    latch.updateTracked(true, false, false);
+    latch.updateTracked(true, true, true);
+    CHECK(!latch.pending());
+    latch.updateTracked(true, true, false);
+    latch.updateTracked(true, true, true);
+    CHECK(latch.pending());
+
+    // A pending press is discarded on loss, not replayed on reacquisition.
+    latch.updateTracked(false, true, false);
+    CHECK(!latch.pending());
+    latch.updateTracked(false, true, true);
+    CHECK(!latch.pending());
+    latch.updateTracked(true, true, true);
+    CHECK(!latch.pending());
+    latch.updateTracked(true, true, false);
+    CHECK(!latch.pending());
+    latch.updateTracked(true, true, true);
+    CHECK(latch.pending());
+
+    // Explicit interruption covers focus/profile changes and skipped frames,
+    // including a press sampled just before image acquisition fails.
+    for (int reason = 0; reason < 3; ++reason) {
+      latch.interrupt();
+      CHECK(!latch.pending());
+      latch.updateTracked(true, true, true);
+      CHECK(!latch.pending());
+      latch.updateTracked(true, true, false);
+      latch.updateTracked(true, true, true);
+      CHECK(latch.pending());
+    }
+    latch.consume();
+    latch.updateTracked(true, true, false);
+    latch.updateTracked(true, true, true);
+    CHECK(latch.pending());
+  }
+}
+
+void deleteContextInterruptions() {
+  // Selection, carousel and menu changes all use the same rearm rule.
+  for (int transition = 0; transition < 5; ++transition) {
+    BooleanRearmLatch x;
+    ToolPanelPress panel;
+    CHECK(!x.updateTracked(true, true, false));
+    CHECK(x.updateTracked(true, true, true));
+    panel.press(ToolPanelPress::kDelete);
+    CHECK(panel.hold(true, ToolPanelPress::kDelete, .3F) == ToolPanelPress::Action::none);
+    CHECK(panel.charge() > 0.0F);
+    x.interrupt();
+    panel.cancel();
+    CHECK(panel.charge() == 0.0F);
+    CHECK(panel.hold(true, ToolPanelPress::kDelete, 1.0F) == ToolPanelPress::Action::none);
+    CHECK(!x.updateTracked(true, true, true));
+    CHECK(!x.updateTracked(true, false, false));
+    CHECK(!x.updateTracked(false, true, false));
+    CHECK(!x.updateTracked(true, true, true));
+    CHECK(!x.updateTracked(true, true, false));
+    CHECK(x.updateTracked(true, true, true));
+    panel.press(ToolPanelPress::kDelete);
+    CHECK(panel.hold(true, ToolPanelPress::kDelete, .6F) == ToolPanelPress::Action::deleteNow);
+  }
+}
+
+void historyPressInterruptions() {
+  // Exercise B and Y independently with the same sample/consume lifecycle as
+  // the shell, including interruptions both before and after a sampled edge.
+  for (int button = 0; button < 2; ++button) {
+    BooleanPressLatch latch;
+    auto frame = [&](bool safe, bool active, bool held) {
+      latch.updateTracked(safe, active, held);
+      bool const pressed = latch.pending();
+      latch.consume();
+      return pressed;
+    };
+    CHECK(!frame(true, true, false));
+    CHECK(frame(true, true, true));
+    CHECK(!frame(true, true, true)); // real uninterrupted hold is one edge
+    CHECK(!frame(true, true, false));
+    for (int reason = 0; reason < 3; ++reason) {
+      // Skipped frame, focus loss or profile change with a previously-up button.
+      latch.interrupt();
+      CHECK(!frame(true, true, true));
+      CHECK(!frame(true, true, true));
+      CHECK(!frame(true, true, false));
+      CHECK(frame(true, true, true));
+      CHECK(!frame(true, true, false));
+    }
+    // A query failure/inactive action and an untracked view cannot rearm.
+    CHECK(!frame(true, false, false));
+    CHECK(!frame(true, true, true));
+    CHECK(!frame(false, true, false));
+    CHECK(!frame(true, true, true));
+    CHECK(!frame(true, true, false));
+    CHECK(frame(true, true, true));
+    // A press sampled on a frame whose image acquisition fails is discarded.
+    CHECK(!frame(true, true, false));
+    latch.updateTracked(true, true, true);
+    CHECK(latch.pending());
+    latch.interrupt();
+    CHECK(!latch.pending());
+    CHECK(!frame(true, true, true));
+    CHECK(!frame(true, true, false));
+    CHECK(frame(true, true, true));
+  }
+}
 
 void selectTriggerLatch() {
   SelectTriggerLatch latch;
@@ -723,11 +894,32 @@ void carouselStickAvailability() {
   float const nan = std::numeric_limits<float>::quiet_NaN();
   float const infinity = std::numeric_limits<float>::infinity();
   CHECK(!carouselStickNeutral(false, neutral));
+  CHECK(carouselStickNeutral(false, neutral, true)); // confirmed simple controller
+  CHECK(!carouselStickNeutral(true, held, true)); // active binding still must be neutral
+  CHECK(!carouselStickNeutral(true, {nan, 0.0F}, true));
   CHECK(carouselStickNeutral(true, neutral));
   CHECK(carouselStickNeutral(true, {0.5F, 1.0F}));
   CHECK(!carouselStickNeutral(true, held));
   CHECK(!carouselStickNeutral(true, {nan, 0.0F}));
   CHECK(!carouselStickNeutral(true, {0.0F, infinity}));
+
+  // A confirmed stick-less controller can place, but cannot bypass loading,
+  // rest, settle dwell, or the consumed-press release requirement.
+  CarouselPlacementGate noStick;
+  bool const available = carouselStickNeutral(false, neutral, true);
+  CHECK(!noStick.update(true, 0, false, available, false, false, frame));
+  CHECK(!noStick.update(true, 0, false, available, true, true, frame));
+  for (int i = 0; i < 30; ++i) {
+    CHECK(!noStick.update(true, 0, true, false, true, false, frame)); // moving
+  }
+  CHECK(!noStick.ready());
+  for (int i = 0; i < 30; ++i) {
+    CHECK(!noStick.update(true, 0, true, available, true, false, frame));
+  }
+  CHECK(!noStick.ready()); // loading press was consumed
+  CHECK(!noStick.update(true, 0, true, available, false, false, frame));
+  CHECK(noStick.ready());
+  CHECK(noStick.update(true, 0, true, available, true, true, frame));
 
   CarouselPlacementGate gate;
   auto update = [&](bool active, Vec2 stick, bool triggerHeld, bool pressed) {
@@ -769,6 +961,18 @@ void carouselStickAvailability() {
   CHECK(update(true, neutral, true, true));
 }
 
+void viewTrackingTriggerInterruption() {
+  SelectTriggerLatch latch;
+  CHECK(!latch.updateTracked(true, true, 0.0F).pressed);
+  CHECK(latch.updateTracked(true, true, 1.0F).pressed);
+  auto lost = latch.updateTracked(false, true, 0.0F);
+  CHECK(!lost.active && lost.held && !lost.released);
+  CHECK(!latch.updateTracked(false, true, 1.0F).pressed);
+  CHECK(!latch.updateTracked(true, true, 1.0F).pressed);
+  CHECK(!latch.updateTracked(true, true, 0.0F).released);
+  CHECK(latch.updateTracked(true, true, 1.0F).pressed);
+}
+
 void controllerTriggerWorkflow() {
   using T = ControllerTriggerWorkflow::Target;
   using A = ControllerTriggerWorkflow::Action;
@@ -776,85 +980,108 @@ void controllerTriggerWorkflow() {
 
   // A selection that already existed at construction is not primed.
   ControllerTriggerWorkflow existing;
-  CHECK(existing.update(true, true, true, T::selected, true) == A::select);
-  CHECK(existing.update(true, true, true, T::selected, true) == A::none);
-  CHECK(existing.update(true, false, false, T::selected, true) == A::none);
-  CHECK(existing.update(true, true, true, T::selected, true) == A::beginGrab);
+  CHECK(existing.update(true, true, true, true, T::selected, true) == A::select);
+  CHECK(existing.update(true, true, true, true, T::selected, true) == A::none);
+  CHECK(existing.update(true, false, false, true, T::selected, true) == A::none);
+  CHECK(existing.update(true, true, true, true, T::selected, true) == A::beginGrab);
 
   // The first press selects and is consumed: holding it cannot grab.
-  CHECK(workflow.update(true, true, true, T::other, false) == A::select);
-  CHECK(workflow.update(true, true, false, T::selected, true) == A::none);
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::none); // held
-  CHECK(workflow.update(true, false, false, T::selected, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::other, false) == A::select);
+  CHECK(workflow.update(true, true, false, true, T::selected, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::none); // held
+  CHECK(workflow.update(true, false, false, true, T::selected, true) == A::none);
 
   // Release, then the next press on the current selection grabs.
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::beginGrab);
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::none);
-  CHECK(workflow.update(true, false, false, T::selected, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::beginGrab);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::selected, true) == A::none);
 
   // A different model still selects instead of grabbing, even when primed.
   CHECK(workflow.primed());
-  CHECK(workflow.update(true, true, true, T::other, true) == A::select);
+  CHECK(workflow.update(true, true, true, true, T::other, true) == A::select);
   CHECK(workflow.primed());
-  CHECK(workflow.update(true, true, true, T::none, true) == A::none); // held
-  CHECK(workflow.update(true, false, false, T::none, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::none, true) == A::none); // held
+  CHECK(workflow.update(true, false, false, true, T::none, true) == A::none);
 
-  // The next press grabs without pointing at the selection (also the target
-  // supplied when aim is unavailable); a hold cannot begin a second grab.
-  CHECK(workflow.update(true, true, true, T::none, true) == A::beginGrab);
+  // A tracked ray miss grabs without pointing at the selection; a hold
+  // cannot begin a second grab.
+  CHECK(workflow.update(true, true, true, true, T::none, true) == A::beginGrab);
   CHECK(workflow.primed());
-  CHECK(workflow.update(true, true, true, T::none, true) == A::none);
-  CHECK(workflow.update(true, false, false, T::none, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::none, true) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::none, true) == A::none);
+
+  // Missing aim is not a miss: consume the press even when primed, and do
+  // not replay it when tracking returns until a real release and new press.
+  CHECK(workflow.update(true, true, true, false, T::none, true) == A::none);
+  CHECK(workflow.primed() && workflow.blocked());
+  CHECK(workflow.update(true, true, false, true, T::other, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::none, true) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::none, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::none, true) == A::beginGrab);
+  CHECK(workflow.update(true, false, false, true, T::none, true) == A::none);
+
+  // With no primed selection, unavailable aim cannot clear a selection or
+  // select a target, and the same held press cannot act after reacquisition.
+  ControllerTriggerWorkflow unavailable;
+  CHECK(unavailable.update(true, true, true, false, T::none, true) == A::none);
+  CHECK(unavailable.update(true, true, false, true, T::other, true) == A::none);
+  CHECK(unavailable.update(true, false, false, false, T::none, true) == A::none);
+  CHECK(unavailable.update(true, true, true, false, T::other, true) == A::none);
+  CHECK(unavailable.update(false, false, false, true, T::none, true) == A::none);
+  CHECK(unavailable.blocked()); // inactive release cannot re-arm
+  CHECK(unavailable.update(true, true, true, true, T::other, true) == A::none);
+  CHECK(unavailable.update(true, false, false, true, T::none, true) == A::none);
+  CHECK(unavailable.update(true, true, true, true, T::other, true) == A::select);
 
   // With no primed selection, a genuine miss still clears or does nothing.
   ControllerTriggerWorkflow missed;
   CHECK(!missed.primed());
-  CHECK(missed.update(true, true, true, T::none, true) == A::clearSelection);
+  CHECK(missed.update(true, true, true, true, T::none, true) == A::clearSelection);
   CHECK(!missed.primed());
-  CHECK(missed.update(true, false, false, T::none, false) == A::none);
-  CHECK(missed.update(true, true, true, T::none, false) == A::none);
+  CHECK(missed.update(true, false, false, true, T::none, false) == A::none);
+  CHECK(missed.update(true, true, true, true, T::none, false) == A::none);
 
   // Removing the selection invalidates priming before handling a miss.
-  CHECK(workflow.update(true, false, false, T::none, false) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::none, false) == A::none);
   CHECK(!workflow.primed());
-  CHECK(workflow.update(true, true, true, T::none, false) == A::none);
-  CHECK(workflow.update(true, false, false, T::none, false) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::none, false) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::none, false) == A::none);
 
   // A disabled workflow makes no decision, including no clear on a miss.
-  CHECK(workflow.update(false, true, true, T::none, true) == A::none);
-  CHECK(workflow.update(false, false, false, T::none, true) == A::none);
+  CHECK(workflow.update(false, true, true, true, T::none, true) == A::none);
+  CHECK(workflow.update(false, false, false, true, T::none, true) == A::none);
 
   // A pre-existing selection must be selected and released before grabbing.
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::select);
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::none);
-  CHECK(workflow.update(true, false, false, T::selected, true) == A::none);
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::beginGrab);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::select);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::selected, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::beginGrab);
 
   // A tracking interruption clears priming and requires a real release.
   workflow.reset();
   CHECK(workflow.blocked());
   CHECK(!workflow.primed());
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::none);
-  CHECK(workflow.update(true, false, false, T::selected, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::selected, true) == A::none);
   CHECK(!workflow.blocked());
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::select);
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::none);
-  CHECK(workflow.update(true, false, false, T::selected, true) == A::none);
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::beginGrab);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::select);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::selected, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::beginGrab);
 
   // A reset prevents grabbing on a miss until a new selection is made.
   workflow.reset();
   CHECK(!workflow.primed());
-  CHECK(workflow.update(true, true, true, T::none, true) == A::none);
-  CHECK(workflow.update(true, false, false, T::none, true) == A::none);
-  CHECK(workflow.update(true, true, true, T::none, true) == A::clearSelection);
+  CHECK(workflow.update(true, true, true, true, T::none, true) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::none, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::none, true) == A::clearSelection);
 
   // External selection removal invalidates prior priming on the same frame.
-  CHECK(workflow.update(true, false, false, T::none, false) == A::none);
-  CHECK(workflow.update(true, true, true, T::selected, true) == A::select);
+  CHECK(workflow.update(true, false, false, true, T::none, false) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::selected, true) == A::select);
   CHECK(workflow.primed());
-  CHECK(workflow.update(true, false, false, T::none, true) == A::none);
-  CHECK(workflow.update(true, true, true, T::none, false) == A::none);
+  CHECK(workflow.update(true, false, false, true, T::none, true) == A::none);
+  CHECK(workflow.update(true, true, true, true, T::none, false) == A::none);
   CHECK(!workflow.primed());
 }
 
@@ -973,7 +1200,11 @@ int main() {
   CHECK(smoothHandPose(smoothed, tiny, .01F).position.x > smoothed.position.x);
   CHECK(handScaleRatio(.2F, .4F) == 2.0F);
   CHECK(handScaleRatio(.0F, .4F) == 1.0F);
+  leftTriggerWorkflow();
   booleanRearmLatch();
+  togglePressInterruptions();
+  historyPressInterruptions();
+  deleteContextInterruptions();
   selectTriggerLatch();
   graspArbitration();
   contactCacheLifetime();
@@ -989,6 +1220,7 @@ int main() {
   controllerPoseQuality();
   carouselPlacementGate();
   carouselStickAvailability();
+  viewTrackingTriggerInterruption();
   controllerTriggerWorkflow();
   toolPanelPress();
   std::printf("Hand tests: %d checks, %d failures\n", checks, failures);

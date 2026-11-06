@@ -45,5 +45,10 @@ fi
   src/camera.cpp tests/test_xr_views.cpp -o .build/test-xr-views
 ./.build/test-xr-views
 "$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
+  src/camera.cpp tests/test_vr_locomotion.cpp -o .build/test-vr-locomotion
+./.build/test-vr-locomotion
+"$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 tests/test_xr_bindings.cpp -o .build/test-xr-bindings
+./.build/test-xr-bindings
+"$CXX_BIN" -std=c++20 -Wall -Wextra -Werror -O2 -Iinclude \
   src/hand_mesh.cpp tests/test_hand_mesh.cpp -o .build/test-hand-mesh
 exec ./.build/test-hand-mesh

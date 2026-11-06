@@ -54,6 +54,11 @@ class SelectTriggerLatch {
  public:
   void interrupt() { blocked_ = true; }
 
+  // A view loss is an interruption even if the controller trigger is active.
+  SelectTriggerOutput updateTracked(bool viewTracked, bool active, float value) {
+    return update(viewTracked && active, value);
+  }
+
   SelectTriggerOutput update(bool active, float value) {
     SelectTriggerOutput output;
     output.active = active && std::isfinite(value);
@@ -82,12 +87,62 @@ class SelectTriggerLatch {
   bool held_{false};
 };
 
+// Left trigger either clears on release, or joins an already live
+// right grab. A press held across any context transition must be released.
+class LeftTriggerWorkflow {
+ public:
+  enum class Action : std::uint8_t { none, clearSelection, beginScale, endScale, trackingLost };
+  void interrupt() { blocked_ = true; candidate_ = false; scaling_ = false; }
+  Action update(bool enabled, bool active, bool held, bool pressed, bool released,
+                bool rightHeld, bool grabbing, bool posesUsable, float /*dt*/) {
+    if (!enabled || !active) {
+      bool const lost = scaling_;
+      interrupt();
+      return lost ? Action::trackingLost : Action::none;
+    }
+    if (blocked_) {
+      if (!held) { blocked_ = false; }
+      return Action::none;
+    }
+    if (scaling_) {
+      if (!grabbing || !rightHeld) { scaling_ = false; candidate_ = false; return Action::none; }
+      if (!posesUsable) { interrupt(); return Action::trackingLost; }
+      if (released) { scaling_ = false; return Action::endScale; }
+      return Action::none;
+    }
+    if (rightHeld) { candidate_ = false; }
+    if (pressed) {
+      if (grabbing && rightHeld && posesUsable) {
+        scaling_ = true;
+        candidate_ = false;
+        return Action::beginScale;
+      }
+      candidate_ = !rightHeld && !grabbing;
+    }
+    if (released) {
+      bool const clear = candidate_ && !rightHeld && !grabbing;
+      candidate_ = false;
+      return clear ? Action::clearSelection : Action::none;
+    }
+    return Action::none;
+  }
+  bool scaling() const { return scaling_; }
+ private:
+  bool blocked_{true};
+  bool candidate_{false};
+  bool scaling_{false};
+};
+
 // A boolean hold is actionable only after an active physical release. Inactive
 // samples and explicit interruptions block it, even when the supplied value is
 // false. The first active release rearms silently; a later press is actionable.
 class BooleanRearmLatch {
  public:
   void interrupt() { blocked_ = true; }
+
+  bool updateTracked(bool viewTracked, bool active, bool held) {
+    return update(viewTracked && active, held);
+  }
 
   bool update(bool active, bool held) {
     if (!active) {
@@ -105,12 +160,40 @@ class BooleanRearmLatch {
   bool blocked_{true};
 };
 
-// Only a valid right-stick sample can prove the browse axis is neutral.
-// The carousel browses on X above 0.5; Y must also be finite so a corrupt
-// vector never authorises a placement. Unbound profiles remain blocked.
-inline bool carouselStickNeutral(bool active, Vec2 stick) {
-  return active && std::isfinite(stick.x) && std::isfinite(stick.y) &&
-         std::fabs(stick.x) <= 0.5F;
+// Edge-triggered menu/carousel/history actions must not turn an interruption into a
+// release. A pending press is also discarded if its frame is interrupted.
+class BooleanPressLatch {
+ public:
+  void interrupt() { blocked_ = true; held_ = false; pending_ = false; }
+
+  void updateTracked(bool viewTracked, bool active, bool held) {
+    if (!viewTracked || !active) {
+      interrupt();
+      return;
+    }
+    if (!held) {
+      blocked_ = false;
+      held_ = false;
+      return;
+    }
+    if (!blocked_ && !held_) { pending_ = true; }
+    held_ = true;
+  }
+
+  bool pending() const { return pending_; }
+  void consume() { pending_ = false; }
+
+ private:
+  bool blocked_{true};
+  bool held_{false};
+  bool pending_{false};
+};
+
+// Only a confirmed no-stick profile can bypass the neutral-sample check.
+// A temporarily inactive or corrupt stick on any other profile remains unsafe.
+inline bool carouselStickNeutral(bool active, Vec2 stick, bool confirmedNoStick = false) {
+  return (!active && confirmedNoStick) || (active && std::isfinite(stick.x) && std::isfinite(stick.y) &&
+                             std::fabs(stick.x) <= 0.5F);
 }
 
 // The carousel's centre trigger. Placement is no longer a pointing action:
@@ -191,8 +274,10 @@ class CarouselPlacementGate {
 //      press is a genuine miss) and is consumed, so it can never also grab;
 //   2. release;
 //   3. the next press starts a physical grab of the CURRENT selection even
-//      with no aim target, unless it targets another object; the grab then
+//      on a tracked ray miss, unless it targets another object; the grab then
 //      follows the grip pose until the trigger is released.
+// A press without tracked aim is consumed without selecting, clearing or
+// grabbing; it cannot replay if aim tracking returns while held.
 // One physical press gives one decision. `reset()` after a tracking loss or a
 // menu/gallery transition requires a real release before anything may start.
 class ControllerTriggerWorkflow {
@@ -203,17 +288,20 @@ class ControllerTriggerWorkflow {
   void reset() { blocked_ = true; primed_ = false; }
 
   Action update(bool enabled, bool triggerHeld, bool triggerPressed,
-                Target target, bool hasSelection) {
+                bool aimTracked, Target target, bool hasSelection) {
     if (!hasSelection) {
       primed_ = false;
     }
-    if (!triggerHeld) {
+    if (enabled && !triggerHeld) {
       blocked_ = false;
     }
     if (!enabled || !triggerPressed || blocked_) {
       return Action::none;
     }
     blocked_ = true; // exactly one decision per physical press
+    if (!aimTracked) {
+      return Action::none; // unavailable aim is not a ray miss
+    }
     switch (target) {
     case Target::selected:
       if (primed_ && hasSelection) {

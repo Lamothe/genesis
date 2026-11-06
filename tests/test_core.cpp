@@ -1829,6 +1829,47 @@ void testEditorHistoryDerivedBounds() {
   CHECK_NEAR(scene.local(animated).translation.x, 0.0F, 1e-5F);
 }
 
+void testSelectionSubtrees() {
+  vredit::Scene scene;
+  auto const root = scene.create();
+  auto const parent = scene.create(root);
+  auto const child = scene.create(parent);
+  auto const grandchild = scene.create(child);
+  auto const sibling = scene.create(root);
+  auto const disconnected = scene.create();
+  auto const disconnectedChild = scene.create(disconnected);
+  auto const dead = scene.create();
+  scene.destroy(dead);
+  std::vector<NodeId> const selection{parent, grandchild, disconnected, parent,
+                                      vredit::kInvalidNode, dead};
+  auto const before = scene.snapshot();
+  vredit::SelectionSubtrees subtrees(scene, selection);
+  // Query children first, and then repeat to exercise cached paths.
+  CHECK(subtrees.contains(grandchild));
+  CHECK(subtrees.contains(child));
+  CHECK(subtrees.contains(parent));
+  CHECK(subtrees.contains(disconnectedChild));
+  CHECK(subtrees.contains(disconnected));
+  CHECK(!subtrees.contains(root));
+  CHECK(!subtrees.contains(sibling));
+  CHECK(!subtrees.contains(dead));
+  CHECK(!subtrees.contains(vredit::kInvalidNode));
+  CHECK(!subtrees.contains(static_cast<NodeId>(999999)));
+  CHECK(subtrees.contains(child));
+  CHECK(!subtrees.contains(sibling));
+  CHECK(vredit::sameSnapshot(before, scene.snapshot()));
+  CHECK(selection.size() == 6U && selection[0] == parent && selection[1] == grandchild);
+
+  scene.setParent(child, sibling);
+  vredit::SelectionSubtrees afterReparent(scene, {parent});
+  CHECK(afterReparent.contains(parent));
+  CHECK(!afterReparent.contains(child));
+  CHECK(!afterReparent.contains(grandchild));
+  vredit::SelectionSubtrees empty(scene, {});
+  CHECK(!empty.contains(root));
+  CHECK(!empty.contains(parent));
+}
+
 void testEditorStateOps() {
   using vredit::EditorSnapshot;
   using vredit::ModelGroups;
@@ -3038,6 +3079,7 @@ int main() {
   testViewerRotationAxes();
   testScaleSelectionUniform();
   testEditorHistoryDerivedBounds();
+  testSelectionSubtrees();
   testEditorStateOps();
   testHandlePicking();
   testHandlePickingBehindCamera();

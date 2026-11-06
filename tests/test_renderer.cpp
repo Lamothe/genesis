@@ -78,7 +78,39 @@ int main() {
     return 1;
   }
 
+  // Selection adds a neutral, grazing-only rim, not a warm fill. Use a
+  // deliberately edge-on normal and compare actual shader output at centre.
+  MeshData rimMesh = source;
+  for (auto& v : rimMesh.vertices) { v.normal = {1, 0, 0}; v.colour = {.15F, .15F, .15F}; }
+  item = DrawItem{};
+  item.mesh = renderer.addMesh(rimMesh);
+  item.model = translationMatrix({0, 0, -3});
+  item.lit = false;
+  std::vector<std::uint8_t> rimBase;
+  std::vector<std::uint8_t> rimSelected;
+  if (item.mesh == kInvalidMesh || !render(renderer, camera, item, rimBase)) { return 1; }
+  item.highlight = 5.0F;
+  if (!render(renderer, camera, item, rimSelected)) { return 1; }
+  int const dr = static_cast<int>(rimSelected[centre]) - rimBase[centre];
+  int const dg = static_cast<int>(rimSelected[centre+1]) - rimBase[centre+1];
+  int const db = static_cast<int>(rimSelected[centre+2]) - rimBase[centre+2];
+  if (dr < 20 || std::abs(dr-dg) > 2 || std::abs(dr-db) > 2) {
+    std::printf("renderer test: selection rim not neutral (%d %d %d)\n", dr, dg, db);
+    return 1;
+  }
+  for (auto& v : rimMesh.vertices) { v.normal = {0, 0, 1}; }
+  item.mesh = renderer.addMesh(rimMesh);
+  item.highlight = 0.0F;
+  if (item.mesh == kInvalidMesh || !render(renderer, camera, item, rimBase)) { return 1; }
+  item.highlight = 5.0F;
+  if (!render(renderer, camera, item, rimSelected) ||
+      std::abs(static_cast<int>(rimSelected[centre]) - rimBase[centre]) > 1) {
+    std::printf("renderer test: selection adds face fill\n");
+    return 1;
+  }
+
   // Mirroring changes the determinant sign as well as the normal direction.
+  item = DrawItem{};
   MeshData mirrored = source;
   for (auto& v : mirrored.vertices) {
     v.pos.x *= -2.0F;

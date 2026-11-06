@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -78,6 +79,21 @@ bool nodesBounds(Scene& scene,
                  std::vector<NodeVisual> const& visuals,
                  std::vector<NodeId> const& ids,
                  Aabb& boundsOut);
+
+// Per-frame membership in the union of the selected subtrees. Memoising
+// ancestors avoids repeatedly walking shared chains for large hierarchies.
+// Construct afresh after any selection or hierarchy change.
+class SelectionSubtrees {
+public:
+  SelectionSubtrees(Scene const& scene, std::vector<NodeId> const& selection);
+  bool contains(NodeId id);
+
+private:
+  Scene const& scene_;
+  bool hasSelection_{false};
+  std::unordered_map<NodeId, bool> membership_;
+  std::vector<NodeId> path_;
+};
 
 // The one delete rule: removes the SUBTREES rooted at the given nodes.
 // Roots that are descendants of other roots collapse into their topmost

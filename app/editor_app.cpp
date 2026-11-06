@@ -25,6 +25,7 @@
 #include <xcb/xcb.h>
 
 #include "xr_shell.h"
+#include "vr_locomotion.h"
 
 #include "animation.h"
 #include "camera.h"
@@ -170,6 +171,7 @@ inline std::uint64_t meshContentHash(MeshData const& data) {
 
 struct App;
 bool smokeHandEditing(App& app, VkRenderer& renderer);
+bool smokeControllerRig(App& app, VkRenderer& renderer);
 inline MeshHandle cachedMesh(App& app, VkRenderer& renderer, MeshData const& data);
 
 // One animated skinned primitive. The rest mesh is copied for this instance
@@ -220,11 +222,7 @@ struct App {
   // Backdrop = the ground grid + the tinted clear colour. Toggled off
   // ("show the model without the background"), the scene is a plain void.
   bool showBackdrop{false}; // passthrough/void is the default; B or menu-hold adds the grid
-  // Editing mode (desktop 1/2 only: the VR menu tap is the carousel now, and
-  // rotation comes back as gestures). The RIGHT stick is mode-driven: move =
-  // X uniform scale, Y height; rotate = X spins about the scene's up axis,
-  // Y lifts/lowers the face. The LEFT stick is planar floor-move in BOTH
-  // modes; nothing rotates in move.
+  // Desktop-only arrow editing mode; VR sticks control the viewer, not models.
   EditMode mode{EditMode::move};
   bool looking{false};
   bool panning{false};
@@ -254,8 +252,7 @@ struct App {
   Vec3 ringOrigin{0.0F, 0.0F, 0.0F};
   Vec3 ringForward{0.0F, 0.0F, -1.0F};
   vredit::EditorSnapshot galleryBefore{}; // undo "before" for the placement
-  double galleryCycleCooldown{0.0}; // stick-held cycling: one step per 0.25 s
-  bool galleryStickArmed{false};
+  VrCarouselBrowse galleryBrowse;
   bool panelTriggerArmed{false};
   // The centre preview's rim highlight: in VR it means "a trigger press would
   // place the settled, loaded centre model now" (no aim requirement); on
@@ -271,6 +268,7 @@ struct App {
   GrabOwner grabOwner{GrabOwner::none};
   // Trigger/carousel/menu state machines (pure, unit-tested in test_hands).
   ControllerTriggerWorkflow triggerWorkflow;
+  LeftTriggerWorkflow leftTriggerWorkflow;
   NodeId controllerPivotNode{kInvalidNode};
   Vec3 controllerPivotLocal{};
   CarouselPlacementGate carouselGate;
@@ -313,6 +311,7 @@ struct App {
   // nothing (the user's binding).
   // Hold-X delete (VR): the selection's tint ramps red over kDeleteChargeS
   // and the delete fires at full charge; release before that cancels.
+  BooleanRearmLatch deleteLatch;
   bool deleteHolding{false};
   std::chrono::steady_clock::time_point deleteHoldStart{};
   float deleteCharge{0.0F};
@@ -946,7 +945,20 @@ vredit::EditorSnapshot snapshot(App const& app) {
   return vredit::captureState(app.scene, app.visuals, app.modelGroups, app.selection);
 }
 
+// Delete gestures belong to the selection and UI context in which they began.
+void interruptDeleteGestures(App& app) {
+  app.deleteLatch.interrupt();
+  app.deleteHolding = false;
+  app.deleteCharge = 0.0F;
+  if (app.panelPress.button() == ToolPanelPress::kDelete) {
+    app.panelPress.cancel();
+    app.panelTriggerArmed = false;
+  }
+  if (app.handTool == ToolPanelPress::kDelete) { app.handTool = -1; }
+}
+
 void applySnapshot(App& app, VkRenderer& renderer, vredit::EditorSnapshot const& state) {
+  if (app.selection != state.selection) { interruptDeleteGestures(app); }
   vredit::restoreState(state, app.scene, app.visuals, app.modelGroups, app.selection);
   for (AnimationInstance& instance : app.animations) {
     // Start with the last valid bounds even if a restored joint is missing or
@@ -981,11 +993,10 @@ void pointerPress(App& app, PointerTarget const& target, bool partSelect) {
   // A press while a live stick gesture is running means its release was
   // never seen: commit it as one undo step before starting over.
   endEdits(app);
-  if (target.node == kInvalidNode) {
-    app.selection.clear();
-    return;
-  }
-  app.selection = vredit::expandSelection(app.modelGroups, target.node, partSelect);
+  auto const selection = target.node == kInvalidNode ? std::vector<NodeId>{}
+      : vredit::expandSelection(app.modelGroups, target.node, partSelect);
+  if (app.selection != selection) { interruptDeleteGestures(app); }
+  app.selection = selection;
 }
 
 // Cancels a live edit without touching the history: restores its pre-edit
@@ -994,6 +1005,7 @@ void pointerPress(App& app, PointerTarget const& target, bool partSelect) {
 // and nothing else — going through commit() instead would clear an existing
 // redo branch and make the cancelled edit itself redoable.
 void cancelLiveEdit(App& app, VkRenderer& renderer) {
+  app.leftTriggerWorkflow.interrupt();
   app.stickSession = false;
   app.grabActive = false;
   app.grabOwner = GrabOwner::none;
@@ -1034,6 +1046,7 @@ bool endEdits(App& app) {
 // The one delete rule (see deleteSubtrees): removes the selected models or
 // parts — subtrees rooted at the selection — as one undo step.
 bool deleteSelection(App& app) {
+  app.leftTriggerWorkflow.interrupt();
   app.triggerWorkflow.reset();
   if (app.selection.empty() || app.galleryActive) {
     // While the gallery is open, delete must not fire: the previews are
@@ -1044,6 +1057,7 @@ bool deleteSelection(App& app) {
   app.undo.begin(snapshot(app));
   std::vector<NodeId> const targets = app.selection;
   vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection, targets);
+  interruptDeleteGestures(app);
   return app.undo.commit(snapshot(app));
 }
 
@@ -1052,9 +1066,23 @@ bool deleteSelection(App& app) {
 // rather than committed, so the existing redo branch survives and the
 // cancelled gesture never becomes redoable. Returns true only when the
 // history stack actually moved.
-bool performUndo(App& app, VkRenderer& renderer) {
+void cancelPanelDelete(App& app) {
+  if (app.panelPress.button() == ToolPanelPress::kDelete) {
+    app.panelPress.cancel();
+    app.panelTriggerArmed = false;
+  }
+}
+
+void interruptHistoryGestures(App& app) {
   app.triggerWorkflow.reset();
-  if (app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive) {
+  app.leftTriggerWorkflow.interrupt();
+  interruptDeleteGestures(app);
+}
+
+bool performUndo(App& app, VkRenderer& renderer) {
+  bool const liveEdit = app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive;
+  interruptHistoryGestures(app);
+  if (liveEdit) {
     cancelLiveEdit(app, renderer);
     return false;
   }
@@ -1068,8 +1096,9 @@ bool performUndo(App& app, VkRenderer& renderer) {
 }
 
 bool performRedo(App& app, VkRenderer& renderer) {
-  app.triggerWorkflow.reset();
-  if (app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive) {
+  bool const liveEdit = app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive;
+  interruptHistoryGestures(app);
+  if (liveEdit) {
     cancelLiveEdit(app, renderer);
     return false;
   }
@@ -1080,6 +1109,34 @@ bool performRedo(App& app, VkRenderer& renderer) {
     return true;
   }
   return false;
+}
+
+// Shared frame path for the X and legacy hand-panel charge, with an explicit
+// clock sample so interruption and rearming can be exercised without waiting.
+void processDeleteCharge(App& app, bool viewTracked, bool active, bool held,
+                         bool interrupted, bool controllerPanelDelete, bool handPanelDelete,
+                         std::chrono::steady_clock::time_point now) {
+  if (interrupted) { app.deleteLatch.interrupt(); }
+  bool const deleteHeld = app.deleteLatch.updateTracked(viewTracked, active, held);
+  if ((deleteHeld || handPanelDelete) && !app.selection.empty() && !app.galleryActive) {
+    if (!app.deleteHolding) {
+      app.deleteHolding = true;
+      app.deleteHoldStart = now;
+    }
+    double const seconds = std::chrono::duration<double>(now - app.deleteHoldStart).count();
+    app.deleteCharge = static_cast<float>(std::min(seconds / kDeleteChargeS, 1.0));
+    if (app.deleteCharge >= 1.0F) {
+      deleteSelection(app);
+      app.deleteLatch.interrupt();
+      app.deleteHolding = false;
+      app.deleteCharge = 0.0F;
+    }
+  } else if (controllerPanelDelete) {
+    app.deleteHolding = false;
+  } else {
+    app.deleteHolding = false;
+    app.deleteCharge = 0.0F;
+  }
 }
 
 // Lowercased 4-character filename suffix for extension checks. The library
@@ -1316,6 +1373,8 @@ void galleryClose(App& app) {
   if (!app.galleryActive) {
     return;
   }
+  app.leftTriggerWorkflow.interrupt();
+  interruptDeleteGestures(app);
   galleryEvict(app);
   app.galleryActive = false;
   app.galleryAimPlaceable = false;
@@ -1495,13 +1554,13 @@ void galleryOpen(App& app, VkRenderer& renderer) {
   if (app.galleryActive) {
     return;
   }
+  app.leftTriggerWorkflow.interrupt();
   // The gallery owns the trigger while it is open: no tools panel behind it.
   app.menuOwner = MenuOwner::none;
   app.handPanel.visible = false;
   app.handHover = -1;
   app.panelPress.cancel();
-  app.deleteCharge = 0.0F;
-  app.deleteHolding = false;
+  interruptDeleteGestures(app);
   // A live grab must not keep mutating the world behind the carousel (and
   // its pending edit would tangle with the placement's): close it as its
   // own undo step first.
@@ -1524,8 +1583,7 @@ void galleryOpen(App& app, VkRenderer& renderer) {
   app.galleryAimPlaceable = false;
   // A stick held from before the open must not rotate the brand-new ring on
   // its first rendered frame.
-  app.galleryCycleCooldown = 0.0;
-  app.galleryStickArmed = false;
+  app.galleryBrowse.interrupt();
   if (!app.worker.thread.joinable()) {
     asyncStart(app.worker); // decode thread, lazily started (no-op after)
   }
@@ -1609,6 +1667,7 @@ bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
   target.y = 0.0F;
   vredit::placeOnFloor(app.scene, app.visuals, roots, target);
 
+  interruptDeleteGestures(app);
   app.selection =
       vredit::expandSelection(app.modelGroups, roots[0], /*partSelect=*/false);
   app.undo.commit(snapshot(app));
@@ -1681,9 +1740,7 @@ void assembleFrame(App& app,
   if (app.showBackdrop) {
     appendGrid(depthLines, 8.0F, 1.0F);
   }
-  auto isSelected = [&app](NodeId id) {
-    return std::find(app.selection.begin(), app.selection.end(), id) != app.selection.end();
-  };
+  SelectionSubtrees selectedSubtrees(app.scene, app.selection);
   // The centre preview subtree is the one whose exact surface places: it is
   // the only preview that ever lights up (highlight 6).
   auto centrePreview = [&app](NodeId id) {
@@ -1700,7 +1757,7 @@ void assembleFrame(App& app,
     return false;
   };
   // Build the draw items: opaque and mask items first, blended last.
-  auto appendItem = [&app, &items, &isSelected, &centrePreview](NodeVisual const& visual) {
+  auto appendItem = [&app, &items, &selectedSubtrees, &centrePreview](NodeVisual const& visual) {
     DrawItem item;
     item.mesh = visual.mesh;
     item.texture = visual.texture;
@@ -1713,10 +1770,10 @@ void assembleFrame(App& app,
     item.alphaCutoff = visual.alphaCutoff;
     item.alpha = visual.alpha;
     item.lit = true;
-    // The selection gets a thin warm RIM in the shader (5) — the user
+    // The selection gets a thin neutral RIM in the shader (5) — the user
     // rejected both the fill tint and the floating diamond. While the hold-X
     // delete charges, the selection ramps red (3 + charge).
-    if (isSelected(visual.id)) {
+    if (selectedSubtrees.contains(visual.id)) {
       item.highlight = app.deleteCharge > 0.0F ? 3.0F + app.deleteCharge : 5.0F;
     } else if (app.galleryAimPlaceable && centrePreview(visual.id)) {
       // The placeable centre preview wears a subtle cool rim (6) exactly
@@ -2090,8 +2147,59 @@ bool loadModels(App& app, VkRenderer& renderer, std::vector<char const*> const& 
   return true;
 }
 
+// Exercise the real frame assembly with a part whose meshless descendants and
+// blended visual are affected, plus an unrelated placeable preview.
+bool smokeSelectionSubtrees() {
+  App test;
+  NodeId const root = test.scene.create();
+  NodeId const parent = test.scene.create(root);
+  NodeId const intermediate = test.scene.create(parent); // meshless
+  NodeId const child = test.scene.create(intermediate);
+  NodeId const grandchild = test.scene.create(child);
+  NodeId const sibling = test.scene.create(root);
+  NodeId const preview = test.scene.create();
+  for (NodeId const id : {root, parent, child, sibling, preview, grandchild}) {
+    NodeVisual visual;
+    visual.id = id;
+    if (id == grandchild) { visual.alpha = AlphaMode::Blend; }
+    test.visuals.push_back(visual);
+  }
+  test.selection = {parent};
+  test.galleryActive = true;
+  test.galleryAimPlaceable = true;
+  test.carousel[0].index = test.ring.index;
+  test.carousel[0].hasModel = true;
+  test.carousel[0].wrapper = preview;
+  auto const before = snapshot(test);
+  std::vector<DrawItem> items;
+  std::vector<RendererVertex> depthLines;
+  std::vector<RendererVertex> overlayLines;
+  auto check = [&](float selected) {
+    items.clear(); depthLines.clear(); overlayLines.clear();
+    assembleFrame(test, items, depthLines, overlayLines);
+    return items.size() == 6U && items[0].highlight == 0.0F &&
+        items[1].highlight == selected && items[2].highlight == selected &&
+        items[3].highlight == 0.0F && items[4].highlight == 6.0F &&
+        items[5].highlight == selected && sameSnapshot(before, snapshot(test));
+  };
+  if (!check(5.0F)) { return false; }
+  test.deleteCharge = 0.5F;
+  if (!check(3.5F)) { return false; }
+  test.galleryActive = false;
+  if (!deleteSelection(test) || test.scene.valid(parent) || test.scene.valid(intermediate) ||
+      test.scene.valid(child) || test.scene.valid(grandchild) || !test.scene.valid(root) || !test.scene.valid(sibling) ||
+      !test.scene.valid(preview) || !test.selection.empty()) {
+    return false;
+  }
+  return true;
+}
+
 int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& modelPaths,
                       bool textured) {
+  if (!smokeSelectionSubtrees()) {
+    std::printf("SMOKE FAIL: selected subtree highlights or deletion\n");
+    return 1;
+  }
   App app;
   if (modelPaths.empty()) {
     buildDemoScene(app);
@@ -2173,7 +2281,7 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     for (NodeVisual const& visual : app.visuals) {
       app.selection.push_back(visual.id);
     }
-    // Re-render as the round-trip baseline: the selection state (and its warm
+    // Re-render as the round-trip baseline: the selection state (and its neutral
     // tint) must match the post-undo image or the comparison is meaningless.
     items.clear();
     depthLines.clear();
@@ -2347,7 +2455,33 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
     }
     return n;
   };
+  auto const deleteTestTime = std::chrono::steady_clock::now();
+  processDeleteCharge(app, true, true, false, false, false, false, deleteTestTime);
+  processDeleteCharge(app, true, true, true, false, false, false, deleteTestTime);
+  processDeleteCharge(app, true, true, true, false, false, false,
+                      deleteTestTime + std::chrono::milliseconds(300));
   galleryOpen(app, renderer);
+  if (!app.galleryActive || app.deleteHolding || app.deleteCharge != 0.0F) {
+    std::printf("SMOKE FAIL: carousel open did not cancel X\n"); return 1;
+  }
+  processDeleteCharge(app, true, true, true, false, false, false,
+                      deleteTestTime + std::chrono::seconds(2));
+  if (app.deleteHolding) {
+    std::printf("SMOKE FAIL: carousel open rearmed held X\n"); return 1;
+  }
+  // An active release while open can rearm X; closing without placement must
+  // interrupt it again, even if no delete frame ran during the transition.
+  processDeleteCharge(app, true, true, false, false, false, false, deleteTestTime);
+  processDeleteCharge(app, true, true, true, false, false, false, deleteTestTime);
+  galleryClose(app);
+  processDeleteCharge(app, true, true, true, false, false, false,
+                      deleteTestTime + std::chrono::seconds(3));
+  if (app.deleteHolding) {
+    std::printf("SMOKE FAIL: carousel close rearmed held X\n"); return 1;
+  }
+  galleryOpen(app, renderer);
+  processDeleteCharge(app, true, true, false, false, false, false, deleteTestTime);
+  processDeleteCharge(app, true, true, true, false, false, false, deleteTestTime);
   pump();
   if (!app.galleryActive || staged() == 0 || app.visuals.size() <= baseVisuals) {
     std::printf("SMOKE FAIL: carousel staged nothing\n");
@@ -2611,6 +2745,14 @@ int runSmokeOffscreen(char const* shaderDir, std::vector<char const*> const& mod
   if (app.galleryActive || app.selection.empty()) {
     std::printf("SMOKE FAIL: exact centre press did not place\n");
     return 1;
+  }
+  auto const afterPlacement = snapshot(app);
+  processDeleteCharge(app, true, true, true, false, false, false,
+                      deleteTestTime + std::chrono::seconds(10));
+  processDeleteCharge(app, true, true, true, false, false, false,
+                      deleteTestTime + std::chrono::seconds(11));
+  if (app.deleteHolding || !sameSnapshot(snapshot(app), afterPlacement)) {
+    std::printf("SMOKE FAIL: held X deleted carousel placement\n"); return 1;
   }
   Aabb placedBounds;
   auto const placement = app.ring.slotPose(app.ring.index, app.ringOrigin, app.ringForward).position;
@@ -2980,6 +3122,17 @@ int runSmokeSkinned(char const* shaderDir) {
                 error.c_str());
     renderer.shutdown();
     return 1;
+  }
+  // Exercise controller scaling on the real imported skinned hierarchy.
+  {
+    App rigApp;
+    Model rigModel = model;
+    rigModel.clips.clear();
+    if (!addModelToScene(rigApp, renderer, rigModel) || !smokeControllerRig(rigApp, renderer)) {
+      std::printf("SMOKE FAIL: controller scale on imported skin\n");
+      renderer.shutdown();
+      return 1;
+    }
   }
   // A static skin may have a non-identity bind pose. It must be deformed on
   // insertion, before placement computes bounds, and remain stationary.
@@ -3497,6 +3650,144 @@ void updateHandScale(App& app, HandPose left, HandPose right, float dt) {
   applyHandDelta(app, delta);
 }
 
+void rebaseControllerGrab(App& app, ControllerPose const& right) {
+  for (auto& [id, local] : app.grabLocals) { local = app.scene.local(id); }
+  app.grabStart = right.handPose();
+  if (app.scene.valid(app.controllerPivotNode)) {
+    app.grabPivot = transformPoint(app.scene.world(app.controllerPivotNode), app.controllerPivotLocal);
+  }
+  app.handScaling = false;
+}
+
+void updateControllerScale(App& app, ControllerPose const& left, ControllerPose const& right) {
+  float const ratio = handScaleRatio(app.scaleStartDistance, length(left.position - right.position));
+  auto const delta = mul(translationMatrix(app.grabPivot),
+      mul(scaleMatrix({ratio, ratio, ratio}), translationMatrix(-app.grabPivot)));
+  applyHandDelta(app, delta);
+}
+
+// View-relative grabs depend on a fresh head pose as well as controller poses.
+// Commit before processing any controller samples on an untracked frame.
+void interruptControllerForViewLoss(App& app, bool viewTracked) {
+  if (viewTracked) { return; }
+  if (app.grabActive && app.grabOwner == GrabOwner::controller) { endEdits(app); }
+  app.triggerWorkflow.reset();
+  app.leftTriggerWorkflow.interrupt();
+  app.galleryBrowse.interrupt();
+  app.deleteLatch.interrupt();
+  app.deleteHolding = false;
+  app.deleteCharge = 0.0F;
+  if (app.handTool == ToolPanelPress::kDelete) { app.handTool = -1; }
+}
+
+void processControllerScale(App& app, bool enabled, bool leftActive, bool leftHeld,
+                            bool leftPressed, bool leftReleased, bool rightActive, bool rightHeld, float dt,
+                            ControllerPose const& leftControllerGrip, ControllerPose const& controllerGrip) {
+  // A left-only trigger press clears on release without relying on a ray miss (the skydome is
+  // pickable). During a live right grab a fresh left press instead joins a
+  // scale, never a tap. Menu and carousel transitions disarm it.
+  bool const controllerGrab = app.grabActive && app.grabOwner == GrabOwner::controller;
+  bool const leftEnabled = enabled;
+  bool const bothPoses = controllerGrip.usable() && leftControllerGrip.usable();
+  bool const scaleStartPoses = bothPoses &&
+      (app.leftTriggerWorkflow.scaling() ||
+       length(leftControllerGrip.position - controllerGrip.position) >= .04F);
+  // Preserve whether this gesture was scaling before the workflow consumes
+  // a simultaneous right release. The final tracked sample belongs to it.
+  bool const wasScaling = app.leftTriggerWorkflow.scaling() && app.handScaling;
+  auto const leftAction = app.leftTriggerWorkflow.update(
+      leftEnabled, leftActive, leftHeld, leftPressed,
+      leftReleased, rightActive && rightHeld,
+      controllerGrab, scaleStartPoses, dt);
+  using LeftAction = LeftTriggerWorkflow::Action;
+  if (leftAction == LeftAction::clearSelection) {
+    pointerPress(app, PointerTarget{}, false);
+    app.controllerPivotNode = kInvalidNode;
+    app.triggerWorkflow.reset();
+  } else if (leftAction == LeftAction::trackingLost) {
+    if (controllerGrab) { endEdits(app); }
+    app.triggerWorkflow.reset();
+  }
+  if (app.grabActive && app.grabOwner == GrabOwner::controller) {
+    if (!rightHeld) {
+      // Only a physical, active release with usable poses supplies a final
+      // sample. Inactive inputs and lost tracking commit the last good pose.
+      if (rightActive && controllerGrip.usable()) {
+        if (wasScaling) {
+          if (enabled && leftActive && leftControllerGrip.usable()) {
+            updateControllerScale(app, leftControllerGrip, controllerGrip);
+          }
+        } else {
+          updateControllerGrab(app, controllerGrip);
+        }
+      }
+      endEdits(app); // one history step on physical release
+    } else if (!controllerGrip.usable()) {
+      endEdits(app);
+      app.triggerWorkflow.reset();
+      app.leftTriggerWorkflow.interrupt();
+      std::printf("[xr] controller grip tracking lost; grab committed\n");
+    } else if (leftAction == LeftAction::beginScale) {
+      // Apply the current right pose before capturing a scale baseline.
+      updateControllerGrab(app, controllerGrip);
+      beginHandScale(app, leftControllerGrip.handPose(), controllerGrip.handPose());
+    } else if (leftAction == LeftAction::endScale) {
+      updateControllerScale(app, leftControllerGrip, controllerGrip);
+      rebaseControllerGrab(app, controllerGrip);
+    } else if (app.leftTriggerWorkflow.scaling()) {
+      updateControllerScale(app, leftControllerGrip, controllerGrip);
+    } else {
+      updateControllerGrab(app, controllerGrip);
+    }
+  }
+}
+
+bool smokeControllerRig(App& app, VkRenderer& renderer) {
+  if (app.animations.size() != 1U || app.animations[0].skins.size() != 1U || app.modelGroups.empty()) { return false; }
+  auto const group = app.modelGroups.front().second;
+  app.selection.clear();
+  for (auto const& member : app.modelGroups) {
+    if (member.second == group) { app.selection.push_back(member.first); }
+  }
+  auto const visual = app.animations[0].skins[0].visual;
+  auto const initial = snapshot(app);
+  auto const worldBefore = app.scene.world(visual);
+  auto const skinBefore = app.animations[0].skins[0].deformed.vertices;
+  ControllerPose right{{.2F, 1, 0}, {}, true, true};
+  ControllerPose left{{-.2F, 1, 0}, {}, true, true};
+  app.controllerPivotNode = visual;
+  app.controllerPivotLocal = {};
+  auto frame = [&](bool held, bool pressed, bool released, bool rightHeld, ControllerPose const& l) {
+    processControllerScale(app, true, true, held, pressed, released, true, rightHeld, .016F, l, right);
+  };
+  frame(false, false, false, false, left);
+  if (!beginControllerGrab(app, right, app.scene.worldPosition(visual), {{0,0,0}, {}, true})) { return false; }
+  frame(true, true, false, true, left);
+  auto const pivot = app.grabPivot;
+  auto stretched = left;
+  stretched.position.x -= .4F;
+  frame(true, false, false, true, stretched);
+  auto const delta = mul(translationMatrix(pivot),
+      mul(scaleMatrix({2,2,2}), translationMatrix(-pivot)));
+  auto const expected = mul(delta, worldBefore);
+  auto const scaled = app.scene.world(visual);
+  for (int i = 0; i < 16; ++i) {
+    if (std::fabs(scaled.m[i] - expected.m[i]) > 2e-4F) { return false; }
+  }
+  tickAnimations(app, renderer, 0.0F);
+  auto const& skinAfter = app.animations[0].skins[0].deformed.vertices;
+  if (skinBefore.size() != skinAfter.size()) { return false; }
+  for (std::size_t i = 0; i < skinBefore.size(); ++i) {
+    if (length(skinBefore[i].pos - skinAfter[i].pos) > 2e-4F) { return false; }
+  }
+  frame(true, false, false, false, stretched);
+  auto state = snapshot(app);
+  if (!app.undo.undo(state) || !sameSnapshot(state, initial) || app.undo.canUndo()) { return false; }
+  applySnapshot(app, renderer, state);
+  return true;
+}
+
+
 void updateHandGrab(App& app, HandPose pose) {
   applyHandDelta(app, app.physicalGrab
       ? handGrabTransform(app.grabStart, pose, app.grabStart.position, Mat4{})
@@ -3521,11 +3812,14 @@ void prepareHandTool(App& app, int button) {
 }
 
 void closeToolMenu(App& app) {
+  app.leftTriggerWorkflow.interrupt();
   if (app.menuOwner == MenuOwner::none && !app.handPanel.visible) {
     return;
   }
+  interruptDeleteGestures(app);
   app.panelPress.cancel();
   app.panelTriggerArmed = false;
+  app.triggerWorkflow.reset();
   app.deleteCharge = 0.0F;
   app.deleteHolding = false;
   app.handHover = -1;
@@ -3540,9 +3834,11 @@ void closeToolMenu(App& app) {
 // the menu, not the scene. A controller panel is latched in the world on this
 // frame (stable to point at); a hand panel follows the palm each frame.
 void openToolMenu(App& app, MenuOwner owner, Vec3 const& headWorld, Vec3 const& headForward) {
+  app.leftTriggerWorkflow.interrupt();
   if (owner == MenuOwner::none) {
     return;
   }
+  interruptDeleteGestures(app);
   if (app.galleryActive) {
     galleryClose(app);
   }
@@ -3580,6 +3876,35 @@ void toggleControllerToolMenu(App& app, Vec3 const& headWorld, Vec3 const& headF
   openToolMenu(app, MenuOwner::controller, headWorld, headForward);
 }
 
+// A toggles the carousel before either context can consume this frame's
+// trigger. Both transitions reset the workflows, including an empty library.
+void toggleControllerCarousel(App& app, VkRenderer& renderer) {
+  if (app.galleryActive) {
+    galleryClose(app);
+  } else {
+    if (app.menuOwner != MenuOwner::none) {
+      closeToolMenu(app);
+    }
+    galleryOpen(app, renderer);
+  }
+}
+
+// Never anchor or toggle world-space UI using a stale view, even if a caller
+// supplies an edge on an interrupted frame.
+bool processControllerUiToggles(App& app, VkRenderer& renderer, XrFrameInput const& input,
+                                Vec3 const& headWorld, Vec3 const& headForward) {
+  if (!input.viewTracked || input.deleteInterrupted) { return false; }
+  bool const menuToggled = input.menuPressed;
+  if (menuToggled) {
+    toggleControllerToolMenu(app, headWorld, headForward);
+    app.triggerWorkflow.reset();
+    app.panelPress.cancel();
+    app.deleteCharge = 0.0F;
+  }
+  if (input.spawnPressed) { toggleControllerCarousel(app, renderer); }
+  return menuToggled;
+}
+
 constexpr std::array<char const*, 12> kHandTools{
     "Models", "", "", "", "", "", "", "", "Undo", "Redo", "Delete", "Backdrop"};
 
@@ -3606,6 +3931,70 @@ void drawHandPanel(App const& app, std::vector<RendererVertex>& lines) {
     constexpr float height = .018F;
     auto at = centre - Vec3{.5F * textLineWidth(kHandTools[button], height), height*.5F, 0};
     appendTextLines(lines, kHandTools[button], trs(point(at), panel.orientation, {1,1,1}), height, colour);
+  }
+}
+
+// Process a viewer press separately from grip-driven continuation: an unavailable
+// aim is consumed, never interpreted as a miss or replayed after tracking returns.
+void processControllerViewerPress(App& app, XrFrameInput const& input, Ray const& controllerAim,
+                                  ControllerPose const& controllerGrip, Vec3 headWorld,
+                                  Quat headOrientation, HandSelectionLatch& selectionLatch,
+                                  HandGraspGate& graspGate, HandGesture& rightGrasp) {
+  bool const controllerRight = !input.handActive[1];
+  bool const controllerAimTracked = controllerRight && input.aimValid[1] && input.aimTracked[1];
+  bool const partSelectPress = input.gripHeld > 0.5F;
+  ControllerTriggerWorkflow::Target target = ControllerTriggerWorkflow::Target::none;
+  PointerTarget pressTarget;
+  if (input.selectPressed && controllerAimTracked) {
+    pressTarget = resolvePointerTarget(app, controllerAim);
+    if (pressTarget.node != kInvalidNode) {
+      target = (!partSelectPress && selectionContainsNode(app, pressTarget.node))
+                   ? ControllerTriggerWorkflow::Target::selected
+                   : ControllerTriggerWorkflow::Target::other;
+    }
+  }
+  auto const action = app.triggerWorkflow.update(
+      input.viewTracked && controllerRight && input.selectActive,
+      input.selectHeld, input.selectPressed, controllerAimTracked, target,
+      !app.selection.empty());
+  switch (action) {
+  case ControllerTriggerWorkflow::Action::select: {
+    pointerPress(app, pressTarget, partSelectPress);
+    Mat4 inverse;
+    if (app.scene.valid(pressTarget.node) &&
+        invertAffine(app.scene.world(pressTarget.node), inverse)) {
+      app.controllerPivotNode = pressTarget.node;
+      app.controllerPivotLocal = transformPoint(inverse, pressTarget.point);
+    } else {
+      app.controllerPivotNode = kInvalidNode;
+      app.triggerWorkflow.reset();
+    }
+    selectionLatch.reset();
+    graspGate.reset();
+    rightGrasp.reset();
+    break;
+  }
+  case ControllerTriggerWorkflow::Action::clearSelection:
+    pointerPress(app, PointerTarget{}, false);
+    break;
+  case ControllerTriggerWorkflow::Action::beginGrab: {
+    if (!controllerGrip.usable()) {
+      std::printf("[xr] trigger grab refused: grip pose %s\n",
+                  controllerGrip.valid ? "is VALID but untracked" : "is unavailable");
+      break;
+    }
+    HandGrabView const view{headWorld,
+        headOrientation, true};
+    if (!app.scene.valid(app.controllerPivotNode) ||
+        !beginControllerGrab(app, controllerGrip,
+            transformPoint(app.scene.world(app.controllerPivotNode), app.controllerPivotLocal), view)) {
+      std::printf("[xr] trigger grab could not start\n");
+    }
+    break;
+  }
+  case ControllerTriggerWorkflow::Action::none:
+  default:
+    break;
   }
 }
 
@@ -3713,6 +4102,150 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   controllerNow.orientation = normalized(turn * controllerStart.orientation);
   HandGrabView const controllerView{{0.0F, 0.0F, 0.0F}, {}, true};
   Vec3 const controllerPivot = transformPoint(app.scene.world(cube), {.5F, 0, 0});
+  // Exercise actual UI transitions with the same edges as the XR loop.
+  app.libraryDir = ".build";
+  XrFrameInput toggleInput;
+  toggleInput.menuPressed = true;
+  toggleInput.spawnPressed = true;
+  if (!check(!processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1}) &&
+                 app.menuOwner == MenuOwner::none && !app.galleryActive,
+             "lost view cannot toggle menu or carousel")) { return false; }
+  toggleInput.viewTracked = true;
+  toggleInput.deleteInterrupted = true;
+  if (!check(!processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1}) &&
+                 app.menuOwner == MenuOwner::none && !app.galleryActive,
+             "focus/profile interruption cannot toggle UI")) { return false; }
+  toggleInput.deleteInterrupted = false;
+  toggleInput.menuPressed = false;
+  toggleInput.spawnPressed = false;
+  if (!check(!processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1}) &&
+                 app.menuOwner == MenuOwner::none && !app.galleryActive,
+             "no UI transition after lost edges")) { return false; }
+  toggleInput.menuPressed = true;
+  if (!check(processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1}) &&
+                 app.menuOwner == MenuOwner::controller, "fresh menu press opens panel")) { return false; }
+  toggleInput.viewTracked = false;
+  if (!check(!processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1}) &&
+                 app.menuOwner == MenuOwner::controller, "lost view cannot close panel")) { return false; }
+  toggleInput.viewTracked = true;
+  (void)processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1});
+  toggleInput.menuPressed = false;
+  toggleInput.spawnPressed = true;
+  (void)processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1});
+  if (!check(app.galleryActive, "fresh A press opens carousel")) { return false; }
+  toggleInput.viewTracked = false;
+  if (!check(!processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1}) &&
+                 app.galleryActive, "lost view cannot close carousel")) { return false; }
+  toggleInput.viewTracked = true;
+  (void)processControllerUiToggles(app, renderer, toggleInput, {}, {0, 0, -1});
+  if (!check(!app.galleryActive, "fresh A press closes carousel")) { return false; }
+  // Simultaneous A/trigger transitions must win over both trigger contexts.
+  // Use the real toggle and workflows, including the empty-library failure.
+  app.libraryDir = ".build";
+  using TriggerAction = ControllerTriggerWorkflow::Action;
+  using TriggerTarget = ControllerTriggerWorkflow::Target;
+  (void)app.triggerWorkflow.update(true, false, false, true, TriggerTarget::selected, true);
+  toggleControllerCarousel(app, renderer);
+  if (!check(app.galleryActive && app.triggerWorkflow.blocked(), "A opens before trigger") ||
+      !check(app.triggerWorkflow.update(true, true, true, true, TriggerTarget::selected, true) ==
+                 TriggerAction::none, "opening suppresses viewer press") ||
+      !check(!app.carouselGate.update(true, 0, true, true, true, true, .2F),
+             "opening suppresses carousel press")) { return false; }
+  for (int i = 0; i < 10; ++i) {
+    (void)app.carouselGate.update(true, 0, true, true, true, false, .02F);
+  }
+  if (!check(!app.carouselGate.ready(), "held opening trigger cannot place")) { return false; }
+  (void)app.carouselGate.update(true, 0, true, true, false, false, .02F);
+  if (!check(app.carouselGate.ready(), "carousel rearms on release")) { return false; }
+  toggleControllerCarousel(app, renderer);
+  if (!check(!app.galleryActive && app.triggerWorkflow.blocked(), "A closes before trigger") ||
+      !check(app.triggerWorkflow.update(true, true, true, true, TriggerTarget::selected, true) ==
+                 TriggerAction::none, "closing suppresses viewer press") ||
+      !check(!app.carouselGate.update(false, 0, true, true, true, true, .02F),
+             "closing suppresses ready placement") ||
+      !check(app.triggerWorkflow.update(true, true, false, true, TriggerTarget::selected, true) ==
+                 TriggerAction::none, "held closing trigger cannot select or grab")) { return false; }
+  (void)app.triggerWorkflow.update(true, false, false, true, TriggerTarget::selected, true);
+  if (!check(app.triggerWorkflow.update(true, true, true, true, TriggerTarget::selected, true) ==
+                 TriggerAction::select, "viewer rearms after release")) { return false; }
+  // Even a failed opening attempt consumes the simultaneous trigger press.
+  app.libraryDir = ".build/no-such-carousel-library";
+  toggleControllerCarousel(app, renderer);
+  if (!check(!app.galleryActive && app.triggerWorkflow.blocked(), "empty library blocks trigger") ||
+      !check(app.triggerWorkflow.update(true, true, true, true, TriggerTarget::selected, true) ==
+                 TriggerAction::none, "empty library cannot click through")) { return false; }
+  app.triggerWorkflow.reset();
+
+  // Exercise the same viewer-press path used by XR, including loss and
+  // reacquisition of aim while the trigger is held and during a live grab.
+  XrFrameInput aimInput;
+  aimInput.viewTracked = true;
+  aimInput.selectActive = true;
+  aimInput.aimValid[1] = true;
+  aimInput.aimTracked[1] = true;
+  HandSelectionLatch smokeSelectionLatch;
+  HandGraspGate smokeGraspGate;
+  HandGesture smokeRightGrasp;
+  Ray const missRay{{100.0F, 100.0F, 100.0F}, {0.0F, 0.0F, -1.0F}};
+  auto pressFrame = [&]() {
+    processControllerViewerPress(app, aimInput, missRay, controllerStart, {}, {},
+                                 smokeSelectionLatch, smokeGraspGate, smokeRightGrasp);
+  };
+  app.triggerWorkflow.reset();
+  (void)app.triggerWorkflow.update(true, false, false, true,
+      ControllerTriggerWorkflow::Target::none, true);
+  if (!check(app.triggerWorkflow.update(true, true, true, true,
+                 ControllerTriggerWorkflow::Target::selected, true) ==
+                 ControllerTriggerWorkflow::Action::select,
+             "aim-loss selection is primed")) { return false; }
+  aimInput.selectHeld = false;
+  pressFrame();
+  app.controllerPivotNode = cube;
+  Mat4 smokeInverse;
+  if (!check(invertAffine(app.scene.world(cube), smokeInverse), "aim-loss pivot inverse")) { return false; }
+  app.controllerPivotLocal = transformPoint(smokeInverse, controllerPivot);
+  auto const aimLossBefore = snapshot(app);
+  aimInput.selectHeld = true;
+  aimInput.selectPressed = true;
+  aimInput.aimTracked[1] = false; // VALID but untracked
+  pressFrame();
+  if (!check(!app.grabActive && sameSnapshot(snapshot(app), aimLossBefore),
+             "untracked aim cannot start a primed grab")) { return false; }
+  aimInput.aimValid[1] = false;
+  pressFrame();
+  if (!check(!app.grabActive && sameSnapshot(snapshot(app), aimLossBefore),
+             "unavailable aim cannot start or clear a primed grab")) { return false; }
+  aimInput.aimValid[1] = true;
+  aimInput.selectPressed = false;
+  aimInput.aimTracked[1] = true;
+  pressFrame();
+  if (!check(!app.grabActive, "aim reacquisition cannot replay a held press")) { return false; }
+  aimInput.selectHeld = false;
+  pressFrame();
+  aimInput.selectHeld = true;
+  aimInput.selectPressed = true;
+  pressFrame();
+  if (!check(app.grabActive, "tracked miss after release starts grab")) { return false; }
+  aimInput.aimValid[1] = false;
+  aimInput.aimTracked[1] = false;
+  aimInput.selectPressed = false;
+  pressFrame();
+  processControllerScale(app, true, true, false, false, false, true, true, .016F,
+                         controllerStart, controllerNow);
+  if (!check(app.grabActive && !sameSnapshot(snapshot(app), aimLossBefore),
+             "live grab follows tracked grip without aim")) { return false; }
+  aimInput.selectHeld = false;
+  pressFrame();
+  processControllerScale(app, true, true, false, false, false, true, false, .016F,
+                         controllerStart, controllerNow);
+  auto aimLossUndo = snapshot(app);
+  if (!check(!app.grabActive && app.undo.undo(aimLossUndo) &&
+             sameSnapshot(aimLossUndo, aimLossBefore) && !app.undo.canUndo(),
+             "aim-loss grab release commits one undo")) { return false; }
+  applySnapshot(app, renderer, aimLossBefore);
+  app.undo.clear();
+  app.triggerWorkflow.reset();
+
   ControllerPose untrackedStart = controllerStart;
   untrackedStart.tracked = false;
   if (!check(!beginControllerGrab(app, untrackedStart, controllerPivot, controllerView),
@@ -3761,6 +4294,151 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   }
   applySnapshot(app, renderer, controllerState);
   app.undo.clear();
+
+  // A lost head pose must commit the last good controller sample, even if
+  // the controller itself remains tracked and moves on the loss frame.
+  auto const viewLossBefore = snapshot(app);
+  if (!check(beginControllerGrab(app, controllerStart, controllerPivot, controllerView),
+             "view-loss grab starts")) { return false; }
+  updateControllerGrab(app, controllerNow);
+  auto const viewLossLastGood = snapshot(app);
+  (void)app.deleteLatch.update(true, false);
+  (void)app.deleteLatch.update(true, true);
+  app.deleteHolding = true;
+  app.deleteCharge = 0.5F;
+  (void)app.galleryBrowse.update(true, {}, .01F);
+  (void)app.galleryBrowse.update(true, {1,0}, .01F);
+  interruptControllerForViewLoss(app, false);
+  if (!check(!app.deleteHolding && app.deleteCharge == 0.0F &&
+             !app.deleteLatch.updateTracked(true, true, true),
+             "view loss cancels delete and blocks held button") ||
+      !check(app.galleryBrowse.update(true, {1,0}, 1.0F) == 0,
+             "view loss blocks held carousel stick")) { return false; }
+  (void)app.deleteLatch.updateTracked(true, true, false);
+  if (!check(app.deleteLatch.updateTracked(true, true, true),
+             "view loss delete rearms on release")) { return false; }
+  processControllerScale(app, false, true, false, false, false, true, false, .016F,
+                         controllerStart, controllerStart);
+  if (!check(!app.grabActive && sameSnapshot(snapshot(app), viewLossLastGood),
+             "head tracking loss commits last good pose") ||
+      !check(app.triggerWorkflow.blocked(), "head tracking loss blocks trigger")) { return false; }
+  auto viewLossUndo = snapshot(app);
+  if (!check(app.undo.undo(viewLossUndo) && sameSnapshot(viewLossUndo, viewLossBefore),
+             "head tracking loss creates one undo") ||
+      !check(!app.undo.canUndo(), "head tracking loss commits only once")) { return false; }
+  applySnapshot(app, renderer, viewLossBefore);
+  app.undo.clear();
+
+  // The release frame is a real sample: motion can occur between frames.
+  auto const releaseBefore = snapshot(app);
+  auto const releaseInitialWorld = app.scene.world(cube);
+  auto releasePose = controllerStart;
+  releasePose.position.x += .23F;
+  if (!check(beginControllerGrab(app, controllerStart, controllerPivot, controllerView), "release grab starts")) { return false; }
+  processControllerScale(app, true, true, false, false, false, true, false, .016F,
+                         controllerStart, releasePose);
+  auto const releaseWorld = app.scene.world(cube);
+  if (!check(!app.grabActive && !nearMatrix(releaseWorld, releaseInitialWorld),
+             "right release applies final motion")) { return false; }
+  auto releaseState = snapshot(app);
+  auto releaseUndo = releaseState;
+  if (!check(app.undo.undo(releaseUndo) && sameSnapshot(releaseUndo, releaseBefore), "release motion undo") ||
+      !check(app.undo.redo(releaseUndo) && sameSnapshot(releaseUndo, releaseState), "release motion redo")) { return false; }
+  applySnapshot(app, renderer, releaseBefore);
+  app.undo.clear();
+  if (!check(beginControllerGrab(app, controllerStart, controllerPivot, controllerView), "untracked release grab starts")) { return false; }
+  auto badRelease = releasePose;
+  badRelease.tracked = false;
+  processControllerScale(app, true, true, false, false, false, true, false, .016F,
+                         controllerStart, badRelease);
+  if (!check(!app.grabActive && nearMatrix(app.scene.world(cube), releaseInitialWorld) && !app.undo.canUndo(),
+             "untracked release keeps last good pose")) { return false; }
+  app.undo.clear();
+
+  // Exercise the same per-frame integration used by XR: a grab joins and
+  // leaves scale without a jump, retains its one undo transaction, and a
+  // tracking interruption commits only the last usable sample.
+  auto const controllerScaleBefore = snapshot(app);
+  app.controllerPivotNode = cube;
+  Mat4 pivotInverse;
+  if (!check(invertAffine(app.scene.world(cube), pivotInverse), "scale pivot inverse")) { return false; }
+  app.controllerPivotLocal = transformPoint(pivotInverse, controllerPivot);
+  ControllerPose leftController = controllerStart;
+  leftController.position.x -= .4F;
+  auto scaleFrame = [&](bool enabled, bool active, bool held, bool pressed, bool released,
+                        bool rightHeld, ControllerPose const& leftPose, ControllerPose const& rightPose) {
+    processControllerScale(app, enabled, active, held, pressed, released, true, rightHeld,
+                           .016F, leftPose, rightPose);
+  };
+  scaleFrame(true, true, false, false, false, false, leftController, controllerStart);
+  if (!check(beginControllerGrab(app, controllerStart, controllerPivot, controllerView), "scale grab starts")) { return false; }
+  scaleFrame(true, true, false, false, false, true, leftController, controllerNow);
+  auto const justBeforeJoin = app.scene.world(cube);
+  scaleFrame(true, true, true, true, false, true, leftController, controllerNow);
+  if (!check(app.handScaling && nearMatrix(app.scene.world(cube), justBeforeJoin), "scale join has no jump")) { return false; }
+  auto stretchedController = leftController;
+  stretchedController.position = controllerNow.position + (leftController.position - controllerNow.position) * 2.0F;
+  scaleFrame(true, true, true, false, false, true, stretchedController, controllerNow);
+  auto const scaledWorld = app.scene.world(cube);
+  auto const scaleExpected = mul(translationMatrix(app.grabPivot),
+      mul(scaleMatrix({2,2,2}), mul(translationMatrix(-app.grabPivot), justBeforeJoin)));
+  if (!check(nearMatrix(scaledWorld, scaleExpected), "physical controller distance scales uniformly")) { return false; }
+  scaleFrame(true, true, false, false, true, true, stretchedController, controllerNow);
+  if (!check(!app.handScaling && nearMatrix(app.scene.world(cube), scaledWorld), "scale leave has no jump")) { return false; }
+  scaleFrame(true, true, false, false, false, true, stretchedController, controllerNow);
+  if (!check(nearMatrix(app.scene.world(cube), scaledWorld), "rebased stationary grab unchanged")) { return false; }
+  auto controllerLater = controllerNow;
+  controllerLater.position.x += .15F;
+  scaleFrame(true, true, false, false, false, true, stretchedController, controllerLater);
+  auto const finishedWorld = app.scene.world(cube);
+  if (!check(!nearMatrix(finishedWorld, scaledWorld), "right grab resumes after scale")) { return false; }
+  scaleFrame(true, true, false, false, false, false, stretchedController, controllerLater);
+  auto finishedState = snapshot(app);
+  auto undoState = finishedState;
+  if (!check(app.undo.undo(undoState) && sameSnapshot(undoState, controllerScaleBefore) && !app.undo.canUndo(), "combined gesture one undo") ||
+      !check(app.undo.redo(undoState) && sameSnapshot(undoState, finishedState), "combined gesture redo")) { return false; }
+  applySnapshot(app, renderer, controllerScaleBefore);
+  app.undo.clear();
+  scaleFrame(true, true, false, false, false, false, leftController, controllerStart);
+  if (!check(beginControllerGrab(app, controllerStart, controllerPivot, controllerView), "tracking loss grab starts")) { return false; }
+  scaleFrame(true, true, true, true, false, true, leftController, controllerStart);
+  scaleFrame(true, true, true, false, false, true, stretchedController, controllerStart);
+  // Simultaneous releases still apply the final two-controller separation.
+  auto finalStretch = leftController;
+  finalStretch.position = controllerStart.position + (leftController.position - controllerStart.position) * 3.0F;
+  auto const scaleBaseline = app.grabLocals.front().second;
+  auto const scalePivot = app.grabPivot;
+  auto const releaseScaleExpected = mul(translationMatrix(scalePivot),
+      mul(scaleMatrix({3,3,3}), mul(translationMatrix(-scalePivot), toMatrix(scaleBaseline))));
+  scaleFrame(true, true, false, false, true, false, finalStretch, controllerStart);
+  if (!check(!app.grabActive && nearMatrix(app.scene.world(cube), releaseScaleExpected),
+             "simultaneous release applies final scale")) { return false; }
+  undoState = snapshot(app);
+  if (!check(app.undo.undo(undoState) && sameSnapshot(undoState, controllerScaleBefore), "release scale undo")) { return false; }
+  applySnapshot(app, renderer, controllerScaleBefore);
+  app.undo.clear();
+  app.leftTriggerWorkflow.interrupt();
+  scaleFrame(true, true, false, false, false, false, leftController, controllerStart);
+  if (!check(beginControllerGrab(app, controllerStart, controllerPivot, controllerView), "tracking loss grab restarts")) { return false; }
+  scaleFrame(true, true, true, true, false, true, leftController, controllerStart);
+  scaleFrame(true, true, true, false, false, true, stretchedController, controllerStart);
+  auto const lastGoodWorld = app.scene.world(cube);
+  auto lostLeft = stretchedController;
+  lostLeft.tracked = false;
+  scaleFrame(true, true, true, false, false, true, lostLeft, controllerStart);
+  if (!check(!app.grabActive && nearMatrix(app.scene.world(cube), lastGoodWorld), "scale tracking loss commits last pose")) { return false; }
+  scaleFrame(true, true, true, false, false, true, stretchedController, controllerStart);
+  if (!check(!app.grabActive && nearMatrix(app.scene.world(cube), lastGoodWorld), "tracking recovery cannot restart held trigger")) { return false; }
+  undoState = snapshot(app);
+  if (!check(app.undo.undo(undoState) && sameSnapshot(undoState, controllerScaleBefore), "tracking loss gesture undo")) { return false; }
+  applySnapshot(app, renderer, controllerScaleBefore);
+  app.undo.clear();
+  app.leftTriggerWorkflow.interrupt();
+  scaleFrame(true, true, false, false, false, false, leftController, controllerStart);
+  scaleFrame(true, true, true, true, false, false, leftController, controllerStart);
+  scaleFrame(true, true, false, false, true, false, leftController, controllerStart);
+  if (!check(app.selection.empty(), "left tap clears selection without ray")) { return false; }
+  applySnapshot(app, renderer, controllerScaleBefore);
 
   // Motion changes editable placement without cancelling live node animation.
   app.scene.setPoseOffset(cube, translationMatrix({.3F,0,0}));
@@ -3842,6 +4520,29 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
              "cancel clears grab and restores hierarchy without history")) {
     return false;
   }
+
+  // The controller scale follows the same topmost subtree rule for a rig:
+  // selecting the mesh and ancestor applies the uniform delta only once.
+  app.controllerPivotNode = child;
+  app.controllerPivotLocal = {};
+  Vec3 const rigPivot = app.scene.worldPosition(child);
+  auto const rigBefore = snapshot(app);
+  scaleFrame(true, true, false, false, false, false, leftController, controllerStart);
+  if (!check(beginControllerGrab(app, controllerStart, rigPivot, controllerView), "rig controller grab")) { return false; }
+  scaleFrame(true, true, true, true, false, true, leftController, controllerStart);
+  auto const rigScalePivot = app.grabPivot;
+  auto rigStretch = leftController;
+  rigStretch.position = controllerStart.position + (leftController.position - controllerStart.position) * 2.0F;
+  scaleFrame(true, true, true, false, false, true, rigStretch, controllerStart);
+  auto const rigDelta = mul(translationMatrix(rigScalePivot),
+      mul(scaleMatrix({2,2,2}), translationMatrix(-rigScalePivot)));
+  if (!check(sameTransform(app.scene.local(child), childLocal) &&
+             nearMatrix(app.scene.world(child), mul(rigDelta, childWorld)), "controller scale transforms rig once")) { return false; }
+  scaleFrame(true, true, true, false, false, false, rigStretch, controllerStart);
+  auto rigState = snapshot(app);
+  if (!check(app.undo.undo(rigState) && sameSnapshot(rigState, rigBefore) && !app.undo.canUndo(), "rig controller scale one undo")) { return false; }
+  applySnapshot(app, renderer, rigBefore);
+  app.undo.clear();
 
   // Parent-only part selection includes the offset child's geometry in its
   // rotation pivot, including when the selected parent has no visual mesh.
@@ -3959,6 +4660,148 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
              "invalid tracking cannot start or transform a grab")) {
     return false;
   }
+
+  // Selection and panel transitions must discard all delete captures. A held X
+  // cannot acquire the new target, even after it has been held for a long time.
+  {
+    app.undo.clear();
+    pointerPress(app, PointerTarget{cube, {}}, true);
+    auto const now = std::chrono::steady_clock::now();
+    auto frame = [&](bool active, bool held, int ms) {
+      processDeleteCharge(app, true, active, held, false, false, false,
+                          now + std::chrono::milliseconds(ms));
+    };
+    frame(true, false, 0);
+    frame(true, true, 0);
+    frame(true, true, 300);
+    if (!check(app.deleteHolding && app.deleteCharge > 0.0F, "selection fixture charges X")) { return false; }
+    app.panelPress.press(ToolPanelPress::kDelete);
+    (void)app.panelPress.hold(true, ToolPanelPress::kDelete, .3F);
+    app.panelTriggerArmed = true;
+    pointerPress(app, PointerTarget{child, {}}, true);
+    if (!check(app.selection == std::vector<NodeId>{child} && !app.deleteHolding &&
+               app.deleteCharge == 0.0F && !app.panelPress.active() && !app.panelTriggerArmed,
+               "selection change cancels X and panel delete")) { return false; }
+    frame(true, true, 2000);
+    frame(true, true, 3000);
+    if (!check(app.scene.valid(child) && !app.deleteHolding, "held X cannot delete new selection")) { return false; }
+    // Clearing and selecting again while X remains held must not inherit the
+    // gesture, including when a legacy hand-panel Delete was captured.
+    app.handTool = ToolPanelPress::kDelete;
+    pointerPress(app, PointerTarget{}, false);
+    if (!check(app.selection.empty() && app.handTool == -1, "clear cancels hand delete")) { return false; }
+    frame(true, true, 3050);
+    pointerPress(app, PointerTarget{child, {}}, true);
+    frame(true, true, 3075);
+    if (!check(!app.deleteHolding && app.scene.valid(child), "held X cannot select after clear")) { return false; }
+    frame(false, false, 3100);
+    frame(true, true, 3200);
+    if (!check(!app.deleteHolding, "inactive X cannot rearm after selection")) { return false; }
+    frame(true, false, 3300);
+    frame(true, true, 3400);
+    frame(true, true, 3700);
+    pointerPress(app, PointerTarget{child, {}}, true);
+    if (!check(app.deleteHolding && app.deleteCharge > 0.0F, "same selection keeps charge")) { return false; }
+    openToolMenu(app, MenuOwner::controller, {}, {0, 0, -1});
+    frame(true, true, 4500);
+    if (!check(!app.deleteHolding && app.scene.valid(child), "menu open blocks held X")) { return false; }
+    frame(true, false, 4600);
+    frame(true, true, 4700);
+    frame(true, true, 5000);
+    closeToolMenu(app);
+    frame(true, true, 6000);
+    if (!check(!app.deleteHolding && app.scene.valid(child), "menu close blocks held X")) { return false; }
+    frame(true, false, 6100);
+    frame(true, true, 6200);
+    frame(true, true, 6900);
+    if (!check(!app.scene.valid(child), "fresh X deletes new selection after release")) { return false; }
+    auto restored = snapshot(app);
+    if (!check(app.undo.undo(restored), "undo selection-transition delete")) { return false; }
+    applySnapshot(app, renderer, restored);
+    app.undo.clear();
+  }
+
+  // Exercise real history, charge and left-trigger paths together: a history
+  // action must cancel a gesture even when the history stack cannot move.
+  for (bool const redo : {false, true}) {
+    for (bool const hasHistory : {false, true}) {
+      app.undo.clear();
+      app.selection = {cube};
+      if (hasHistory) {
+        app.undo.begin(snapshot(app));
+        app.selection.clear();
+        app.undo.commit(snapshot(app));
+        if (redo) {
+          auto state = snapshot(app);
+          (void)app.undo.undo(state);
+          applySnapshot(app, renderer, state);
+        }
+      }
+      auto const now = std::chrono::steady_clock::now();
+      // A selected object is needed for the charge, including the undo case.
+      app.selection = {cube};
+      processDeleteCharge(app, true, true, false, false, false, false, now);
+      processDeleteCharge(app, true, true, true, false, false, false, now);
+      processDeleteCharge(app, true, true, true, false, false, false,
+                          now + std::chrono::milliseconds(300));
+      app.leftTriggerWorkflow.interrupt();
+      processControllerScale(app, true, true, false, false, false, true, false, 0.0F,
+                             controllerStart, controllerStart);
+      processControllerScale(app, true, true, true, true, false, true, false, 0.0F,
+                             controllerStart, controllerStart);
+      if (!check(app.deleteHolding && app.deleteCharge > 0.0F, "history fixture charges X")) { return false; }
+      bool const moved = redo ? performRedo(app, renderer) : performUndo(app, renderer);
+      if (!check(moved == hasHistory && !app.deleteHolding && app.deleteCharge == 0.0F,
+                 "history interrupts X charge even with empty stack")) { return false; }
+      // Keep a selection after history to detect an illicit release/delayed delete.
+      app.selection = {cube};
+      auto const afterHistory = snapshot(app);
+      processControllerScale(app, true, true, false, false, true, true, false, 0.0F,
+                             controllerStart, controllerStart);
+      processDeleteCharge(app, true, true, true, false, false, false,
+                          now + std::chrono::seconds(2));
+      if (!check(sameSnapshot(snapshot(app), afterHistory) && !app.deleteHolding,
+                 "held X and left release cannot act after history")) { return false; }
+      processDeleteCharge(app, true, false, false, false, false, false, now);
+      processDeleteCharge(app, true, true, true, false, false, false,
+                          now + std::chrono::seconds(3));
+      if (!check(!app.deleteHolding, "inactive X is not a release")) { return false; }
+      processDeleteCharge(app, true, true, false, false, false, false, now);
+      processDeleteCharge(app, true, true, true, false, false, false, now);
+      processDeleteCharge(app, true, true, true, false, false, false,
+                          now + std::chrono::milliseconds(700));
+      if (!check(!app.scene.valid(cube), "fresh X press can delete after release")) { return false; }
+      auto restore = snapshot(app);
+      if (!check(app.undo.undo(restore), "restore after X delete")) { return false; }
+      applySnapshot(app, renderer, restore);
+      app.selection = {cube};
+      // The successful delete is itself an interruption. Rearm on release.
+      processControllerScale(app, true, true, false, false, false, true, false, 0.0F,
+                             controllerStart, controllerStart);
+      processControllerScale(app, true, true, true, true, false, true, false, 0.0F,
+                             controllerStart, controllerStart);
+      processControllerScale(app, true, true, false, false, true, true, false, 0.0F,
+                             controllerStart, controllerStart);
+      if (!check(app.selection.empty(), "fresh left tap works after release")) { return false; }
+    }
+  }
+  // A face history action also cancels a concurrent panel Delete capture;
+  // panel Undo/Redo call the same handlers as the face buttons.
+  app.selection = {cube};
+  app.panelPress.press(ToolPanelPress::kDelete);
+  (void)app.panelPress.hold(true, ToolPanelPress::kDelete, 0.3F);
+  (void)performUndo(app, renderer);
+  if (!check(!app.panelPress.active() && !app.panelTriggerArmed &&
+             app.panelPress.hold(true, ToolPanelPress::kDelete, 1.0F) == ToolPanelPress::Action::none,
+             "history cancels panel delete capture")) { return false; }
+  app.selection = {cube};
+  app.undo.clear();
+  auto const beforeHandDelete = snapshot(app);
+  app.undo.begin(beforeHandDelete);
+  app.handTool = ToolPanelPress::kDelete;
+  moveSelectionVertical(app.scene, app.selection, .1F);
+  if (!check(!performUndo(app, renderer) && sameSnapshot(snapshot(app), beforeHandDelete) &&
+             !app.undo.canUndo(), "history cancels live edit during hand delete")) { return false; }
 
   // History tools cancel rather than commit live stick edits, preserving
   // the pre-existing redo branch for either UNDO or REDO.
@@ -4095,7 +4938,7 @@ int runXr(char const* shaderDir,
 
   App app;
   app.xr = true;
-  std::printf("[xr] Genesis: right trigger select/grab, left menu tools, "
+  std::printf("[xr] Genesis: right trigger select/grab, left trigger release deselect or scale, left menu tools, "
               "right stick browses the carousel\n");
   app.width = shell.eyeWidth();
   app.height = shell.eyeHeight();
@@ -4132,14 +4975,12 @@ int runXr(char const* shaderDir,
     app.selection.push_back(app.visuals[0].id);
   }
 
-  // The headset drives the eye views; locomotion is a rig transform composed
-  // with the head pose (per-eye viewProj = proj*viewHead * rigView). The rig
-  // must be a gravity-aligned frame — yaw + position only. An inherited pitch
-  // (the desktop framing camera looks down at the model) tilts the entire
-  // world off the headset's gravity: the ground stops being level and the
-  // tilt direction sweeps as the head turns.
-  Camera rig = app.camera;
-  rig.pitch = 0.0F;
+  // Start gravity aligned; subsequent virtual pitch/yaw composes with all
+  // raw tracked poses, without changing the compositor's projection poses.
+  Camera initialRig = app.camera;
+  initialRig.pitch = 0.0F;
+  VrRig rig{initialRig.position, cameraOrientation(initialRig)};
+  VrLocomotion locomotion;
 
   bool running = true;
   int framesRendered = 0;
@@ -4149,7 +4990,6 @@ int runXr(char const* shaderDir,
   HandGesture rightPinch;
   HandGesture rightGrasp;
   HandGraspGate graspGate;
-  BooleanRearmLatch deleteLatch;
   bool palmUp = false;
   bool leftUiOwned = false;
   int jointSignature = -1;
@@ -4169,6 +5009,8 @@ int runXr(char const* shaderDir,
       break;
     }
     if (status == XrShell::FrameStatus::Pump || status == XrShell::FrameStatus::Skipped) {
+      locomotion.interrupt();
+      lastFrameTime = std::chrono::steady_clock::now();
       // Rendering must not hide a tracking interruption. Commit the live
       // edit at its last good sample, drop any captured menu press, and
       // require a release before reacquisition can start anything new.
@@ -4184,7 +5026,9 @@ int runXr(char const* shaderDir,
       app.panelPress.cancel();
       app.panelTriggerArmed = false;
       app.carouselGate.reset();
-      deleteLatch.interrupt();
+      app.galleryBrowse.interrupt();
+      app.deleteLatch.interrupt();
+      app.leftTriggerWorkflow.interrupt();
       app.deleteHolding = false;
       app.deleteCharge = 0.0F;
       // A hand menu lives and dies with the tracked palm. A controller menu
@@ -4218,23 +5062,22 @@ int runXr(char const* shaderDir,
     float dt = std::chrono::duration<float>(now - lastFrameTime).count();
     lastFrameTime = now;
     selectionLatch.advance(dt); // use elapsed time, not the animation timestep clamp
+    float const gestureDt = dt;
     dt = dt > 0.1F ? 0.1F : dt;
 
     tickAnimations(app, renderer, dt);
 
-    // No flight controls: passthrough means you walk in the real world with
-    // the models placed in it — the sticks' flight/turn bindings were removed
-    // at the user's request ("I can now move in the real world"). Grip is the
-    // fine-control modifier.
-
-    // Head and pointer in world space (rig-transformed).
-    Mat4 rigView = cameraView(rig);
-    Mat4 rigWorld{};
-    if (!invertAffine(rigView, rigWorld)) {
-      shell.endFrame(); // frame is begun: pair the begin before bailing
-      running = false;
-      break;
-    }
+    // Freeze locomotion during manipulations and panel use, including the
+    // transition frame, so moving the rig cannot move a held selection.
+    bool const rigSafe = input.viewTracked && !input.deleteInterrupted &&
+        !app.grabActive && app.menuOwner == MenuOwner::none &&
+        !(input.selectActive && input.selectHeld) &&
+        !(input.leftSelectActive && input.leftSelectHeld) && !input.menuPressed;
+    locomotion.update(rig, input.headPosition, input.headOrient, input.leftStick,
+                      input.rightStick, rigSafe && input.leftStickActive && !input.handActive[0],
+                      rigSafe && input.rightStickActive && !input.handActive[1] &&
+                          !app.galleryActive && !input.spawnPressed, dt);
+    Mat4 const rigWorld = rig.world();
     Vec3 headWorld = transformPoint(rigWorld, input.headPosition);
     Vec3 headForward =
         normalized(transformVector(rigWorld, rotate(input.headOrient, {0.0F, 0.0F, -1.0F})));
@@ -4254,11 +5097,18 @@ int runXr(char const* shaderDir,
     // The physical grip pose: position AND orientation, with the runtime's
     // VALID and TRACKED flags kept separate. A hand profile's grip/pose is
     // not bound here, so hands never feed the controller manipulation path.
+    ControllerPose leftControllerGrip;
+    if (!input.handActive[0] && input.controllerGrip[0].valid) {
+      leftControllerGrip.position = transformPoint(rigWorld, input.controllerGrip[0].position);
+      leftControllerGrip.orientation = normalized(rig.orientation * input.controllerGrip[0].orientation);
+      leftControllerGrip.valid = true;
+      leftControllerGrip.tracked = input.controllerGrip[0].tracked;
+    }
     ControllerPose controllerGrip;
     if (controllerRight && input.controllerGrip[1].valid) {
       controllerGrip.position = transformPoint(rigWorld, input.controllerGrip[1].position);
       controllerGrip.orientation =
-          normalized(cameraOrientation(rig) * input.controllerGrip[1].orientation);
+          normalized(rig.orientation * input.controllerGrip[1].orientation);
       controllerGrip.valid = true;
       controllerGrip.tracked = input.controllerGrip[1].tracked;
     }
@@ -4281,7 +5131,7 @@ int runXr(char const* shaderDir,
     HandPose worldHands[2] = {input.hands[0], input.hands[1]};
     for (auto& hand : worldHands) {
       hand.position = transformPoint(rigWorld, hand.position);
-      hand.orientation = normalized(cameraOrientation(rig) * hand.orientation);
+      hand.orientation = normalized(rig.orientation * hand.orientation);
     }
     int const jointsNow = (worldHands[0].valid ? 1 : 0) + (worldHands[1].valid ? 2 : 0);
     if (jointsNow != jointSignature) {
@@ -4289,6 +5139,8 @@ int runXr(char const* shaderDir,
           worldHands[0].valid ? "tracked" : "untracked", worldHands[1].valid ? "tracked" : "untracked");
       jointSignature = jointsNow;
     }
+    interruptControllerForViewLoss(app, input.viewTracked);
+    if (!input.viewTracked) { rightPinch.reset(); }
     if (!input.selectActive) {
       if (app.grabActive && app.grabOwner == GrabOwner::controller) {
         endEdits(app);
@@ -4300,8 +5152,9 @@ int runXr(char const* shaderDir,
       app.deleteCharge = 0.0F;
     }
     bool const handRight = input.handActive[1];
-    bool const handSignal = handPinchSignal(handRight, input.pinchActive[1], input.pinch[1]);
-    bool const leftSignal = handPinchSignal(input.handActive[0], input.pinchActive[0], input.pinch[0]) &&
+    bool const handSignal = input.viewTracked && handPinchSignal(handRight, input.pinchActive[1], input.pinch[1]);
+    bool const leftSignal = input.viewTracked && !input.deleteInterrupted &&
+        handPinchSignal(input.handActive[0], input.pinchActive[0], input.pinch[0]) &&
         worldHands[0].valid;
     // Aim is needed to target, not to sustain a tracked pinch or palm grab.
     bool const leftPressed = leftPinch.update(leftSignal, input.pinch[0]);
@@ -4369,6 +5222,10 @@ int runXr(char const* shaderDir,
       app.handUiOwned = true;
       handMenuToggled = true;
     }
+    // Apply Menu and A before trigger actions, never using a stale view.
+    handMenuToggled = processControllerUiToggles(app, renderer, input, headWorld, headForward) ||
+                      handMenuToggled;
+
     // Latch the stationary carousel anchor on its opening frame.
     if (app.galleryActive && !app.ringLatched) {
       galleryTick(app, renderer, 0.0F, headWorld, headForward);
@@ -4466,19 +5323,12 @@ int runXr(char const* shaderDir,
       }
     }
 
-    // Left controller MENU: one press opens/closes the real tools panel. The
-    // panel is processed after this toggle, so a press that opens it this
-    // frame captures the trigger as a menu press; a trigger held from before
-    // must be released first. Thumbstick clicks still do nothing.
-    if (input.menuPressed) {
-      toggleControllerToolMenu(app, headWorld, headForward);
-      handMenuToggled = true;
-      app.triggerWorkflow.reset();
-      app.panelPress.cancel();
-      app.deleteCharge = 0.0F;
+    // Controller tools panel: the right aim points, the right trigger acts.
+    if (input.viewTracked && !input.deleteInterrupted &&
+        (input.undoPressed || input.redoPressed)) {
+      cancelPanelDelete(app);
     }
 
-    // Controller tools panel: the right aim points, the right trigger acts.
     // A press captures one button (or a miss, which is swallowed). Delete is
     // a 0.6 s hold; the other actions fire on release over the same button.
     if (app.menuOwner != MenuOwner::none && controllerRight) {
@@ -4497,7 +5347,7 @@ int runXr(char const* shaderDir,
       if (input.selectHeld &&
           app.panelPress.hold(true, app.handHover, dt) == ToolPanelPress::Action::deleteNow) {
         deleteSelection(app);
-        deleteLatch.interrupt();
+        app.deleteLatch.interrupt();
         app.deleteHolding = false;
       }
       app.deleteCharge = app.panelPress.charge();
@@ -4528,6 +5378,12 @@ int runXr(char const* shaderDir,
       }
     }
 
+    // History can close an open carousel; do not perform that transition on a
+    // stale or interrupted view either. The shell consumes these frame edges.
+    if (!input.viewTracked || input.deleteInterrupted) {
+      input.undoPressed = false;
+      input.redoPressed = false;
+    }
     bool cancelledLiveEdit = false;
     if (input.undoPressed || input.redoPressed) { selectionLatch.reset(); graspGate.reset(); rightGrasp.reset(); }
     if (input.undoPressed) {
@@ -4568,7 +5424,7 @@ int runXr(char const* shaderDir,
       if (app.physicalGrab) { rightPinch.reset(); }
     }
 
-    // Controller select/grab. The right trigger is the only scene input:
+    // Controller select/grab. The right trigger workflow:
     //   1. the first press selects the exact surface under the tracked aim;
     //   2. release;
     //   3. the next press-and-hold moves the current selection with the
@@ -4577,60 +5433,9 @@ int runXr(char const* shaderDir,
     // selects a part and never starts a grab. The carousel and the tools
     // panel own the trigger while open.
     if (app.menuOwner == MenuOwner::none && !app.galleryActive) {
-      bool const partSelectPress = input.gripHeld > 0.5F;
-      ControllerTriggerWorkflow::Target target = ControllerTriggerWorkflow::Target::none;
-      PointerTarget pressTarget;
-      if (input.selectPressed && controllerAimTracked) {
-        pressTarget = resolvePointerTarget(app, controllerAim);
-        if (pressTarget.node != kInvalidNode) {
-          target = (!partSelectPress && selectionContainsNode(app, pressTarget.node))
-                       ? ControllerTriggerWorkflow::Target::selected
-                       : ControllerTriggerWorkflow::Target::other;
-        }
-      }
-      auto const action = app.triggerWorkflow.update(
-          controllerRight && input.selectActive && (controllerAimTracked || app.triggerWorkflow.primed()),
-          input.selectHeld, input.selectPressed, target,
-          !app.selection.empty());
-      switch (action) {
-      case ControllerTriggerWorkflow::Action::select: {
-        pointerPress(app, pressTarget, partSelectPress);
-        Mat4 inverse;
-        if (app.scene.valid(pressTarget.node) &&
-            invertAffine(app.scene.world(pressTarget.node), inverse)) {
-          app.controllerPivotNode = pressTarget.node;
-          app.controllerPivotLocal = transformPoint(inverse, pressTarget.point);
-        } else {
-          app.controllerPivotNode = kInvalidNode;
-          app.triggerWorkflow.reset();
-        }
-        selectionLatch.reset();
-        graspGate.reset();
-        rightGrasp.reset();
-        break;
-      }
-      case ControllerTriggerWorkflow::Action::clearSelection:
-        pointerPress(app, PointerTarget{}, false);
-        break;
-      case ControllerTriggerWorkflow::Action::beginGrab: {
-        if (!controllerGrip.usable()) {
-          std::printf("[xr] trigger grab refused: grip pose %s\n",
-                      controllerGrip.valid ? "is VALID but untracked" : "is unavailable");
-          break;
-        }
-        HandGrabView const view{headWorld,
-            normalized(cameraOrientation(rig) * input.headOrient), true};
-        if (!app.scene.valid(app.controllerPivotNode) ||
-            !beginControllerGrab(app, controllerGrip,
-                transformPoint(app.scene.world(app.controllerPivotNode), app.controllerPivotLocal), view)) {
-          std::printf("[xr] trigger grab could not start\n");
-        }
-        break;
-      }
-      case ControllerTriggerWorkflow::Action::none:
-      default:
-        break;
-      }
+      processControllerViewerPress(app, input, controllerAim, controllerGrip, headWorld,
+                                   normalized(rig.orientation * input.headOrient),
+                                   selectionLatch, graspGate, rightGrasp);
     } else {
       // Another owner has the trigger. It must return to release before the
       // scene can use it; this also stops a trigger held across a panel or
@@ -4638,39 +5443,21 @@ int runXr(char const* shaderDir,
       app.triggerWorkflow.reset();
     }
 
-    if (app.grabActive && app.grabOwner == GrabOwner::controller) {
-      if (!input.selectHeld) {
-        endEdits(app); // release commits exactly one undo step
-      } else if (!controllerGrip.usable()) {
-        // Tracking loss is not a release: commit at the last good sample and
-        // require a real trigger release before another grab can start.
-        endEdits(app);
-        app.triggerWorkflow.reset();
-        std::printf("[xr] controller grip tracking lost; grab committed at last good pose\n");
-      } else {
-        updateControllerGrab(app, controllerGrip);
-      }
-    }
+    processControllerScale(app, input.viewTracked && app.menuOwner == MenuOwner::none && !app.galleryActive &&
+                           !input.handActive[0] && controllerRight,
+                           input.leftSelectActive, input.leftSelectHeld, input.leftSelectPressed,
+                           input.leftSelectReleased, input.selectActive, input.selectHeld, gestureDt,
+                           leftControllerGrip, controllerGrip);
 
-    // The VR thumbsticks never edit: the right stick's X browses the carousel
-    // while it is open, and nothing else. Movement/rotation/scale are the
-    // physical controller grab only.
+    // The right stick belongs exclusively to carousel browsing while open;
+    // neither stick edits a selection.
     galleryTick(app, renderer, dt, headWorld, headForward);
     if (app.galleryActive) {
-      app.galleryCycleCooldown -= dt;
-      bool const stickNeutral = controllerRight &&
-          carouselStickNeutral(input.rightStickActive, input.rightStick);
-      bool const browsing = controllerRight && input.rightStickActive &&
-          std::fabs(input.rightStick.x) > 0.5F;
-      if (!input.rightStickActive || !controllerRight) {
-        app.galleryStickArmed = false;
-      } else if (stickNeutral) {
-        app.galleryStickArmed = true;
-        app.galleryCycleCooldown = 0.0;
-      } else if (browsing && app.galleryStickArmed && app.galleryCycleCooldown <= 0.0) {
-        galleryCycle(app, renderer, input.rightStick.x > 0.0F ? 1 : -1);
-        app.galleryCycleCooldown = 0.25;
-      }
+      bool const stickNeutral = input.viewTracked && controllerRight &&
+          carouselStickNeutral(input.rightStickActive, input.rightStick, input.rightStickAbsent);
+      int const cycle = app.galleryBrowse.update(input.viewTracked && controllerRight &&
+                                                  input.rightStickActive, input.rightStick, dt);
+      if (cycle != 0) { galleryCycle(app, renderer, cycle); }
       // Placement is the CENTRED model, no pointing: wait for the ring to be
       // at rest, the stick to be released, and THIS index to have loaded and
       // settled. A trigger press while any of those is false is consumed,
@@ -4705,50 +5492,9 @@ int runXr(char const* shaderDir,
     bool const handPanelDelete =
         app.menuOwner == MenuOwner::hand && app.handTool == ToolPanelPress::kDelete &&
         handHeld && input.aimTracked[1] && app.handHover == ToolPanelPress::kDelete;
-    if (input.deleteInterrupted) {
-      deleteLatch.interrupt();
-    }
-    bool const deleteHeld = deleteLatch.update(
-        input.deleteActive && !input.deleteInterrupted, input.deleteHeld);
-    if ((deleteHeld || handPanelDelete) &&
-        !app.selection.empty() && !app.galleryActive) {
-      if (!app.deleteHolding) {
-        app.deleteHolding = true;
-        app.deleteHoldStart = std::chrono::steady_clock::now();
-      }
-      double const held =
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - app.deleteHoldStart)
-              .count();
-      app.deleteCharge = static_cast<float>(std::min(held / kDeleteChargeS, 1.0));
-      if (app.deleteCharge >= 1.0F) {
-        deleteSelection(app);
-        deleteLatch.interrupt();
-        app.deleteHolding = false;
-        app.deleteCharge = 0.0F;
-      }
-    } else if (controllerPanelDelete) {
-      app.deleteHolding = false; // the controller panel owns the red ramp
-    } else {
-      app.deleteHolding = false;
-      app.deleteCharge = 0.0F;
-    }
-    // The model carousel: the spawn key opens it (one staged model in front
-    // of the viewer) or closes it. NO grip chord here on purpose —
-    // the grip sensor spikes when squeezing the controller to press A, and
-    // the old "grip+A cancels" chord silently swallowed EVERY press (the
-    // reported "nothing appears when I press A"). Cancelling is undo (B) — a
-    // single, stable button the user already has.
-    if (input.spawnPressed) {
-      if (app.galleryActive) {
-        galleryClose(app);
-      } else {
-        if (app.menuOwner != MenuOwner::none) {
-          closeToolMenu(app);
-        }
-        galleryOpen(app, renderer);
-      }
-    }
-
+    processDeleteCharge(app, input.viewTracked, input.deleteActive && !input.deleteInterrupted,
+                        input.deleteHeld, input.deleteInterrupted, controllerPanelDelete,
+                        handPanelDelete, std::chrono::steady_clock::now());
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
     std::vector<RendererVertex> overlayLines;
@@ -4832,7 +5578,7 @@ int runXr(char const* shaderDir,
                 "renderFalse %llu (runtime hint ignored)\n",
                 static_cast<unsigned long long>(stats.stalePose),
                 static_cast<unsigned long long>(stats.renderFalse));
-    std::printf("[xr] controller sticks (right = carousel browse, left unused): "
+    std::printf("[xr] controller sticks (left = flight, right = look/carousel): "
                 "left X %.2f Y %.2f, right X %.2f Y %.2f (peaks)\n",
                 stats.leftXMax, stats.leftYMax, stats.rightXMax, stats.rightYMax);
   }
@@ -5121,7 +5867,9 @@ int main(int argc, char** argv) {
           "vr:   right trigger: first press selects (grip+trigger part), release,\n"
           "      next press-hold grabs the selection with the controller grip\n"
           "      pose; release commits. Sticks never edit.\n"
+          "      left stick flies; right stick looks (browses in carousel).\n"
           "      left menu tap = tools panel (Models/Undo/Redo/Delete/Backdrop),\n"
+          "      left-only trigger release clears; hold during a right grab to scale;\n"
           "      right aim + trigger activates; A = carousel, right stick X\n"
           "      browses, trigger places the settled centre model;\n"
           "      hold X delete, B/Y undo/redo. Hands render and the hand menu\n"

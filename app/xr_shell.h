@@ -39,9 +39,12 @@ struct XrFrameInput {
   // runtime's space-location flags so the app can require measured tracking.
   ControllerPose controllerGrip[2];
   Vec3 headPosition{0.0F, 0.0F, 0.0F}; // midpoint of the eyes (tracking space)
-  Vec2 leftStick{0.0F, 0.0F};  // left stick: reserved (no model editing)
-  Vec2 rightStick{0.0F, 0.0F}; // right stick: carousel browsing
+  Vec2 leftStick{0.0F, 0.0F};  // viewer-relative flight
+  Vec2 rightStick{0.0F, 0.0F}; // viewer look or carousel browsing
+  bool leftStickActive{false};
+  bool viewTracked{false}; // fresh position and orientation, both actively tracked
   bool rightStickActive{false}; // successful, active, finite right-stick sample
+  bool rightStickAbsent{false}; // confirmed simple-controller profile, not a transient loss
   // selectActive is true only for a successful, active, finite trigger
   // sample, except that a focus/profile interruption is exposed as
   // inactive for one rendered frame so the app can cancel. On
@@ -49,15 +52,19 @@ struct XrFrameInput {
   // are false: cancel captures/grabs, not commit a synthetic release.
   // After an interruption, an active sample at or below the release
   // threshold silently rearms; a later physical press emits the next edge.
+  bool leftSelectActive{false};
+  bool leftSelectHeld{true};
+  bool leftSelectPressed{false};
+  bool leftSelectReleased{false};
   bool selectActive{false};
   bool selectHeld{false};
   bool selectPressed{false};
   bool selectReleased{false};
   bool menuPressed{false};
-  bool menuHeld{false};    // held state for the backdrop toggle (hold = backdrop)
-  bool undoPressed{false};  // latched: Face button on Touch, trackpad on Vive
+  bool menuHeld{false};    // raw held state on a safe, active sample
+  bool undoPressed{false};  // latched: face button on Touch
   bool redoPressed{false};
-  bool spawnPressed{false}; // latched: A on Touch (model gallery open/close)
+  bool spawnPressed{false}; // A on Touch; interrupted presses are discarded
   // True only when the X action query succeeds and the action is active.
   // Inactive is not a physical release; interrupt the delete latch.
   bool deleteActive{false};

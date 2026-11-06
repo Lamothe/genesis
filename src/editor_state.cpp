@@ -64,6 +64,33 @@ void restoreState(EditorSnapshot const& snapshot,
   selection = snapshot.selection;
 }
 
+SelectionSubtrees::SelectionSubtrees(Scene const& scene, std::vector<NodeId> const& selection)
+    : scene_(scene) {
+  for (NodeId const id : selection) {
+    if (scene_.valid(id)) {
+      hasSelection_ = true;
+      membership_.emplace(id, true);
+    }
+  }
+}
+
+bool SelectionSubtrees::contains(NodeId id) {
+  if (!hasSelection_ || !scene_.valid(id)) {
+    return false;
+  }
+  path_.clear();
+  NodeId current = id;
+  while (current != kInvalidNode && membership_.find(current) == membership_.end()) {
+    path_.push_back(current);
+    current = scene_.parent(current);
+  }
+  bool const selected = current != kInvalidNode && membership_.at(current);
+  for (NodeId const node : path_) {
+    membership_.emplace(node, selected);
+  }
+  return selected;
+}
+
 bool nodesBounds(Scene& scene,
                  std::vector<NodeVisual> const& visuals,
                  std::vector<NodeId> const& ids,
