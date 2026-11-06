@@ -5,6 +5,7 @@
 #include <vulkan/vulkan.h>
 
 #include "camera.h"
+#include "controller_workflow.h"
 #include "hand_input.h"
 #include "vecmath.h"
 
@@ -32,9 +33,23 @@ struct XrFrameInput {
   // aimRays[i] is ACTIVELY tracked (VALID and TRACKED): a pose that is only
   // VALID may be inferred/last-known and must not drive spatial actions.
   bool aimTracked[2] = {false, false};
+  // Physical controller grip poses, located from XR grip action spaces (left,
+  // right). These are the manipulation poses: never the aim ray and never a
+  // head-gaze fallback. VALID and TRACKED are recorded separately from the
+  // runtime's space-location flags so the app can require measured tracking.
+  ControllerPose controllerGrip[2];
   Vec3 headPosition{0.0F, 0.0F, 0.0F}; // midpoint of the eyes (tracking space)
-  Vec2 leftStick{0.0F, 0.0F};  // left stick: stick-driven MOVE of the selection
-  Vec2 rightStick{0.0F, 0.0F}; // right stick: mode-driven edit of the selection
+  Vec2 leftStick{0.0F, 0.0F};  // left stick: reserved (no model editing)
+  Vec2 rightStick{0.0F, 0.0F}; // right stick: carousel browsing
+  bool rightStickActive{false}; // successful, active, finite right-stick sample
+  // selectActive is true only for a successful, active, finite trigger
+  // sample, except that a focus/profile interruption is exposed as
+  // inactive for one rendered frame so the app can cancel. On
+  // inactive input the held signal is conservatively true and both edges
+  // are false: cancel captures/grabs, not commit a synthetic release.
+  // After an interruption, an active sample at or below the release
+  // threshold silently rearms; a later physical press emits the next edge.
+  bool selectActive{false};
   bool selectHeld{false};
   bool selectPressed{false};
   bool selectReleased{false};
@@ -43,7 +58,12 @@ struct XrFrameInput {
   bool undoPressed{false};  // latched: Face button on Touch, trackpad on Vive
   bool redoPressed{false};
   bool spawnPressed{false}; // latched: A on Touch (model gallery open/close)
+  // True only when the X action query succeeds and the action is active.
+  // Inactive is not a physical release; interrupt the delete latch.
+  bool deleteActive{false};
   bool deleteHeld{false};   // X on Touch held: hold-to-delete with red ramp
+  // Focus/profile change, even if the current delete query is active.
+  bool deleteInterrupted{false};
   float gripHeld{0.0F};
 };
 

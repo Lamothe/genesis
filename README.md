@@ -25,20 +25,25 @@ renderer bolted on later through the seam contract
   XCB/swapchain windowed mode, offscreen mode with RGBA8 readback; registered
   indexed meshes, built-in cube is mesh 0)
 - `app/geometry.*` — cube, floor grid, handle-line geometry
-- `app/editor_app.cpp` — XCB window, input, selection, gizmo wiring, model
-  loading (`.glb`/`.obj` on the command line), smoke modes
+- `app/editor_app.cpp` — XCB/OpenXR shell input, selection, controller
+  workflow, model loading (`.glb`/`.obj` on the command line), smoke modes
+- `include/controller_workflow.h` — controller grip-pose quality, the
+  carousel's settled/loaded placement gate, the trigger select-then-grab state
+  machine and the tools-panel press/Delete-hold capture
 - `shaders/` — GLSL (compiled by `glslc` at launch)
 - `tests/test_core.cpp` — maths, parser and behaviour tests
 
 ## Build and test
 
 ```sh
-bash run-tests.sh        # core + hand gesture checks; fixtures via ImageMagick
+bash run-tests.sh        # core + controller/hand state checks; fixtures via ImageMagick
 bash run-editor.sh       # build + interactive editor
 bash run-editor.sh model.glb other.obj   # load models (textures via glTF/OBJ materials)
 bash run-editor.sh model.glb --xr        # VR session via OpenXR (WiVRn etc.)
 bash run-editor.sh --smoke-offscreen     # render + pixel assertions
 bash run-editor.sh --smoke-textured      # texture sampling end-to-end
+bash run-editor.sh --smoke-blend         # blended surfaces
+bash run-editor.sh --smoke-perf          # offscreen rendering timings
 bash run-editor.sh --smoke-window 30     # windowed present path
 bash run-editor.sh --smoke-xr            # XR frame loop (SKIP without a runtime)
 ```
@@ -55,13 +60,16 @@ forward/back.
 
 **LMB** selects: a click selects the whole model under the cursor,
 **Shift+LMB** or **Ctrl+LMB** selects a single part. There is no gizmo — the
-coloured axis handles were removed; all editing is the **arrow keys** (the
-desktop mirror of the sticks) and it is **mode-driven** with two modes:
+coloured axis handles were removed; desktop editing is the **arrow keys** and
+it is **mode-driven** with two modes:
 **1** = move (**left/right** uniform scale — per-axis scaling does not exist;
 **up/down** height, no floor rule), **2** = rotate (**left/right** spins the
 model about the scene's up axis, **up/down** tips the top away / lifts the
 face — strictly around the viewer's axes). **Shift** runs
-the arrows at quarter speed (fine). Nothing rotates outside rotate mode. Each
+the arrows at quarter speed (fine). Nothing rotates outside rotate mode. The
+desktop **2** key still rotates strictly around the VIEWER's axes (the scene's
+vertical and the left-right line through your eye, latched per gesture): whole
+models re-rest on the floor after a tip, part selections tip in place. Each
 arrow gesture is one undo step. **Ctrl-Z** undo (cancels a live edit),
 **Ctrl-Y** / **Ctrl-Shift-Z** redo, **N** opens the model carousel (the
 ring of models rotates in/out of view around the camera; **[** **]** cycle
@@ -75,104 +83,86 @@ closes without placing), **Delete** removes the selection (model or part),
 part selection marks the part) and the current mode's name shows as
 sans-serif text floating in front of the camera.
 
-In VR the trigger only *selects* — whole model, or a single part with grip+trigger.
-Bare hands (Quest through WiVRn) use a separate control path; controller
-buttons and sticks are unchanged:
+In VR the right controller's **physical grip pose** is the manipulation input;
+its aim ray only selects and points at UI. Placement in the carousel needs no
+pointing. There is one owner grab at a time, and the controls are:
 
-- **Left pinch while the left palm faces up** toggles the stationary hand menu;
-  palm-up alone does nothing. Choose **Models** to open the carousel.
-- In the carousel, **right pinch** the exact surface of the settled centre
-  preview to place it (an exact hit has priority over browsing). Otherwise,
-  pinching anywhere left or right of centre browses one model (previous on
-  the left, next on the right — there is no central dead zone). A grazing
-  clip from a backward or plane-parallel ray neither places nor browses, and
-  a pinch with an untracked aim (a valid pose that is not actively tracked)
-  neither browses nor places; the head-gaze fallback never acts on the
-  carousel.
-  Placing a model closes the menu. While the aim rests exactly on the
-  placeable preview's surface it wears a subtle cool rim plus a faint wash
-  (never a fill banner); the highlight never appears while the ring is moving
-  or the aim is untracked.
-  The centre marker identifies the model that can be placed. Desktop and
-  controller use the same hit rules.
-- Outside the menu, **right pinch and release** selects the whole model under
-  the aim beam. Pinch and hold the selected model again to move it with the
-  palm and rotate it with the wrist around the picked surface. Lateral motion is
-  view-relative: lateral motion follows the hand in the view, and depth changes
-  by the same fraction as the hand's distance from the viewer. The grab view is
-  latched; releasing commits one undo step. Hand selection is whole-model only;
-  controllers retain grip+trigger part selection.
-- While holding a right-hand grab, pinch and hold with the left hand and vary
-  the distance between the palms to scale uniformly about the model's centre.
-  Releasing either hand ends the edit; release the right hand before another
-  edit. Both hands are shown as tracked, procedurally generated 3D surfaces
-  depth-tested against models; they are not the downloaded rigged asset.
-- After selecting a model, bring the right hand near its surface and close it
-  to grab and rotate it directly; opening the hand releases it. This uses the
-  runtime grasp gesture and does not provide collision or haptic resistance.
-- The hand menu offers **Models**, **Undo**, **Redo**, **Delete** and
-  **Backdrop**. Delete requires a 0.6 s hold with red charge feedback.
-  A held menu interaction stays captured until release.
-- Opening the tools panel pauses an active controller-stick edit; choosing
-  UNDO/REDO cancels it without discarding the existing redo branch. Closing
-  the panel or choosing another edit commits it.
-- Tracking loss or a skipped/paused XR frame ends the current hand edit;
-  release the pinch before starting again. Aim-and-pinch select/place remains
-  available without joint tracking, but grab/rotation and the palm-up menu
-  toggle need tracked palm joints. Direct grasp also needs runtime grasp input. The console reports joint availability
-  and tracking, left-pinch menu actions and tool activations.
+- **Right trigger, viewer:** the first press selects the exact model (or, with
+  **grip+trigger**, the single part) under the tracked aim and is consumed:
+  holding it cannot then move the model. Release. The next press-and-hold grabs
+  the current selection and moves/rotates it with the controller's physical 3D
+  position AND orientation, through the same latched-view projection the hand
+  grab used: lateral motion follows the controller in view, and depth changes by
+  the same fraction as the grip's distance from the eye. The pivot is the picked
+  surface point; release commits one undo step. A press on a different model
+  selects it; the grab can start without pointing back at the selection. Nothing snaps on
+  grab start because every update applies the cumulative delta to the captured
+  start transforms.
+- **Grip pose quality:** the shell locates a separate grip action space for each
+  controller and records VALID and TRACKED independently. A VALID-but-untracked
+  grip can neither start nor update a grab, and there is no head-gaze fallback
+  for the physical pose. Losing tracking during a grab commits at the last good
+  pose and requires a real trigger release before another grab. Profile changes
+  and skipped/paused XR frames do the same.
+- **Left Menu:** one press opens/closes the real tools panel (**Models**,
+  **Undo**, **Redo**, **Delete**, **Backdrop**), latched in the world in front of
+  the viewer so pointing at it is stable. Aim with the right controller and pull
+  the trigger: Models/Undo/Redo/Backdrop fire on release over the same button;
+  Delete is a 0.6 s hold with the red charge ramp and cancels if released early.
+  A miss is captured and swallowed (nothing clicks through). Opening the panel
+  commits a live grab; a trigger held across a panel/carousel transition must
+  return to release before it can act again.
+- **Carousel:** **A** or the panel's **Models** button opens it. **Right stick
+  X** browses the ring (one step per flick, held repeats every 0.25 s). The
+  **right trigger loads the centred model — no pointing at it** — but only once
+  the ring is at rest, the right stick is active and neutral, and that centre slot has finished
+  loading and rested for 0.12 s. A trigger press while it is loading or
+  unsettled is consumed: it never replays when the load completes, so it cannot
+  place a different model than the one visible at the press. The centre
+  preview wears the cool rim while a trigger press would place now (readiness,
+  not aim). Profiles without an active right stick cannot place from the carousel.
+  Placement is at natural size on the floor below the centred preview,
+  one undo step, and closes the carousel.
+- **A** still opens/closes the carousel directly, undo (**B**)/redo (**Y**) and
+  hold-**X** delete remain, and **grip** remains the part-selection modifier.
+  Thumbstick clicks do nothing. The VR thumbsticks never move, rotate or scale a
+  model: the right stick only browses the carousel and the left stick is unused.
+- **Hands:** tracked hand/arm surfaces still render, depth-tested against the
+  scene, and the **left palm-up pinch** menu still opens the tools panel. Hand
+  pinch/grasp no longer selects, grabs, moves or scales models; the old hand-grab
+  maths and tests are retained for future arm interaction. A hand menu follows
+  the palm and closes on palm tracking loss; the controller menu stays latched where it opened.
+  Models in the hand-only menu requires switching to the right controller.
 
-**Verification status:** build, automated hand/core tests and offscreen hand
-editing/panel smoke checks are available; the carousel's placeable-highlight
-is additionally covered by an offscreen with/without pixel-difference render
-check. These do **not** verify the runtime bindings or gesture usability in
-the headset. Michael's headset confirmation is still required for every
-feature above.
+**Verification status:** strict build; core, hand, XR-view and hand-mesh tests;
+state-machine regressions for carousel placement gating (loading, settling,
+browsing, held-trigger latch, changed index), trigger select-then-grab,
+untracked poses, tools-panel capture/Delete hold and history; offscreen,
+textured, blend and perf smokes. The offscreen smoke also renders and checks the
+panel, and covers a controller-owner grab with position+orientation, refusal of
+an untracked pose, undo and release. The **XR frame smoke was not available**:
+it was not run during this handover to avoid disturbing the active XR session.
+Runtime bindings and headset usability remain **unverified**.
 
-Movement and editing are the **sticks** (controller aim is too jittery for
-accurate placement): the **left stick** slides the selection across the floor
-relative to your head at **3 m/s** at full deflection (previously 1.5 m/s;
-pushing forward walks it away from you; it never lifts
-off the floor), and the **right stick** scales it (X, right = bigger) and
-raises it (Y, up = lift). The **left controller's menu** is two controls:
-**tap** = the model carousel, **hold** = the backdrop (thumbstick clicks do
-nothing). The old menu-tap MOVE/ROTATE switch is gone — hand grabs provide rotation; the desktop **2** key still
-rotates, strictly around the VIEWER's axes (the scene's vertical and the
-left-right line through your eye, always perpendicular and level, latched per
-gesture: turning your head mid-gesture does not steer it; whole models
-re-rest on the floor after a tip, part selections tip in place). **Grip** held
-runs the sticks at quarter speed for fine control. Each stick gesture is one
-undo step. The bounding box is not a click target: pressing empty space next
-to a model selects nothing. The selection is shown by a thin warm rim; the mode label is desktop-only (there is no fixed MOVE label in VR). **A** or a **menu tap**
-is the model carousel: a STATIONARY RING of library models around you — the
-centred model is staged at eye height in front of you and the previous/next
-models sit visible at the sides as cheap geometry-only previews (all
-previews stay untextured; textures load when a model is placed). **right
-stick X**
-rotates
-the ring in and out of view INSTANTLY (decoding runs on a worker thread, so
-a huge model never blocks the switch; each preview is labelled with its filename stem), and the
-trigger places the centred model only when its exact preview surface is hit,
-at natural size on the floor below the centred preview — one undo step
-(undo removes it entirely), and the carousel closes. Otherwise, a trigger
-with a tracked right aim anywhere left or right of centre browses one model
-(previous on the left, next on the right — there is no central dead zone; a
-grazing clip is inert).
-**A**, a **menu tap** or undo (B) closes without placing. The library folder
-(`~/Downloads/VR` by default, `--library DIR`) is rescanned every time it
-opens — drop a file in and place it without restarting. **Hold X** to
-delete: the selection ramps red and the delete fires at full charge (0.6 s);
-release
-before that to cancel. **B** (right) / **Y** (left) on Touch undo/redo,
-trackpad click on Vive. Passthrough is the DEFAULT view: the real world with
-the models drawn over it (hold the menu button, or desktop B, toggles the grid backdrop
-back). There are no flight controls in VR by design: passthrough means you
-walk around the real world with the
-models placed in it, so locomotion is physical — you walk, turn and crouch.
-The sticks are for EDITING, not locomotion (their output is still logged at
-session end as controller diagnostics). The view uses the headset's located
-eye poses, including head roll, while the world rig remains level with gravity.
-Desktop keeps its keyboard
+The **bounding box is not a click target**: pressing empty space next to a model
+selects nothing. The selection is shown by a thin warm rim; the mode label is
+desktop-only (there is no fixed MOVE label in VR). The carousel is a
+**stationary ring** of library models: the centred model is staged at eye height
+and the previous/next models sit visible at the sides as cheap geometry-only
+previews (textures load when a model is placed; each preview is labelled with
+its filename stem). The library folder (`~/Downloads/VR` by default,
+`--library DIR`) is rescanned every time the carousel opens — drop a file in and
+place it without restarting. **Hold X** to delete: the selection ramps red and
+the delete fires at full charge (0.6 s); release before that to cancel. **B**
+(right) / **Y** (left) on Touch undo/redo, trackpad click on Vive. Passthrough
+is the DEFAULT view: the real world with the models drawn over it (the
+**Backdrop** button, or desktop **B**, toggles the grid back). There are no
+flight controls in VR by design: passthrough means you walk around the real
+world with the models placed in it, so locomotion is physical — you walk, turn
+and crouch. The sticks never edit or drive locomotion (their output is still
+logged at session end as controller diagnostics). The view uses the headset's
+located eye poses, including head roll, while the world rig remains level with
+gravity. Desktop keeps its keyboard
 flight (WASD, Q/E, Shift boost) and mouse look for desk debugging.
 
 ## Animation and rendering status
@@ -190,8 +180,10 @@ transmission, emissive, sRGB material pipeline and studio lighting. This change
 only fixes normal transforms and Vulkan blend-upload synchronisation; it does
 not claim Centre Stage appearance parity. The hands are procedural tracked surfaces, not the downloaded rig; its library
 GLB has no skin, while the original archive contains a rig. Rig retargeting and
-collision need further work. Passthrough does not supply real
-room geometry for collision.
+collision need further work. Visible hands/arms and their depth-tested
+rendering are retained in the controller workflow, but no arm-asset work was
+done in this change. Passthrough does not supply real room geometry for
+collision.
 
 ## Design notes
 

@@ -1,5 +1,6 @@
 #include "xr_shell.h"
 #include "xr_view.h"
+#include "controller_workflow.h"
 
 #include <openxr/openxr.h>
 
@@ -41,7 +42,6 @@ bool xrOk(XrResult result, char const* what) {
   return true;
 }
 
-
 } // namespace
 
 struct XrShell::ImplData {
@@ -64,7 +64,9 @@ struct XrShell::ImplData {
   XrAction deleteAction{XR_NULL_HANDLE}; // X on Touch: hold to delete
   XrAction gripAction{XR_NULL_HANDLE};
   XrAction aimAction{XR_NULL_HANDLE};
-  XrSpace aimSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE}; // left, right
+  XrAction gripPoseAction{XR_NULL_HANDLE}; // physical controller pose
+  XrSpace aimSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};   // left, right
+  XrSpace gripSpaces[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};  // left, right
   XrSwapchain swapchains[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
   std::vector<XrSwapchainImageVulkan2KHR> images[2];
   std::vector<VkImageView> imageViews[2];
@@ -79,7 +81,8 @@ struct XrShell::ImplData {
   bool frameReady{false}; // views located and both eye images acquired
   XrTime predictedDisplayTime{0};
   XrFrameState frameState{};
-  bool selectPrev{false};
+  SelectTriggerLatch selectTrigger;
+  bool selectInterruptedPending{false};
   bool menuPrev{false};
   bool undoPrev{false};
   bool redoPrev{false};
@@ -484,7 +487,8 @@ bool XrShell::createActions() {
       !makeVec2("rightstick", &xr_->rightStickAction) || !makeBool("menu", &xr_->menuAction) ||
       !makeBool("undo", &xr_->undoAction) || !makeBool("redo", &xr_->redoAction) ||
       !makeBool("spawn", &xr_->spawnAction) || !makeBool("delete", &xr_->deleteAction) ||
-      !makeFloat("grip", &xr_->gripAction) || !makePose("aim", &xr_->aimAction)) {
+      !makeFloat("grip", &xr_->gripAction) || !makePose("aim", &xr_->aimAction) ||
+      !makePose("grip_pose", &xr_->gripPoseAction)) {
     return false;
   }
 
@@ -500,7 +504,9 @@ bool XrShell::createActions() {
         {"/user/hand/left/input/select/click", xr_->triggerAction},
         {"/user/hand/left/input/menu/click", xr_->menuAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
-        {"/user/hand/left/input/aim/pose", xr_->aimAction}}}, // no thumbstick on this profile
+        {"/user/hand/left/input/aim/pose", xr_->aimAction},
+        {"/user/hand/right/input/grip/pose", xr_->gripPoseAction},
+        {"/user/hand/left/input/grip/pose", xr_->gripPoseAction}}}, // no thumbstick on this profile
       {"/interaction_profiles/oculus/touch_controller",
        {{"/user/hand/right/input/trigger/value", xr_->triggerAction},
         {"/user/hand/left/input/trigger/value", xr_->triggerAction},
@@ -511,6 +517,10 @@ bool XrShell::createActions() {
         {"/user/hand/left/input/squeeze/value", xr_->gripAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
         {"/user/hand/left/input/aim/pose", xr_->aimAction},
+        // The physical grip pose drives view-relative model manipulation;
+        // the aim ray only selects or points at UI.
+        {"/user/hand/right/input/grip/pose", xr_->gripPoseAction},
+        {"/user/hand/left/input/grip/pose", xr_->gripPoseAction},
         // Undo/redo/spawn on the face buttons. Thumbstick clicks are
         // deliberately UNBOUND (the user's binding): the carousel is the
         // left menu button's TAP. A = spawn, X (held) = delete.
@@ -528,6 +538,8 @@ bool XrShell::createActions() {
         {"/user/hand/left/input/squeeze/click", xr_->gripAction},
         {"/user/hand/right/input/aim/pose", xr_->aimAction},
         {"/user/hand/left/input/aim/pose", xr_->aimAction},
+        {"/user/hand/right/input/grip/pose", xr_->gripPoseAction},
+        {"/user/hand/left/input/grip/pose", xr_->gripPoseAction},
         {"/user/hand/right/input/trackpad/click", xr_->undoAction},
         {"/user/hand/left/input/trackpad/click", xr_->redoAction}}},
   };
@@ -580,15 +592,22 @@ bool XrShell::createActions() {
     }
   }
 
-  // Aim spaces for both controller pointers (left, right).
+  // Aim spaces for the pointers and grip spaces for the physical poses
+  // (left, right). The grip space is what model manipulation follows; the
+  // aim space only selects and points at UI.
   XrActionSpaceCreateInfo spaceInfo = xrStruct<XrActionSpaceCreateInfo>(XR_TYPE_ACTION_SPACE_CREATE_INFO);
-  spaceInfo.action = xr_->aimAction;
   spaceInfo.poseInActionSpace.orientation.w = 1.0F;
   XrPath const handPaths[2] = {leftPath, rightPath};
   for (int hand = 0; hand < 2; ++hand) {
+    spaceInfo.action = xr_->aimAction;
     spaceInfo.subactionPath = handPaths[hand];
     if (!xrOk(xrCreateActionSpace(xr_->session, &spaceInfo, &xr_->aimSpaces[hand]),
-              "xrCreateActionSpace")) {
+              "xrCreateActionSpace(aim)")) {
+      return false;
+    }
+    spaceInfo.action = xr_->gripPoseAction;
+    if (!xrOk(xrCreateActionSpace(xr_->session, &spaceInfo, &xr_->gripSpaces[hand]),
+              "xrCreateActionSpace(grip)")) {
       return false;
     }
   }
@@ -701,6 +720,11 @@ void XrShell::pollEvents(bool& running) {
   while (xrPollEvent(xr_->instance, &event) == XR_SUCCESS) {
     if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
       auto* changed = reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
+      if (xr_->sessionState == XR_SESSION_STATE_FOCUSED &&
+          changed->state != XR_SESSION_STATE_FOCUSED) {
+        xr_->selectTrigger.interrupt();
+        xr_->selectInterruptedPending = true;
+      }
       xr_->sessionState = changed->state;
       switch (changed->state) {
       case XR_SESSION_STATE_READY: {
@@ -725,6 +749,10 @@ void XrShell::pollEvents(bool& running) {
       default:
         break;
       }
+    } else if (event.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+      // A profile can change without an inactive sample in between.
+      xr_->selectTrigger.interrupt();
+      xr_->selectInterruptedPending = true;
     } else if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
       running = false;
     }
@@ -737,7 +765,8 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   XrActionsSyncInfo syncInfo = xrStruct<XrActionsSyncInfo>(XR_TYPE_ACTIONS_SYNC_INFO);
   syncInfo.countActiveActionSets = 1;
   syncInfo.activeActionSets = &active;
-  if (!xrOk(xrSyncActions(xr_->session, &syncInfo), "xrSyncActions")) {
+  XrResult const syncResult = xrSyncActions(xr_->session, &syncInfo);
+  if (!xrOk(syncResult, "xrSyncActions")) {
     return false;
   }
 
@@ -751,17 +780,15 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   XrActionStateFloat triggerState = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
   getInfo.action = xr_->triggerAction;
   getInfo.subactionPath = rightPath;
-  xrGetActionStateFloat(xr_->session, &getInfo, &triggerState);
-  // Hysteresis on the analog trigger: hovering at the press threshold would
-  // otherwise drop and re-press every other frame, and each re-press restarts
-  // the grab at the current position — the model creeps and undo fills with
-  // micro-steps instead of tracking the hand 1:1.
-  float const trigger = triggerState.isActive ? triggerState.currentState : 0.0F;
-  bool selectNow = trigger > (xr_->selectPrev ? 0.4F : 0.55F);
-  input.selectHeld = selectNow;
-  input.selectPressed = selectNow && !xr_->selectPrev;
-  input.selectReleased = !selectNow && xr_->selectPrev;
-  xr_->selectPrev = selectNow;
+  XrResult const triggerResult = xrGetActionStateFloat(xr_->session, &getInfo, &triggerState);
+  // Hysteresis prevents chatter; inactive or failed queries are not releases.
+  auto const select = xr_->selectTrigger.update(syncResult == XR_SUCCESS &&
+                                                XR_SUCCEEDED(triggerResult) && triggerState.isActive &&
+                                                !xr_->selectInterruptedPending, triggerState.currentState);
+  input.selectActive = select.active;
+  input.selectHeld = select.held;
+  input.selectPressed = select.pressed;
+  input.selectReleased = select.released;
 
   XrActionStateVector2f leftStickState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
   getInfo.action = xr_->leftStickAction;
@@ -776,8 +803,12 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   XrActionStateVector2f rightStickState = xrStruct<XrActionStateVector2f>(XR_TYPE_ACTION_STATE_VECTOR2F);
   getInfo.action = xr_->rightStickAction;
   getInfo.subactionPath = rightPath;
-  xrGetActionStateVector2f(xr_->session, &getInfo, &rightStickState);
-  if (rightStickState.isActive) {
+  XrResult const rightStickResult = xrGetActionStateVector2f(xr_->session, &getInfo, &rightStickState);
+  input.rightStickActive = syncResult == XR_SUCCESS && XR_SUCCEEDED(rightStickResult) &&
+                           rightStickState.isActive &&
+                           std::isfinite(rightStickState.currentState.x) &&
+                           std::isfinite(rightStickState.currentState.y);
+  if (input.rightStickActive) {
     input.rightStick = {rightStickState.currentState.x, rightStickState.currentState.y};
     stats_.rightXMax = std::max(stats_.rightXMax, std::abs(input.rightStick.x));
     stats_.rightYMax = std::max(stats_.rightYMax, std::abs(input.rightStick.y));
@@ -844,8 +875,10 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
   XrActionStateBoolean deleteState = xrStruct<XrActionStateBoolean>(XR_TYPE_ACTION_STATE_BOOLEAN);
   getInfo.action = xr_->deleteAction;
   getInfo.subactionPath = leftPath;
-  xrGetActionStateBoolean(xr_->session, &getInfo, &deleteState);
-  input.deleteHeld = deleteState.isActive && deleteState.currentState;
+  XrResult const deleteResult = xrGetActionStateBoolean(xr_->session, &getInfo, &deleteState);
+  input.deleteActive = syncResult == XR_SUCCESS && XR_SUCCEEDED(deleteResult) && deleteState.isActive;
+  input.deleteHeld = input.deleteActive && deleteState.currentState;
+  input.deleteInterrupted = xr_->selectInterruptedPending;
 
   XrActionStateFloat gripState = xrStruct<XrActionStateFloat>(XR_TYPE_ACTION_STATE_FLOAT);
   getInfo.action = xr_->gripAction;
@@ -954,6 +987,20 @@ bool XrShell::syncActions(XrFrameInput& input, std::uint64_t displayTime) {
       input.aimValid[hand] = true;
       input.aimTracked[hand] = (location.locationFlags & aimTrackedFlags) == aimTrackedFlags;
     }
+    // The physical grip pose is measured independently: a VALID-but-untracked
+    // pose is recorded as exactly that, never silently promoted to usable.
+    XrSpaceLocation grip = xrStruct<XrSpaceLocation>(XR_TYPE_SPACE_LOCATION);
+    locate = xrLocateSpace(xr_->gripSpaces[hand], xr_->space,
+                           static_cast<XrTime>(displayTime), &grip);
+    if (XR_SUCCEEDED(locate) && (grip.locationFlags & aimValidFlags) == aimValidFlags) {
+      auto const& p = grip.pose;
+      input.controllerGrip[hand].position = {p.position.x, p.position.y, p.position.z};
+      input.controllerGrip[hand].orientation = {p.orientation.x, p.orientation.y,
+                                               p.orientation.z, p.orientation.w};
+      input.controllerGrip[hand].valid = true;
+      input.controllerGrip[hand].tracked =
+          (grip.locationFlags & aimTrackedFlags) == aimTrackedFlags;
+    }
   }
   // Head gaze fallback uses the same raw eye pose as the rendered view.
   input.pointerRay = xrPointerRay(input.aimValid[1], input.aimRays[1], xr_->views[0]);
@@ -999,6 +1046,7 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     return FrameStatus::Exit;
   }
   if (!xr_->sessionRunning) {
+    xr_->selectTrigger.interrupt();
     return FrameStatus::Pump; // session still starting; keep pumping
   }
 
@@ -1018,6 +1066,7 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
   // Pairing rule: every xrBeginFrame gets exactly one xrEndFrame. When a
   // frame cannot be rendered, end it here (zero layers) before bailing.
   auto failFrame = [this]() {
+    xr_->selectTrigger.interrupt();
     endFrame(); // endFrame counts the zero-layer outcome
     return FrameStatus::Skipped;
   };
@@ -1085,6 +1134,7 @@ XrShell::FrameStatus XrShell::beginFrame(XrFrameInput& inputOut) {
     }
   }
   xr_->frameReady = true;
+  xr_->selectInterruptedPending = false;
   // The app consumes this frame's undo/redo presses now; a later skip must
   // not swallow a fresh press or replay this one.
   xr_->undoPending = false;
@@ -1178,6 +1228,12 @@ void XrShell::shutdown() {
     if (aimSpace != XR_NULL_HANDLE) {
       xrDestroySpace(aimSpace);
       aimSpace = XR_NULL_HANDLE;
+    }
+  }
+  for (XrSpace& gripSpace : xr_->gripSpaces) {
+    if (gripSpace != XR_NULL_HANDLE) {
+      xrDestroySpace(gripSpace);
+      gripSpace = XR_NULL_HANDLE;
     }
   }
   for (auto tracker : xr_->trackers) {

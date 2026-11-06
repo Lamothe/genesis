@@ -29,6 +29,7 @@
 #include "animation.h"
 #include "camera.h"
 #include "carousel.h"
+#include "controller_workflow.h"
 #include "editor_state.h"
 #include "gizmo.h"
 #include "gltf.h"
@@ -51,16 +52,17 @@ constexpr float kMinEyeHeight = 0.15F;   // the camera never passes below the gr
 constexpr float kWheelMetres = 1.0F;     // metres per wheel notch
 constexpr float kPickThresholdPx = 8.0F;
 constexpr float kVrPickThresholdPx = 24.0F; // aim rays jitter: 3x the mouse
-// Stick-driven editing rates (VR): the left stick slides the selection, the
-// right stick turns/scales it. Grip held runs both at quarter speed (fine
-// control).
-constexpr float kStickDeadZone = 0.12F; // a gesture STARTS past this deflection
-constexpr float kStickEndZone = 0.06F;  // ...and ENDS below this (hysteresis, so one
-                                        // physical gesture is one undo step)
-constexpr float kStickMoveMps = 3.0F;    // metres per second at full deflection
+// Desktop arrow-key editing rates. The VR thumbsticks deliberately do not
+// edit: they only browse the carousel, and the trigger/grip pose does the
+// moving and rotating.
 constexpr float kStickTurnRadps = 1.75F; // ~100 degrees per second at full
 constexpr float kStickHeightMps = 1.0F;  // move mode: metres/second up/down
 constexpr float kStickScalePerS = 1.0F;  // move mode: e-fold growth per second
+
+// Hand tracking stays for the visible hands/arms and the palm-up UI menu, but
+// it never selects, grabs, moves or scales a model. The old hand-grab maths is
+// retained behind this switch for future arm interaction work.
+constexpr bool kHandModelManipulation = false;
 // Hold-X delete: the delete fires when the hold reaches full charge.
 constexpr double kDeleteChargeS = 0.6;
 
@@ -230,14 +232,27 @@ struct App {
   Vec3 ringForward{0.0F, 0.0F, -1.0F};
   vredit::EditorSnapshot galleryBefore{}; // undo "before" for the placement
   double galleryCycleCooldown{0.0}; // stick-held cycling: one step per 0.25 s
-  // The placeable centre preview's rim highlight: true exactly while a press
-  // on the current aim would place (see galleryAimHighlight). Held per frame
-  // so assembleFrame can light the preview's grazing edges.
+  bool galleryStickArmed{false};
+  bool panelTriggerArmed{false};
+  // The centre preview's rim highlight: in VR it means "a trigger press would
+  // place the settled, loaded centre model now" (no aim requirement); on
+  // desktop it keeps the pointer meaning "this exact click would place".
+  // Held per frame so assembleFrame can light the preview's grazing edges.
   bool galleryAimPlaceable{false};
-  // Stick-driven editing (VR): one undo step per stick gesture — begun on the
-  // first deflection past the dead zone, committed when the sticks settle.
-  bool handGrab{false};
+  // One live owner grab at a time: the controller's physical grip pose (the
+  // workflow) or a tracked hand (legacy, no longer acquired for models).
+  // `grabActive` is the shared transaction flag; `grabOwner` says whose pose
+  // drives it. `physicalGrab` remains the hand-contact variant.
+  bool grabActive{false};
   bool physicalGrab{false};
+  GrabOwner grabOwner{GrabOwner::none};
+  // Trigger/carousel/menu state machines (pure, unit-tested in test_hands).
+  ControllerTriggerWorkflow triggerWorkflow;
+  NodeId controllerPivotNode{kInvalidNode};
+  Vec3 controllerPivotLocal{};
+  CarouselPlacementGate carouselGate;
+  ToolPanelPress panelPress;
+  MenuOwner menuOwner{MenuOwner::none};
   HandContactCache handContactCache;
   HandPose grabStart{};
   HandPose grabFiltered{};
@@ -248,14 +263,14 @@ struct App {
   HandGrabView grabView{};
   std::vector<std::pair<NodeId, Mat4>> grabWorlds;
   std::vector<std::pair<NodeId, Transform>> grabLocals;
-  std::vector<std::pair<NodeId, Mat4>> grabPoseStarts;
   HandPanel handPanel{};
-  bool handPanelCarousel{false};
   int handHover{-1};
   int handTool{-1}; // captured until pinch release, never retarget mid-hold
   bool handUiOwned{false};
+  // Desktop arrow-key edit session (the VR thumbsticks deliberately never
+  // start one: they only browse the carousel).
   bool stickSession{false};
-  // The stick gesture's frame, latched at gesture start: the pivot (the
+  // The arrow gesture's frame, latched at gesture start: the pivot (the
   // moving set's bounds centre), the pre-signed tip axis and the fine rate.
   // Latching keeps one gesture one coherent step — a live head pose or grip
   // toggle mid-gesture must not steer the tip, change its rate, or walk
@@ -268,13 +283,11 @@ struct App {
   // before a new gesture may start, or the same frame's drift would
   // cancel-and-restart and swallow the undo.
   bool stickArmed{true};
-  // Menu tap/hold (VR): a tap opens/closes the model carousel; a hold toggles
-  // the backdrop once at 0.4 s (cancelling the tap). Thumbstick clicks do
+  // Left controller Menu (VR): one press opens/closes the real tools panel
+  // (Models, Undo, Redo, Delete, Backdrop). `menuOwner` records whether the
+  // panel came from the controller or the legacy palm-up hand gesture so the
+  // right code path owns the trigger and the placement. Thumbstick clicks do
   // nothing (the user's binding).
-  float menuCharge{0.0F};
-  bool menuHoldLatched{false};
-  bool menuTapped{false}; // a pending tap (fires the carousel on release)
-  bool menuPrevHeld{false};
   // Hold-X delete (VR): the selection's tint ramps red over kDeleteChargeS
   // and the delete fires at full charge; release before that cancels.
   bool deleteHolding{false};
@@ -649,6 +662,19 @@ PointerTarget resolvePointerTarget(App& app, Ray const& ray) {
   return target;
 }
 
+// True when `node` is selected itself or a selected ancestor contains it.
+// A whole-model selection stores every group node; a part selection of a
+// parent can still own a picked descendant, and the controller's grab must
+// recognise that as "the current selection" rather than selecting again.
+bool selectionContainsNode(App const& app, NodeId node) {
+  for (auto current = node; current != kInvalidNode; current = app.scene.parent(current)) {
+    if (std::find(app.selection.begin(), app.selection.end(), current) != app.selection.end()) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // The floor rule ("models stay stuck to the floor") applies to whole models:
 // tipping a PART must not lift it out of its model by flooring through the
 // part's own bounds. True when every model group touched by the selection is
@@ -695,10 +721,8 @@ void galleryClose(App& app);
 bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay);
 
 // Pointer interaction shared by the mouse and the VR controller ray: a
-// press only SELECTS ("I never want to see them again" — the coloured axis
-// handles are gone): movement, rotation, height and scale are all the
-// thumbsticks' job in VR (controller aim is too jittery for accurate
-// placement) and the arrow keys' on desktop.
+// press only SELECTS. The VR controller uses a subsequent grip-pose grab;
+// desktop uses the arrow keys.
 // partSelect (shift/ctrl click, grip+trigger in VR) limits the selection to
 // the single picked part instead of the whole model.
 void pointerPress(App& app, PointerTarget const& target, bool partSelect) {
@@ -717,14 +741,15 @@ void pointerPress(App& app, PointerTarget const& target, bool partSelect) {
   app.selection = vredit::expandSelection(app.modelGroups, target.node, partSelect);
 }
 
-// Cancels a live stick gesture without touching the history: restores its
-// pre-edit state and drops the pending undo entry, so both the undo and redo
-// stacks stay exactly as they were. Any undo/redo keypress during a live
-// edit does this and nothing else — going through commit() instead would
-// clear an existing redo branch and make the cancelled edit itself redoable.
+// Cancels a live edit without touching the history: restores its pre-edit
+// state and drops the pending undo entry, so both the undo and redo stacks
+// stay exactly as they were. Any undo/redo press during a live edit does this
+// and nothing else — going through commit() instead would clear an existing
+// redo branch and make the cancelled edit itself redoable.
 void cancelLiveEdit(App& app) {
   app.stickSession = false;
-  app.handGrab = false;
+  app.grabActive = false;
+  app.grabOwner = GrabOwner::none;
   app.physicalGrab = false;
   app.handScaling = false;
   app.handTool = -1;
@@ -742,14 +767,16 @@ void cancelLiveEdit(App& app) {
   }
 }
 
-// Commits a live stick gesture as its own undo step. Used where a new
-// action begins (spawn, delete, mode switches). Also disarms the input: a
-// still-held key/stick must return to neutral before a new gesture starts,
-// or the next frame would split one physical hold into two undo steps.
+// Commits a live edit as its own undo step. Used where a new action begins
+// (release, spawn, delete, menu changes, tracking loss). Also disarms the
+// desktop arrows: a still-held key must return to neutral before a new
+// gesture starts, or the next frame would split one physical hold into two
+// undo steps. The controller trigger is disarmed by its own workflow.
 bool endEdits(App& app) {
-  bool const wasActive = app.stickSession || app.handGrab || app.handTool >= 2;
+  bool const wasActive = app.stickSession || app.grabActive || app.handTool >= 2;
   app.stickSession = false;
-  app.handGrab = false;
+  app.grabActive = false;
+  app.grabOwner = GrabOwner::none;
   app.physicalGrab = false;
   app.handScaling = false;
   app.handTool = -1;
@@ -760,6 +787,7 @@ bool endEdits(App& app) {
 // The one delete rule (see deleteSubtrees): removes the selected models or
 // parts — subtrees rooted at the selection — as one undo step.
 bool deleteSelection(App& app) {
+  app.triggerWorkflow.reset();
   if (app.selection.empty() || app.galleryActive) {
     // While the gallery is open, delete must not fire: the previews are
     // transient UI and the gallery owns the session. Nothing else mutates.
@@ -770,6 +798,41 @@ bool deleteSelection(App& app) {
   std::vector<NodeId> const targets = app.selection;
   vredit::deleteSubtrees(app.scene, app.visuals, app.modelGroups, app.selection, targets);
   return app.undo.commit(snapshot(app));
+}
+
+// Shared history actions for the face buttons, the tools panel and the
+// desktop keys. A live edit is CANCELLED (restored, pending entry dropped)
+// rather than committed, so the existing redo branch survives and the
+// cancelled gesture never becomes redoable. Returns true only when the
+// history stack actually moved.
+bool performUndo(App& app) {
+  app.triggerWorkflow.reset();
+  if (app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive) {
+    cancelLiveEdit(app);
+    return false;
+  }
+  vredit::EditorSnapshot state = snapshot(app);
+  if (app.undo.undo(state)) {
+    applySnapshot(app, state);
+    app.stickArmed = false;
+    return true;
+  }
+  return false;
+}
+
+bool performRedo(App& app) {
+  app.triggerWorkflow.reset();
+  if (app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive) {
+    cancelLiveEdit(app);
+    return false;
+  }
+  vredit::EditorSnapshot state = snapshot(app);
+  if (app.undo.redo(state)) {
+    applySnapshot(app, state);
+    app.stickArmed = false;
+    return true;
+  }
+  return false;
 }
 
 // Lowercased 4-character filename suffix for extension checks. The library
@@ -1009,6 +1072,10 @@ void galleryClose(App& app) {
   galleryEvict(app);
   app.galleryActive = false;
   app.galleryAimPlaceable = false;
+  // The trigger that placed/closed must return to release before it can
+  // select or grab in the scene; a new centre slot needs a fresh settle.
+  app.carouselGate.reset();
+  app.triggerWorkflow.reset();
   std::printf("[gallery] closed\n");
 }
 
@@ -1181,10 +1248,19 @@ void galleryOpen(App& app, VkRenderer& renderer) {
   if (app.galleryActive) {
     return;
   }
-  // A live stick gesture must not keep mutating the world behind the
-  // carousel (and its pending edit would tangle with the placement's): close
-  // it as its own undo step first.
+  // The gallery owns the trigger while it is open: no tools panel behind it.
+  app.menuOwner = MenuOwner::none;
+  app.handPanel.visible = false;
+  app.handHover = -1;
+  app.panelPress.cancel();
+  app.deleteCharge = 0.0F;
+  app.deleteHolding = false;
+  // A live grab must not keep mutating the world behind the carousel (and
+  // its pending edit would tangle with the placement's): close it as its
+  // own undo step first.
   endEdits(app);
+  app.triggerWorkflow.reset();
+  app.carouselGate.reset();
   app.galleryFiles = scanLibrary(app.libraryDir);
   if (app.galleryFiles.empty()) {
     std::printf("[gallery] library folder is empty: %s\n", app.libraryDir.c_str());
@@ -1198,6 +1274,11 @@ void galleryOpen(App& app, VkRenderer& renderer) {
   // floating preview). Nothing else mutates while the carousel is open.
   app.galleryBefore = snapshot(app);
   app.galleryActive = true;
+  app.galleryAimPlaceable = false;
+  // A stick held from before the open must not rotate the brand-new ring on
+  // its first rendered frame.
+  app.galleryCycleCooldown = 0.0;
+  app.galleryStickArmed = false;
   if (!app.worker.thread.joinable()) {
     asyncStart(app.worker); // decode thread, lazily started (no-op after)
   }
@@ -1219,12 +1300,20 @@ void galleryCycle(App& app, VkRenderer& renderer, int dir) {
 }
 
 // The trigger (click) while the carousel is open: place the CENTRED model on
-// the floor at the aim point at NATURAL size as one undo step. The undo
+// the floor below the preview at NATURAL size as one undo step. The undo
 // "before" is the PRE-OPEN state, so undoing removes the model entirely — it
 // never returns as a floating preview. The placement closes the carousel.
 bool galleryPick(App& app, VkRenderer& renderer, Ray const& aimRay) {
   (void)aimRay;
   if (!app.galleryActive || app.galleryFiles.empty()) {
+    return false;
+  }
+  // Placement is by the centred slot only. A ring still easing between slots
+  // must never place the model it is passing through (the controller's
+  // placement gate already waits; this is the last line of defence for every
+  // caller).
+  if (!app.ring.atRest()) {
+    std::printf("[gallery] ring is still settling — try again\n");
     return false;
   }
   int const index = app.ring.index;
@@ -1653,28 +1742,11 @@ void handleEvent(App& app,
     bool stateChanged = false;
     if ((keysym == 'z' || keysym == 'Z') && (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
       // Undo/redo during a live edit cancels that edit first and stops there,
-      // leaving both stacks untouched (see cancelLiveEdit).
-      if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
-        cancelLiveEdit(app);
-        break;
-      }
-      bool const redo = (key->state & XCB_MOD_MASK_SHIFT) != 0U;
-      vredit::EditorSnapshot state = snapshot(app);
-      if (redo ? app.undo.redo(state) : app.undo.undo(state)) {
-        applySnapshot(app, state);
-        app.stickArmed = false; // sticks must re-centre before a new gesture
-      }
+      // leaving both stacks untouched (see performUndo/cancelLiveEdit).
+      (void)((key->state & XCB_MOD_MASK_SHIFT) != 0U ? performRedo(app) : performUndo(app));
     } else if ((keysym == 'y' || keysym == 'Y') &&
                (key->state & XCB_MOD_MASK_CONTROL) != 0U) {
-      if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
-        cancelLiveEdit(app);
-        break;
-      }
-      vredit::EditorSnapshot state = snapshot(app);
-      if (app.undo.redo(state)) {
-        applySnapshot(app, state);
-        app.stickArmed = false; // sticks must re-centre before a new gesture
-      }
+      (void)performRedo(app);
     } else if (keysym == 0xFF1BU) {
       app.running = false;
       stateChanged = true;
@@ -2607,9 +2679,17 @@ bool selectedHandContact(App& app, XrFrameInput const& input, Mat4 const& rigWor
   return false;
 }
 
-void beginHandGrab(App& app, HandPose pose, std::optional<Vec3> point = std::nullopt, HandGrabView view = {}) {
+void applyHandDelta(App& app, Mat4 const& delta);
+
+// Starts the one owner grab: capture the topmost selected subtrees, their
+// local transforms. Shared by the (legacy) hand path
+// and the controller grip-pose path; the owner decides which input updates
+// the delta, never both.
+void beginOwnerGrab(App& app, HandPose pose, GrabOwner owner,
+                    std::optional<Vec3> point, HandGrabView view) {
   Aabb bounds;
-  if (!pose.valid || !movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
+  if (!pose.valid || owner == GrabOwner::none || app.selection.empty() ||
+      !movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
     return;
   }
   endEdits(app);
@@ -2620,7 +2700,6 @@ void beginHandGrab(App& app, HandPose pose, std::optional<Vec3> point = std::nul
   app.grabView = view;
   app.grabWorlds.clear();
   app.grabLocals.clear();
-  app.grabPoseStarts.clear();
   for (auto id : app.selection) {
     bool child = false;
     for (auto parent = app.scene.parent(id); parent != kInvalidNode; parent = app.scene.parent(parent)) {
@@ -2632,11 +2711,35 @@ void beginHandGrab(App& app, HandPose pose, std::optional<Vec3> point = std::nul
     if (!child) {
       app.grabWorlds.emplace_back(id, app.scene.world(id));
       app.grabLocals.emplace_back(id, app.scene.local(id));
-      app.grabPoseStarts.emplace_back(id, app.scene.poseOffset(id));
     }
   }
   app.undo.begin(snapshot(app));
-  app.handGrab = true;
+  app.grabOwner = owner;
+  app.grabActive = true;
+}
+
+void beginHandGrab(App& app, HandPose pose, std::optional<Vec3> point = std::nullopt, HandGrabView view = {}) {
+  beginOwnerGrab(app, pose, GrabOwner::hand, point, view);
+}
+
+// The controller workflow never points to sustain a grab: the physical grip
+// pose (position AND orientation) drives the same view-relative projection
+// the hand path uses, so depth changes by the same fraction as the grip's
+// distance from the latched eye. A VALID-but-untracked pose is not usable.
+bool beginControllerGrab(App& app, ControllerPose const& pose, Vec3 pivot, HandGrabView view) {
+  if (app.selection.empty() || !pose.usable()) {
+    return false;
+  }
+  beginOwnerGrab(app, pose.handPose(), GrabOwner::controller, pivot, view);
+  return app.grabActive && app.grabOwner == GrabOwner::controller;
+}
+
+void updateControllerGrab(App& app, ControllerPose const& pose) {
+  if (!app.grabActive || app.grabOwner != GrabOwner::controller || !pose.usable()) {
+    return;
+  }
+  applyHandDelta(app, projectedHandGrabTransform(app.grabView, app.grabStart,
+                                                 pose.handPose(), app.grabPivot, Mat4{}));
 }
 
 void applyHandDelta(App& app, Mat4 const& delta) {
@@ -2654,18 +2757,17 @@ void applyHandDelta(App& app, Mat4 const& delta) {
   // matrix sheared. TRS cannot express it: reject the whole sample rather
   // than silently distort one selected subtree.
   std::vector<std::pair<NodeId, Transform>> updates;
-  for (std::size_t i = 0; i < app.grabWorlds.size(); ++i) {
-    auto const& [id, initial] = app.grabWorlds[i];
-    Mat4 inverseStartPose;
-    if (!invertAffine(app.grabPoseStarts[i].second, inverseStartPose)) { return; }
-    auto const animatedBaseline = mul(initial, mul(inverseStartPose, app.scene.poseOffset(id)));
+  for (auto const& [id, initialLocal] : app.grabLocals) {
+    auto const parent = app.scene.parent(id);
+    auto const parentWorld = parent == kInvalidNode ? Mat4{} : app.scene.world(parent);
+    // Follow live ancestor and child animation, but reapply the cumulative
+    // delta to the captured editable local rather than the previous update.
+    auto const animatedBaseline = mul(parentWorld, mul(toMatrix(initialLocal), app.scene.poseOffset(id)));
     auto world = mul(delta, animatedBaseline);
 
-
-    auto parent = app.scene.parent(id);
     if (parent != kInvalidNode) {
       Mat4 parentInverse;
-      if (!invertAffine(app.scene.world(parent), parentInverse)) { return; }
+      if (!invertAffine(parentWorld, parentInverse)) { return; }
       world = mul(parentInverse, world);
     }
     Mat4 poseInverse;
@@ -2693,7 +2795,6 @@ void beginHandScale(App& app, HandPose left, HandPose right) {
   app.scaleStartDistance = distance;
   for (auto& [id, world] : app.grabWorlds) { world = app.scene.world(id); }
   for (auto& [id, local] : app.grabLocals) { local = app.scene.local(id); }
-  for (auto& [id, pose] : app.grabPoseStarts) { pose = app.scene.poseOffset(id); }
   Aabb bounds;
   if (!movingSetBounds(app.scene, app.visuals, app.selection, bounds)) { return; }
   app.grabPivot = (bounds.min + bounds.max) * .5F;
@@ -2719,7 +2820,7 @@ void updateHandGrab(App& app, HandPose pose) {
 // Freeze a live controller edit while choosing a tool. Its snapshot stays
 // pending so UNDO/REDO can cancel it without destroying an existing redo branch.
 void prepareHandPanel(App& app) {
-  if (app.handGrab || app.handTool >= 0) {
+  if (app.grabActive || app.handTool >= 0) {
     endEdits(app);
   }
   app.stickArmed = false;
@@ -2733,6 +2834,66 @@ void prepareHandTool(App& app, int button) {
   }
 }
 
+void closeToolMenu(App& app) {
+  if (app.menuOwner == MenuOwner::none && !app.handPanel.visible) {
+    return;
+  }
+  app.panelPress.cancel();
+  app.panelTriggerArmed = false;
+  app.deleteCharge = 0.0F;
+  app.deleteHolding = false;
+  app.handHover = -1;
+  app.handTool = -1;
+  app.menuOwner = MenuOwner::none;
+  app.handPanel.visible = false;
+  std::printf("[menu] tools panel closed\n");
+}
+
+// Opens the real tools panel (Models, Undo, Redo, Delete, Backdrop). Opening
+// it commits any live grab as its own undo step: the trigger now belongs to
+// the menu, not the scene. A controller panel is latched in the world on this
+// frame (stable to point at); a hand panel follows the palm each frame.
+void openToolMenu(App& app, MenuOwner owner, Vec3 const& headWorld, Vec3 const& headForward) {
+  if (owner == MenuOwner::none) {
+    return;
+  }
+  if (app.galleryActive) {
+    galleryClose(app);
+  }
+  endEdits(app);
+  app.triggerWorkflow.reset();
+  app.panelPress.cancel();
+  app.menuOwner = owner;
+  app.panelTriggerArmed = false;
+  prepareHandPanel(app);
+  app.handPanel.visible = true;
+  app.handHover = -1;
+  app.handTool = -1;
+  app.deleteCharge = 0.0F;
+  app.deleteHolding = false;
+  app.handPanel.orientation =
+      quatFromAxisAngle(Vec3{0.0F, 1.0F, 0.0F}, std::atan2(-headForward.x, -headForward.z));
+  app.handPanel.origin = headWorld + headForward * 0.85F + Vec3{0.0F, -0.10F, 0.0F};
+  std::printf("[menu] tools panel open (%s)\n",
+              owner == MenuOwner::controller ? "controller" : "hand");
+}
+
+// Left Menu: tap toggles the controller-owned panel. If the hand menu or the
+// carousel is up, they hand over instead of stacking two UI modes.
+void toggleControllerToolMenu(App& app, Vec3 const& headWorld, Vec3 const& headForward) {
+  if (app.menuOwner == MenuOwner::controller) {
+    closeToolMenu(app);
+    return;
+  }
+  if (app.galleryActive) {
+    galleryClose(app);
+  }
+  if (app.menuOwner != MenuOwner::none) {
+    closeToolMenu(app);
+  }
+  openToolMenu(app, MenuOwner::controller, headWorld, headForward);
+}
+
 constexpr std::array<char const*, 12> kHandTools{
     "Models", "", "", "", "", "", "", "", "Undo", "Redo", "Delete", "Backdrop"};
 
@@ -2743,9 +2904,11 @@ void drawHandPanel(App const& app, std::vector<RendererVertex>& lines) {
   auto const& panel = app.handPanel;
   constexpr int buttons[] = {0, 8, 9, 10, 11};
   auto point = [&](Vec3 local) { return panel.origin + rotate(panel.orientation, local); };
+  int const activeButton = app.menuOwner == MenuOwner::controller ? app.panelPress.button()
+                                                                  : app.handTool;
   for (int button : buttons) {
     auto const centre = handPanelButtonCentre(button);
-    Vec3 const colour = button == app.handTool ? Vec3{1.0F, 0.55F, 0.25F} :
+    Vec3 const colour = button == activeButton ? Vec3{1.0F, 0.55F, 0.25F} :
         button == app.handHover ? Vec3{1.0F, 0.9F, 0.4F} : Vec3{0.6F, 0.9F, 1.0F};
     Vec3 const corners[4] = {{centre.x-.105F, centre.y-.028F, 0},
         {centre.x+.105F, centre.y-.028F, 0}, {centre.x+.105F, centre.y+.028F, 0},
@@ -2810,7 +2973,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   updateHandGrab(app, start);
   if (!check(sameSnapshot(snapshot(app), before), "stationary grab preserves exact state")) { return false; }
 
-  if (!check(app.handGrab && app.grabWorlds.size() == 1, "begin captures cube")) {
+  if (!check(app.grabActive && app.grabWorlds.size() == 1, "begin captures cube")) {
     return false;
   }
   updateHandGrab(app, current);
@@ -2830,7 +2993,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   if (!check(nearMatrix(app.scene.world(cube), movedWorld), "repeated update has no drift")) {
     return false;
   }
-  if (!check(endEdits(app) && !app.handGrab, "release commits") ||
+  if (!check(endEdits(app) && !app.grabActive, "release commits") ||
       !check(!endEdits(app), "release does not commit twice")) {
     return false;
   }
@@ -2848,6 +3011,70 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   if (!check(sameSnapshot(snapshot(app), after) && !app.undo.canRedo(), "redo restores grab")) {
     return false;
   }
+
+  // Controller grip-pose grab: a separate owner from the hand, driven by the
+  // physical position AND orientation through the same view-relative maths.
+  // A VALID-but-untracked pose can neither start nor update it.
+  applySnapshot(app, before);
+  app.undo.clear();
+  ControllerPose controllerStart;
+  controllerStart.valid = true;
+  controllerStart.tracked = true;
+  controllerStart.position = start.position;
+  controllerStart.orientation = start.orientation;
+  ControllerPose controllerNow = controllerStart;
+  controllerNow.position = controllerNow.position + displacement;
+  controllerNow.orientation = normalized(turn * controllerStart.orientation);
+  HandGrabView const controllerView{{0.0F, 0.0F, 0.0F}, {}, true};
+  Vec3 const controllerPivot = transformPoint(app.scene.world(cube), {.5F, 0, 0});
+  ControllerPose untrackedStart = controllerStart;
+  untrackedStart.tracked = false;
+  if (!check(!beginControllerGrab(app, untrackedStart, controllerPivot, controllerView),
+             "untracked grip cannot start a controller grab") ||
+      !check(beginControllerGrab(app, controllerStart, controllerPivot, controllerView),
+             "controller grab starts") ||
+      !check(app.grabOwner == GrabOwner::controller && !app.physicalGrab,
+             "controller owner is separate from the hand grab")) {
+    return false;
+  }
+  auto const controllerInitial = app.scene.world(cube);
+  app.controllerPivotNode = cube;
+  Mat4 controllerInverse;
+  if (!check(invertAffine(controllerInitial, controllerInverse), "controller pivot inverse")) {
+    return false;
+  }
+  app.controllerPivotLocal = transformPoint(controllerInverse, controllerPivot);
+  updateControllerGrab(app, controllerNow);
+  auto const controllerExpected = projectedHandGrabTransform(
+      controllerView, controllerStart.handPose(), controllerNow.handPose(),
+      controllerPivot, controllerInitial);
+  if (!check(nearMatrix(app.scene.world(cube), controllerExpected),
+             "controller position and orientation drive the delta") ||
+      !check(nearVector(transformPoint(app.scene.world(app.controllerPivotNode), app.controllerPivotLocal), transformPoint(
+          projectedHandGrabTransform(controllerView, controllerStart.handPose(),
+                                     controllerNow.handPose(), controllerPivot, Mat4{}),
+          controllerPivot)), "controller pivot follows grabbed model")) {
+    return false;
+  }
+  ControllerPose untrackedNow = controllerNow;
+  untrackedNow.tracked = false;
+  auto const beforeUntracked = app.scene.world(cube);
+  updateControllerGrab(app, untrackedNow);
+  if (!check(nearMatrix(app.scene.world(cube), beforeUntracked),
+             "untracked controller pose cannot move the model")) {
+    return false;
+  }
+  if (!check(endEdits(app) && !app.grabActive && app.grabOwner == GrabOwner::none,
+             "controller release commits")) {
+    return false;
+  }
+  vredit::EditorSnapshot controllerState = snapshot(app);
+  if (!check(app.undo.undo(controllerState) && sameSnapshot(controllerState, before),
+             "controller grab undo restores start")) {
+    return false;
+  }
+  applySnapshot(app, controllerState);
+  app.undo.clear();
 
   // Motion changes editable placement without cancelling live node animation.
   app.scene.setPoseOffset(cube, translationMatrix({.3F,0,0}));
@@ -2924,7 +3151,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
     return false;
   }
   cancelLiveEdit(app);
-  if (!check(!app.handGrab &&
+  if (!check(!app.grabActive &&
              nearMatrix(app.scene.world(child), childWorld) && !app.undo.canUndo(),
              "cancel clears grab and restores hierarchy without history")) {
     return false;
@@ -2972,6 +3199,54 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   if (!check(sameSnapshot(snapshot(app), childBefore), "child-only cancellation restores snapshot")) {
     return false;
   }
+  // A child-only grab follows live parent and child animation before applying
+  // the cumulative hand delta, including after returning to the start pose.
+  auto const initialParentPose = translationMatrix({.1F, -.2F, .3F});
+  auto const initialChildPose = translationMatrix({-.1F, .05F, .2F});
+  app.scene.setPoseOffset(parent, initialParentPose);
+  app.scene.setPoseOffset(child, initialChildPose);
+  auto const animatedChildBefore = snapshot(app);
+  beginHandGrab(app, start);
+  auto const liveParentPose = mul(translationMatrix({.8F, .4F, -.5F}),
+                                  rotationMatrix(quatFromAxisAngle({0, 1, 0}, .4F)));
+  auto const liveChildPose = translationMatrix({.2F, -.1F, .4F});
+  app.scene.setPoseOffset(parent, liveParentPose);
+  app.scene.setPoseOffset(child, liveChildPose);
+  auto liveBaseline = [&]() {
+    return mul(app.scene.world(parent), mul(toMatrix(childLocal), app.scene.poseOffset(child)));
+  };
+  auto const stationaryBaseline = liveBaseline();
+  updateHandGrab(app, start);
+  if (!check(nearMatrix(app.scene.world(child), stationaryBaseline) &&
+             sameTransform(app.scene.local(child), childLocal),
+             "stationary child grab follows animated parent")) { return false; }
+  updateHandGrab(app, translated);
+  auto const translationDelta = translationMatrix({.2F, 0, 0});
+  if (!check(nearMatrix(app.scene.world(child), mul(translationDelta, stationaryBaseline)) &&
+             nearMatrix(app.scene.poseOffset(parent), liveParentPose) &&
+             nearMatrix(app.scene.poseOffset(child), liveChildPose),
+             "moving child grab follows parent and child animation")) { return false; }
+  auto const laterParentPose = translationMatrix({-.4F, .6F, .7F});
+  auto const laterChildPose = translationMatrix({.4F, .2F, -.3F});
+  app.scene.setPoseOffset(parent, laterParentPose);
+  app.scene.setPoseOffset(child, laterChildPose);
+  auto const laterBaseline = liveBaseline();
+  updateHandGrab(app, translated);
+  if (!check(nearMatrix(app.scene.world(child), mul(translationDelta, laterBaseline)),
+             "animated child grab remains cumulative without drift")) { return false; }
+  updateHandGrab(app, start);
+  if (!check(nearMatrix(app.scene.world(child), laterBaseline) &&
+             sameTransform(app.scene.local(child), childLocal),
+             "returning grab to identity follows latest animation")) { return false; }
+  updateHandGrab(app, translated);
+  cancelLiveEdit(app);
+  if (!check(sameSnapshot(snapshot(app), animatedChildBefore) &&
+             nearMatrix(app.scene.world(child), laterBaseline) &&
+             nearMatrix(app.scene.poseOffset(parent), laterParentPose) &&
+             nearMatrix(app.scene.poseOffset(child), laterChildPose) && !app.undo.canUndo(),
+             "animated child grab cancellation preserves animation")) { return false; }
+  app.scene.setPoseOffset(parent, Mat4{});
+  app.scene.setPoseOffset(child, Mat4{});
   // A sheared local result cannot be stored in TRS; reject without distortion.
   app.scene.setLocal(parent, {{.8F,.9F,-.4F}, quatFromAxisAngle({0,1,0}, .6F), {1,2,3}});
   auto const nonuniformBefore = snapshot(app);
@@ -2993,7 +3268,7 @@ bool smokeHandEditing(App& app, VkRenderer& renderer) {
   invalid.valid = false;
   beginHandGrab(app, invalid);
   // Tracking-invalid samples are gated out by runXr, not passed to updateHandGrab.
-  if (!check(!app.handGrab && sameSnapshot(snapshot(app), childBefore) &&
+  if (!check(!app.grabActive && sameSnapshot(snapshot(app), childBefore) &&
              nearMatrix(handGrabTransform(start, invalid, childPivot, childWorld), childWorld),
              "invalid tracking cannot start or transform a grab")) {
     return false;
@@ -3134,7 +3409,8 @@ int runXr(char const* shaderDir,
 
   App app;
   app.xr = true;
-  std::printf("[xr] Genesis: point-and-pinch carousel; palm-up left-pinch menu\n");
+  std::printf("[xr] Genesis: right trigger select/grab, left menu tools, "
+              "right stick browses the carousel\n");
   app.width = shell.eyeWidth();
   app.height = shell.eyeHeight();
   app.libraryDir = libraryDir;
@@ -3181,19 +3457,18 @@ int runXr(char const* shaderDir,
 
   bool running = true;
   int framesRendered = 0;
-  bool handMenuOpen = false;
-  bool carouselAimWarned = false;
+  bool controllerAimWarned = false;
+  bool controllerGripWarned = false;
   HandGesture leftPinch;
   HandGesture rightPinch;
   HandGesture rightGrasp;
   HandGraspGate graspGate;
+  BooleanRearmLatch deleteLatch;
   bool palmUp = false;
   bool leftUiOwned = false;
   int jointSignature = -1;
   bool rightWasHand = false;
   HandSelectionLatch selectionLatch;
-  NodeId recentHandNode = kInvalidNode;
-  Vec3 recentHandLocalPoint{};
   int skipsInARow = 0;
   double frameMsTotal = 0.0;
   double frameMsMax = 0.0;
@@ -3208,9 +3483,10 @@ int runXr(char const* shaderDir,
       break;
     }
     if (status == XrShell::FrameStatus::Pump || status == XrShell::FrameStatus::Skipped) {
-      // Rendering must not hide a tracking interruption. End the edit and
-      // require a released pinch before reacquisition can start another one.
-      if (app.handGrab || app.handTool >= 0) {
+      // Rendering must not hide a tracking interruption. Commit the live
+      // edit at its last good sample, drop any captured menu press, and
+      // require a release before reacquisition can start anything new.
+      if (app.grabActive || app.handTool >= 0) {
         endEdits(app);
       }
       selectionLatch.reset();
@@ -3218,8 +3494,20 @@ int runXr(char const* shaderDir,
       rightPinch.reset();
       rightGrasp.reset();
       graspGate.reset();
+      app.triggerWorkflow.reset();
+      app.panelPress.cancel();
+      app.panelTriggerArmed = false;
+      app.carouselGate.reset();
+      deleteLatch.interrupt();
+      app.deleteHolding = false;
+      app.deleteCharge = 0.0F;
+      // A hand menu lives and dies with the tracked palm. A controller menu
+      // stays up (the ray is re-hovered next frame), but its capture is gone.
+      if (app.menuOwner == MenuOwner::hand) {
+        app.menuOwner = MenuOwner::none;
+        app.handPanel.visible = false;
+      }
       app.handUiOwned = true;
-      app.handPanel.visible = false;
       palmUp = false;
       leftUiOwned = true;
     }
@@ -3266,6 +3554,42 @@ int runXr(char const* shaderDir,
         normalized(transformVector(rigWorld, rotate(input.headOrient, {0.0F, 0.0F, -1.0F})));
     Ray worldRay{transformPoint(rigWorld, input.pointerRay.origin),
                  normalized(transformVector(rigWorld, input.pointerRay.direction))};
+    // The right controller's own aim, in world space. Spatial controller
+    // actions never use the head-gaze fallback: a valid-but-untracked aim is
+    // not something you can point with.
+    Ray controllerAim{};
+    bool const controllerRight = !input.handActive[1];
+    bool const controllerAimTracked =
+        controllerRight && input.aimValid[1] && input.aimTracked[1];
+    if (controllerRight && input.aimValid[1]) {
+      controllerAim = {transformPoint(rigWorld, input.aimRays[1].origin),
+                       normalized(transformVector(rigWorld, input.aimRays[1].direction))};
+    }
+    // The physical grip pose: position AND orientation, with the runtime's
+    // VALID and TRACKED flags kept separate. A hand profile's grip/pose is
+    // not bound here, so hands never feed the controller manipulation path.
+    ControllerPose controllerGrip;
+    if (controllerRight && input.controllerGrip[1].valid) {
+      controllerGrip.position = transformPoint(rigWorld, input.controllerGrip[1].position);
+      controllerGrip.orientation =
+          normalized(cameraOrientation(rig) * input.controllerGrip[1].orientation);
+      controllerGrip.valid = true;
+      controllerGrip.tracked = input.controllerGrip[1].tracked;
+    }
+    if (controllerRight && controllerGrip.valid && !controllerGrip.tracked && !controllerGripWarned) {
+      std::printf("[xr] right grip pose is VALID but untracked; model grabs are disabled "
+                  "until tracking returns\n");
+      controllerGripWarned = true;
+    } else if (!controllerGrip.valid || controllerGrip.tracked) {
+      controllerGripWarned = false;
+    }
+    if (controllerRight && input.aimValid[1] && !input.aimTracked[1] && !controllerAimWarned) {
+      std::printf("[xr] right aim is VALID but untracked; pointing/selection is disabled "
+                  "until tracking returns\n");
+      controllerAimWarned = true;
+    } else if (!controllerRight || !input.aimValid[1] || input.aimTracked[1]) {
+      controllerAimWarned = false;
+    }
 
     // Only the hand profile can drive gestures: controller joints may be inferred.
     HandPose worldHands[2] = {input.hands[0], input.hands[1]};
@@ -3278,6 +3602,16 @@ int runXr(char const* shaderDir,
       std::printf("[hands] palm tracking: left %s, right %s\n",
           worldHands[0].valid ? "tracked" : "untracked", worldHands[1].valid ? "tracked" : "untracked");
       jointSignature = jointsNow;
+    }
+    if (!input.selectActive) {
+      if (app.grabActive && app.grabOwner == GrabOwner::controller) {
+        endEdits(app);
+      }
+      app.triggerWorkflow.reset();
+      app.carouselGate.reset();
+      app.panelPress.cancel();
+      app.panelTriggerArmed = false;
+      app.deleteCharge = 0.0F;
     }
     bool const handRight = input.handActive[1];
     bool const handSignal = handPinchSignal(handRight, input.pinchActive[1], input.pinch[1]);
@@ -3292,88 +3626,128 @@ int runXr(char const* shaderDir,
     bool const graspHeld = handPinchHeld(graspSignal, input.grasp);
     bool const leftHeld = handPinchHeld(leftSignal, input.pinch[0]);
     graspGate.update(graspSignal, graspHeld, handHeld,
-                     app.handUiOwned || app.galleryActive || handMenuOpen || app.stickSession);
+                     app.handUiOwned || app.galleryActive || app.menuOwner != MenuOwner::none ||
+                     app.stickSession);
     if (app.physicalGrab) {
       rightPinch.reset(); // a pinch made during a physical grab cannot click on release
     }
     if (!worldHands[1].valid || !handRight) { selectionLatch.reset(); }
     if (!leftHeld) { leftUiOwned = false; }
-    if (handRight || rightWasHand) {
-      input.selectPressed = handRight && rightPressed && !app.physicalGrab;
-      input.selectHeld = handHeld;
-      input.selectReleased = !handHeld;
+    // Hands no longer feed the scene trigger: a hand pinch can open the UI
+    // menu below, but it never selects, grabs, moves or scales a model. The
+    // controller workflow owns input.selectPressed/selectHeld from here on.
+    if (rightWasHand != handRight) {
+      selectionLatch.reset();
+      graspGate.reset();
+      rightGrasp.reset();
+      // A profile change is a tracking interruption for any live owner grab.
+      if (app.grabActive) {
+        endEdits(app);
+      }
+      app.triggerWorkflow.reset();
+      app.carouselGate.reset();
+      app.panelPress.cancel();
+      app.panelTriggerArmed = false;
+      // A controller panel cannot be aimed at by a hand; close it rather than
+      // leave a visible menu the current profile cannot operate.
+      if (handRight && app.menuOwner == MenuOwner::controller) {
+        closeToolMenu(app);
+      }
     }
-    if (rightWasHand != handRight || app.galleryActive) {
+    if (app.galleryActive) {
       selectionLatch.reset();
       graspGate.reset();
       rightGrasp.reset();
     }
     rightWasHand = handRight;
-    bool handCarouselToggled = false;
+    bool handMenuToggled = false;
     palmUp = input.handActive[0] && palmFacingUp(worldHands[0], palmUp);
-    if (leftPressed && palmUp && !handHeld && !app.handGrab) {
+    if (leftPressed && palmUp && !handHeld) {
       selectionLatch.reset();
       graspGate.reset();
       rightGrasp.reset();
       leftUiOwned = true;
-      handMenuOpen = !handMenuOpen;
-      if (handMenuOpen) { prepareHandPanel(app); }
-      else { endEdits(app); }
+      // The hand menu is UI-only now; it hands ownership over cleanly rather
+      // than stacking on top of a controller menu or the carousel.
+      if (app.menuOwner == MenuOwner::hand) {
+        closeToolMenu(app);
+      } else {
+        if (app.galleryActive) {
+          galleryClose(app);
+        }
+        if (app.menuOwner != MenuOwner::none) {
+          closeToolMenu(app);
+        }
+        openToolMenu(app, MenuOwner::hand, headWorld, headForward);
+      }
       app.handUiOwned = true;
-      if (!handMenuOpen) { galleryClose(app); }
-      handCarouselToggled = true;
-      std::printf("[hands] menu %s\n", handMenuOpen ? "open" : "closed");
+      handMenuToggled = true;
     }
     // Latch the stationary carousel anchor on its opening frame.
     if (app.galleryActive && !app.ringLatched) {
       galleryTick(app, renderer, 0.0F, headWorld, headForward);
     }
-    bool const panelWanted = handRight && handMenuOpen && !app.galleryActive;
-    if (panelWanted && (!app.handPanel.visible || app.handPanelCarousel != app.galleryActive)) {
-      prepareHandPanel(app);
-      app.handPanelCarousel = app.galleryActive;
-      app.handPanel.orientation = quatFromAxisAngle({0,1,0}, std::atan2(-headForward.x, -headForward.z));
-      app.handPanel.origin = headWorld + headForward * .65F + Vec3{0,.08F,0};
-
-      app.handUiOwned = handHeld;
-      std::printf("[hands] %s panel open\n", app.galleryActive ? "carousel" : "tools");
+    // A hand panel needs the tracked palm and closes with the carousel. The
+    // controller panel stays latched where it opened.
+    if (app.menuOwner == MenuOwner::hand &&
+        (!input.handActive[0] || !worldHands[0].valid || app.galleryActive)) {
+      closeToolMenu(app);
     }
-    if (!panelWanted && app.handPanel.visible) {
-      endEdits(app);
+    if (app.menuOwner == MenuOwner::hand) {
+      app.handPanel.orientation =
+          quatFromAxisAngle({0, 1, 0}, std::atan2(-headForward.x, -headForward.z));
+      app.handPanel.origin = worldHands[0].position + Vec3{0, .12F, 0};
     }
-    app.handPanel.visible = panelWanted;
-    app.handHover = handSignal && input.aimValid[1] ? app.handPanel.hit(worldRay) : -1;
-    if (app.handHover >= 1 && app.handHover <= 7) {
-      app.handHover = -1;
+    int hover = -1;
+    if (app.menuOwner != MenuOwner::none && controllerRight) {
+      hover = controllerAimTracked ? app.handPanel.hit(controllerAim) : -1;
+    } else if (app.menuOwner == MenuOwner::hand) {
+      hover = handSignal && input.aimValid[1] && input.aimTracked[1]
+          ? app.handPanel.hit(worldRay) : -1;
     }
-    if (!handHeld) {
-      if ((app.handGrab && !app.physicalGrab) || app.handTool >= 0) {
-        endEdits(app);
+    if (hover >= 1 && hover <= 7) {
+      hover = -1; // spacer cells are not buttons
+    }
+    app.handHover = hover;
+    // The legacy hand panel: UI only. It never selects or moves a model.
+    if (app.menuOwner == MenuOwner::hand && handRight && !input.aimTracked[1]) {
+      app.handTool = -1;
+      app.deleteHolding = false;
+      app.deleteCharge = 0.0F;
+      rightPinch.reset();
+    }
+    if (app.menuOwner == MenuOwner::hand) {
+      if (!handHeld) {
+        if (app.handTool >= 0) {
+          endEdits(app);
+        }
+        app.handUiOwned = false;
       }
-      app.handUiOwned = false;
-    }
-    if (rightPressed && !app.physicalGrab && app.handHover >= 0 && !handCarouselToggled) {
-      int const button = app.handHover;
-      prepareHandTool(app, button);
-      app.handUiOwned = true;
-      std::printf("[hands] tool: %s\n", kHandTools[button]);
-      if (button == 0) {
-        galleryOpen(app, renderer);
-      } else if (button == 8) {
-        input.undoPressed = true;
-      } else if (button == 9) {
-        input.redoPressed = true;
-      } else if (button == 10 && !app.selection.empty()) {
-        app.handTool = button;
-        app.deleteHolding = false;
-      } else if (button == 11) {
-        toggleBackdrop(app, renderer, &shell);
+      if (rightPressed && !handMenuToggled && app.handHover >= 0) {
+        int const button = app.handHover;
+        prepareHandTool(app, button);
+        app.handUiOwned = true;
+        std::printf("[hands] tool: %s\n", kHandTools[button]);
+        if (button == ToolPanelPress::kModels) {
+          // The carousel is controller-operated; do not strand a hand-only user.
+          std::printf("[hands] Models requires the right controller\n");
+        } else if (button == ToolPanelPress::kUndo) {
+          input.undoPressed = true;
+        } else if (button == ToolPanelPress::kRedo) {
+          input.redoPressed = true;
+        } else if (button == ToolPanelPress::kDelete && !app.selection.empty()) {
+          app.handTool = button;
+          app.deleteHolding = false;
+        } else if (button == ToolPanelPress::kBackdrop) {
+          toggleBackdrop(app, renderer, &shell);
+        }
+      } else if (rightPressed && !handMenuToggled) {
+        app.handUiOwned = true; // tool panel owns misses too; do not click through
       }
-    } else if (rightPressed && !app.physicalGrab && app.handPanel.visible && !app.galleryActive) {
-      app.handUiOwned = true; // tool panel owns misses too; do not click through
     }
-    if (app.handGrab) {
-      if ((app.physicalGrab ? graspHeld : handHeld) && worldHands[1].valid && !app.handUiOwned && !panelWanted && !app.galleryActive) {
+    if (kHandModelManipulation && app.grabActive && app.grabOwner == GrabOwner::hand) {
+      if ((app.physicalGrab ? graspHeld : handHeld) && worldHands[1].valid && !app.handUiOwned &&
+          app.menuOwner == MenuOwner::none && !app.galleryActive) {
         if (app.physicalGrab) {
           updateHandGrab(app, worldHands[1]); // unfiltered, 1:1 palm pose
         } else if (app.handScaling) {
@@ -3406,130 +3780,94 @@ int runXr(char const* shaderDir,
       }
     }
 
-    if (handRight && (app.handUiOwned || app.physicalGrab)) {
-      input.selectPressed = false;
+    // Left controller MENU: one press opens/closes the real tools panel. The
+    // panel is processed after this toggle, so a press that opens it this
+    // frame captures the trigger as a menu press; a trigger held from before
+    // must be released first. Thumbstick clicks still do nothing.
+    if (input.menuPressed) {
+      toggleControllerToolMenu(app, headWorld, headForward);
+      handMenuToggled = true;
+      app.triggerWorkflow.reset();
+      app.panelPress.cancel();
+      app.deleteCharge = 0.0F;
     }
 
-    // The left controller's MENU carries two controls (the user's binding):
-    // TAP = the model carousel (open/close, the same rule as A), HOLD (0.4 s)
-    // = backdrop toggle. The tap fires on release so a hold can be told apart
-    // from a tap (the hold cancels the tap); thumbstick clicks do NOTHING.
-    // The tap used to switch MOVE/ROTATE — that comes back as gestures.
-    bool carouselToggled = handCarouselToggled;
-    if (input.menuPressed || (input.menuHeld && !app.menuPrevHeld)) {
-      // The app-side rising edge backs up the shell's edge: a press swallowed
-      // by a skipped frame must still initialise the tap/hold state, or a
-      // later hold resumes from a stale charge.
-      app.menuCharge = 0.0F;
-      app.menuHoldLatched = false;
-      app.menuTapped = true;
-    }
-    app.menuPrevHeld = input.menuHeld;
-    if (input.menuHeld) {
-      app.menuCharge += dt;
-      if (!app.menuHoldLatched && app.menuCharge >= 0.4) {
-        app.menuHoldLatched = true;
-        app.menuTapped = false;
-        toggleBackdrop(app, renderer, &shell);
+    // Controller tools panel: the right aim points, the right trigger acts.
+    // A press captures one button (or a miss, which is swallowed). Delete is
+    // a 0.6 s hold; the other actions fire on release over the same button.
+    if (app.menuOwner != MenuOwner::none && controllerRight) {
+      if (input.selectActive && !input.selectHeld) {
+        app.panelTriggerArmed = true;
       }
-    } else if (app.menuTapped) {
-      app.menuTapped = false;
-      // Same open/close rule as A (galleryOpen ends any live stick gesture).
-      if (app.galleryActive) {
-        galleryClose(app);
-      } else {
-        galleryOpen(app, renderer);
+      if (app.panelPress.active() && !controllerAimTracked) {
+        // Losing the tracked aim mid-hold cancels rather than firing blind.
+        app.panelPress.cancel();
+        app.deleteCharge = 0.0F;
       }
-      // The stick that was cycling the ring is still deflected: it must
-      // re-centre before it can start a scale/height gesture on the model the
-      // close just revealed (this frame's stick block runs after this one).
-      app.stickArmed = false;
-      carouselToggled = true;
+      if (input.selectPressed && app.panelTriggerArmed && controllerAimTracked) {
+        app.panelPress.press(app.handHover);
+        app.panelTriggerArmed = false;
+      }
+      if (input.selectHeld &&
+          app.panelPress.hold(true, app.handHover, dt) == ToolPanelPress::Action::deleteNow) {
+        deleteSelection(app);
+        deleteLatch.interrupt();
+        app.deleteHolding = false;
+      }
+      app.deleteCharge = app.panelPress.charge();
+      if (input.selectReleased) {
+        auto const action = app.panelPress.release(app.handHover);
+        app.deleteCharge = 0.0F;
+        switch (action) {
+        case ToolPanelPress::Action::models:
+          closeToolMenu(app);
+          galleryOpen(app, renderer);
+          break;
+        case ToolPanelPress::Action::undo:
+          (void)performUndo(app);
+          break;
+        case ToolPanelPress::Action::redo:
+          (void)performRedo(app);
+          break;
+        case ToolPanelPress::Action::deleteNow:
+          deleteSelection(app);
+          break;
+        case ToolPanelPress::Action::backdrop:
+          toggleBackdrop(app, renderer, &shell);
+          break;
+        case ToolPanelPress::Action::none:
+        default:
+          break;
+        }
+      }
     }
+
     bool cancelledLiveEdit = false;
     if (input.undoPressed || input.redoPressed) { selectionLatch.reset(); graspGate.reset(); rightGrasp.reset(); }
     if (input.undoPressed) {
-      if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
-        cancelLiveEdit(app);
-        cancelledLiveEdit = true;
-      } else {
-        vredit::EditorSnapshot state = snapshot(app);
-        if (app.undo.undo(state)) {
-          applySnapshot(app, state);
-          app.stickArmed = false; // sticks must re-centre before a new gesture
-        }
-      }
+      cancelledLiveEdit = app.stickSession || app.grabActive || app.handTool >= 0 || app.galleryActive;
+      (void)performUndo(app);
     }
     // Same guard as the desktop keys: one cancel per frame leaves both stacks
     // untouched even if both arrive together.
     if (input.redoPressed && !cancelledLiveEdit) {
-      if (app.stickSession || app.handGrab || app.handTool >= 0 || app.galleryActive) {
-        cancelLiveEdit(app);
-      } else {
-        vredit::EditorSnapshot state = snapshot(app);
-        if (app.undo.redo(state)) {
-          applySnapshot(app, state);
-          app.stickArmed = false; // sticks must re-centre before a new gesture
-        }
-      }
+      (void)performRedo(app);
     }
 
-    // The right controller's aim ray drives the same state machine as the
-    // mouse. A body press only SELECTS —
-    // movement and rotation are the sticks' job (controller aim is too
-    // jittery for accurate placement).
+    // Hand model targeting/grabbing is retired (the maths and its tests still
+    // exist): a hand pinch may drive the UI menu, never a model. Keeping the
+    // latch in reset means a future arm interaction starts clean.
     app.camera.position = headWorld;
-    // Cache only an actual closest selected surface while released. A current
-    // hit on another object always wins over the grace; never use gaze fallback.
-    PointerTarget handTarget;
-    bool const handCanTarget = handSignal && input.aimValid[1];
-    // The carousel press and highlight share one strict aim gate: VALID
-    // is not enough, because an inferred/last-known aim must not act spatially.
-    bool const carouselAimTracked = input.aimValid[1] && input.aimTracked[1];
-    // A usable-but-untracked right aim silently disables the carousel press
-    // and highlight. Say so once per episode so a headset user and the log
-    // can tell "no aim" from "tracking lost".
-    if (app.galleryActive && input.aimValid[1] && !input.aimTracked[1]) {
-      if (!carouselAimWarned) {
-        std::printf("[hands] right aim is valid but untracked; carousel press/highlight "
-                    "disabled until tracking returns\n");
-        carouselAimWarned = true;
-      }
-    } else if (!app.galleryActive) {
-      // Re-arm on close, not on the next tracked frame: TRACKED can flap and
-      // one line per carousel session is enough.
-      carouselAimWarned = false;
-    }
-    bool const sceneHandTargeting = handCanTarget && !app.handUiOwned &&
-        !panelWanted && !app.galleryActive && !app.stickSession;
-    if (app.handUiOwned || panelWanted || app.galleryActive || app.stickSession) {
-      selectionLatch.clearHit();
-    }
-    if (sceneHandTargeting && selectionLatch.primed() && !handHeld) {
-      handTarget = resolvePointerTarget(app, worldRay);
-      bool const selected = handTarget.node != kInvalidNode &&
-          std::find(app.selection.begin(), app.selection.end(), handTarget.node) != app.selection.end();
-      if (selected) {
-        Mat4 inverse{};
-        if (invertAffine(app.scene.world(handTarget.node), inverse)) {
-          recentHandNode = handTarget.node;
-          recentHandLocalPoint = transformPoint(inverse, handTarget.point);
-          selectionLatch.rememberHit();
-        } else {
-          selectionLatch.clearHit();
-        }
-      } else if (handTarget.node != kInvalidNode && !selected) {
-        selectionLatch.clearHit();
-      }
-    }
+    selectionLatch.clearHit();
     // Physical contact wins an overlapping pinch, but an unprimed first
     // selection never becomes an edit. A held, armed squeeze may enter contact.
-    if (graspGate.canAcquire(rightGrasp.pressed(), selectionLatch.primed()) &&
-        !app.physicalGrab && !app.handUiOwned && !panelWanted && !handMenuOpen &&
-        !app.galleryActive && !app.stickSession && !carouselToggled &&
+    if (kHandModelManipulation &&
+        graspGate.canAcquire(rightGrasp.pressed(), selectionLatch.primed()) &&
+        !app.physicalGrab && !app.handUiOwned && app.menuOwner == MenuOwner::none &&
+        !app.galleryActive && !app.stickSession &&
         !input.undoPressed && !input.redoPressed && !app.selection.empty() &&
         selectedHandContact(app, input, rigWorld)) {
-      if (app.handGrab) {
+      if (app.grabActive) {
         // Upgrade the projected pinch in place: keep its original undo
         // transaction, but rebase the physical motion at the current pose.
         app.grabStart = worldHands[1];
@@ -3537,184 +3875,156 @@ int runXr(char const* shaderDir,
         app.handScaling = false;
         for (auto& [id, world] : app.grabWorlds) { world = app.scene.world(id); }
         for (auto& [id, local] : app.grabLocals) { local = app.scene.local(id); }
-        for (auto& [id, pose] : app.grabPoseStarts) { pose = app.scene.poseOffset(id); }
       } else {
         beginHandGrab(app, worldHands[1]);
       }
-      app.physicalGrab = app.handGrab;
-      if (app.physicalGrab) { input.selectPressed = false; rightPinch.reset(); }
+      app.physicalGrab = app.grabActive;
+      if (app.physicalGrab) { rightPinch.reset(); }
     }
-    if (input.selectPressed && !carouselToggled) {
-      if (app.galleryActive) {
-        // The carousel is a spatial target: an untracked aim (VALID but not
-        // TRACKED) neither browses nor places. This is the highlight gate too.
-        if (carouselAimTracked) { galleryPointerPress(app, renderer, worldRay); }
+
+    // Controller select/grab. The right trigger is the only scene input:
+    //   1. the first press selects the exact surface under the tracked aim;
+    //   2. release;
+    //   3. the next press-and-hold moves the current selection with the
+    //      physical grip pose, using the view-relative projection.
+    // Grip+trigger stays the part-selection shortcut: a grip-held press
+    // selects a part and never starts a grab. The carousel and the tools
+    // panel own the trigger while open.
+    if (app.menuOwner == MenuOwner::none && !app.galleryActive) {
+      bool const partSelectPress = input.gripHeld > 0.5F;
+      ControllerTriggerWorkflow::Target target = ControllerTriggerWorkflow::Target::none;
+      PointerTarget pressTarget;
+      if (input.selectPressed && controllerAimTracked) {
+        pressTarget = resolvePointerTarget(app, controllerAim);
+        if (pressTarget.node != kInvalidNode) {
+          target = (!partSelectPress && selectionContainsNode(app, pressTarget.node))
+                       ? ControllerTriggerWorkflow::Target::selected
+                       : ControllerTriggerWorkflow::Target::other;
+        }
+      }
+      auto const action = app.triggerWorkflow.update(
+          controllerRight && input.selectActive && (controllerAimTracked || app.triggerWorkflow.primed()),
+          input.selectHeld, input.selectPressed, target,
+          !app.selection.empty());
+      switch (action) {
+      case ControllerTriggerWorkflow::Action::select: {
+        pointerPress(app, pressTarget, partSelectPress);
+        Mat4 inverse;
+        if (app.scene.valid(pressTarget.node) &&
+            invertAffine(app.scene.world(pressTarget.node), inverse)) {
+          app.controllerPivotNode = pressTarget.node;
+          app.controllerPivotLocal = transformPoint(inverse, pressTarget.point);
+        } else {
+          app.controllerPivotNode = kInvalidNode;
+          app.triggerWorkflow.reset();
+        }
+        selectionLatch.reset();
         graspGate.reset();
         rightGrasp.reset();
-        if (!app.galleryActive) { handMenuOpen = false; }
-        if (handRight) { app.handUiOwned = true; }
-      } else {
-        bool const partSelect = !handRight && input.gripHeld > 0.5F;
-        PointerTarget target = handRight && !handCanTarget ? PointerTarget{} :
-            resolvePointerTarget(app, worldRay);
-        bool const selectedHit = target.node != kInvalidNode &&
-            std::find(app.selection.begin(), app.selection.end(), target.node) != app.selection.end();
-        bool const recentSelected = handRight && target.node == kInvalidNode &&
-            selectionLatch.recentHit() &&
-            std::find(app.selection.begin(), app.selection.end(), recentHandNode) != app.selection.end();
-        if (handSignal && worldHands[1].valid &&
-            selectionLatch.startsGrab(selectedHit, recentSelected)) {
-          Vec3 const point = selectedHit ? target.point :
-              transformPoint(app.scene.world(recentHandNode), recentHandLocalPoint);
-          beginHandGrab(app, worldHands[1], point, {headWorld, normalized(cameraOrientation(rig) * input.headOrient), true});
-        } else if (!handRight || handCanTarget) {
-          pointerPress(app, target, partSelect);
-          graspGate.reset();
-          rightGrasp.reset();
-          selectionLatch.selected(handSignal && !app.selection.empty());
+        break;
+      }
+      case ControllerTriggerWorkflow::Action::clearSelection:
+        pointerPress(app, PointerTarget{}, false);
+        break;
+      case ControllerTriggerWorkflow::Action::beginGrab: {
+        if (!controllerGrip.usable()) {
+          std::printf("[xr] trigger grab refused: grip pose %s\n",
+                      controllerGrip.valid ? "is VALID but untracked" : "is unavailable");
+          break;
         }
+        HandGrabView const view{headWorld,
+            normalized(cameraOrientation(rig) * input.headOrient), true};
+        if (!app.scene.valid(app.controllerPivotNode) ||
+            !beginControllerGrab(app, controllerGrip,
+                transformPoint(app.scene.world(app.controllerPivotNode), app.controllerPivotLocal), view)) {
+          std::printf("[xr] trigger grab could not start\n");
+        }
+        break;
+      }
+      case ControllerTriggerWorkflow::Action::none:
+      default:
+        break;
+      }
+    } else {
+      // Another owner has the trigger. It must return to release before the
+      // scene can use it; this also stops a trigger held across a panel or
+      // carousel transition from grabbing immediately.
+      app.triggerWorkflow.reset();
+    }
+
+    if (app.grabActive && app.grabOwner == GrabOwner::controller) {
+      if (!input.selectHeld) {
+        endEdits(app); // release commits exactly one undo step
+      } else if (!controllerGrip.usable()) {
+        // Tracking loss is not a release: commit at the last good sample and
+        // require a real trigger release before another grab can start.
+        endEdits(app);
+        app.triggerWorkflow.reset();
+        std::printf("[xr] controller grip tracking lost; grab committed at last good pose\n");
+      } else {
+        updateControllerGrab(app, controllerGrip);
       }
     }
 
-    // Stick-driven editing (the coloured handles are gone): the LEFT stick
-    // slides the selection across the floor relative to the head's yaw
-    // (pushing forward walks it away from you) in BOTH modes; the RIGHT stick
-    // is mode-driven (move: X uniform scale, Y height; rotate: X spins about
-    // the scene's up axis, Y tips). One undo step per gesture.
-    //
-    // The gesture's frame is latched at start (pivot, the pre-signed viewer
-    // axes, fine rate): turning your head or toggling grip mid-gesture must
-    // not steer the rotation axes, change the rate mid-step, or walk
-    // asymmetric models sideways through a per-frame re-centred pivot.
-    Vec3 headForwardFlat{headForward.x, 0.0F, headForward.z};
-    headForwardFlat = dot(headForwardFlat, headForwardFlat) > 1e-8F
-                          ? normalized(headForwardFlat)
-                          : Vec3{0.0F, 0.0F, -1.0F};
-    Vec3 const headRightFlat = cross(headForwardFlat, Vec3{0.0F, 1.0F, 0.0F});
-    float const stickThreshold = app.stickSession ? kStickEndZone : kStickDeadZone;
-    // Dead-zoned stick VALUES (the gate alone is not enough): sub-threshold
-    // drift must never edit — a move gesture used to keep the session open
-    // while left-Y drift silently tipped the model at degrees per second.
-    auto stickValue = [](float v) {
-      float const a = std::fabs(v);
-      if (a <= kStickDeadZone) {
-        return 0.0F;
-      }
-      return (v > 0.0F ? 1.0F : -1.0F) * (a - kStickDeadZone) / (1.0F - kStickDeadZone);
-    };
-    float const rightX = stickValue(input.rightStick.x);
-    float const rightY = stickValue(input.rightStick.y);
-    float const leftX = stickValue(input.leftStick.x);
-    float const leftY = stickValue(input.leftStick.y);
-    // The LEFT stick moves (X/Z) in both modes. The RIGHT stick is
-    // mode-driven (desktop 1/2 only — VR has no switch until the gestures
-    // land): MOVE = X uniform scale, Y height;
-    // ROTATE = X spins about the scene's up axis, Y tips the top away ("the
-    // model should rotate in the direction of the stick").
-    bool const sticksActive = std::fabs(input.rightStick.x) > stickThreshold ||
-                              std::fabs(input.rightStick.y) > stickThreshold ||
-                              std::fabs(input.leftStick.x) > stickThreshold ||
-                              std::fabs(input.leftStick.y) > stickThreshold;
-    bool const gestureAlive = sticksActive;
-    // While the carousel is open the sticks are ITS: the right stick's X
-    // cycles the staged model (a flick = one step; held = one step per
-    // 0.25 s). All editing stays blocked (the session gates below).
+    // The VR thumbsticks never edit: the right stick's X browses the carousel
+    // while it is open, and nothing else. Movement/rotation/scale are the
+    // physical controller grab only.
     galleryTick(app, renderer, dt, headWorld, headForward);
     if (app.galleryActive) {
       app.galleryCycleCooldown -= dt;
-      if (std::fabs(input.rightStick.x) > 0.5F && app.galleryCycleCooldown <= 0.0) {
+      bool const stickNeutral = controllerRight &&
+          carouselStickNeutral(input.rightStickActive, input.rightStick);
+      bool const browsing = controllerRight && input.rightStickActive &&
+          std::fabs(input.rightStick.x) > 0.5F;
+      if (!input.rightStickActive || !controllerRight) {
+        app.galleryStickArmed = false;
+      } else if (stickNeutral) {
+        app.galleryStickArmed = true;
+        app.galleryCycleCooldown = 0.0;
+      } else if (browsing && app.galleryStickArmed && app.galleryCycleCooldown <= 0.0) {
         galleryCycle(app, renderer, input.rightStick.x > 0.0F ? 1 : -1);
         app.galleryCycleCooldown = 0.25;
       }
-    }
-    // After an undo/redo the sticks must return to neutral before a new
-    // gesture may start, or the same frame's drift cancels-and-restarts and
-    // swallows the undo.
-    if (!sticksActive) {
-      app.stickArmed = true;
-    }
-    if (!panelWanted && sticksActive && !app.stickSession && !app.handGrab && app.handTool < 0 && !app.galleryActive &&
-        !app.selection.empty() && app.stickArmed) {
-      app.undo.begin(snapshot(app));
-      app.stickSession = true;
-      app.stickFineRate = input.gripHeld > 0.5F ? 0.25F : 1.0F;
-      // VIEWER-RELATIVE axes only ("only ever rotate the model around the
-      // axis that stretches to the left and right of the viewer" = tip; the
-      // spin is the scene's up axis), latched at gesture start so a live
-      // head pose cannot steer a step. The two axes are perpendicular and
-      // level with the horizon.
-      vredit::viewerRotationAxes(headRightFlat, app.stickYawAxis, app.stickTipAxis);
-      vredit::Aabb bounds{};
-      if (vredit::movingSetBounds(app.scene, app.visuals, app.selection, bounds)) {
-        app.stickPivot = vredit::aabbCentre(bounds);
-      } else {
-        app.stickPivot = app.scene.worldPosition(app.selection.front());
-      }
-    }
-    if (app.stickSession && !app.galleryActive && !panelWanted) {
-      if (gestureAlive && !app.selection.empty()) {
-        Vec3 const moveDelta = (headRightFlat * leftX + headForwardFlat * leftY) *
-                               (kStickMoveMps * app.stickFineRate * dt);
-        // Guard the call, not just the maths: a zero delta would still
-        // round-trip every local transform through matrix decompose (float
-        // noise, epoch churn, junk in the undo snapshot).
-        if (moveDelta.x != 0.0F || moveDelta.y != 0.0F || moveDelta.z != 0.0F) {
-          vredit::moveSelectionHorizontal(app.scene, app.selection, moveDelta);
-        }
-        // RIGHT STICK (mode-driven): MOVE = X uniform scale (right = bigger),
-        // Y = height (up = lift). ROTATE = X spins about the scene's up axis
-        // (stick right sweeps the face toward your right), Y tips the top
-        // away / lifts the face ("the model should rotate in the direction of
-        // the stick"). ROTATE MODE ONLY — nothing rotates outside it.
-        switch (app.mode) {
-        case EditMode::move: {
-          if (std::fabs(rightX) > 1e-4F) {
-            float const factor =
-                std::exp(rightX * kStickScalePerS * app.stickFineRate * dt);
-            vredit::scaleSelectionUniform(app.scene, app.visuals, app.selection, factor);
-          }
-          if (std::fabs(rightY) > 1e-4F) {
-            // Explicit height: no floor rule (lifting is deliberate).
-            float const deltaY = rightY * kStickHeightMps * app.stickFineRate * dt;
-            vredit::moveSelectionVertical(app.scene, app.selection, deltaY);
-          }
+      // Placement is the CENTRED model, no pointing: wait for the ring to be
+      // at rest, the stick to be released, and THIS index to have loaded and
+      // settled. A trigger press while any of those is false is consumed,
+      // never replayed later.
+      bool centreLoaded = false;
+      for (CarouselSlot const& slot : app.carousel) {
+        if (slot.index == app.ring.index && slot.hasModel) {
+          centreLoaded = true;
           break;
         }
-        case EditMode::rotate:
-        default: {
-          // SPIN + TIP (the signs live in the core seams): stick X spins
-          // about the scene's vertical — never the model's own up — and a
-          // spin never changes height, so no floor rule applies. Stick Y
-          // tips the top away / lifts the face (grip = fine).
-          if (std::fabs(rightX) > 1e-4F) {
-            vredit::stickRotateYaw(app.scene, app.selection, app.stickPivot,
-                                   app.stickYawAxis, rightX, kStickTurnRadps,
-                                   app.stickFineRate * dt);
-          }
-          if (vredit::stickRotateTip(app.scene, app.selection, app.stickPivot,
-                                     app.stickTipAxis, rightY, kStickTurnRadps,
-                                     app.stickFineRate * dt)) {
-            // The floor rule is about MODELS ("models stay stuck to the
-            // floor"): tipping digs a resting model's corners below it;
-            // tipping a PART must not lift it out of its model by flooring
-            // through the part's own bounds.
-            if (wholeModelSelection(app)) {
-              vredit::dropSelectionToFloor(app.scene, app.visuals, app.selection);
-            }
-          }
-          break;
-        }
-        }
-      } else {
-        app.undo.commit(snapshot(app));
-        app.stickSession = false;
       }
+      if (app.carouselGate.update(true, app.ring.index, centreLoaded,
+                                  app.ring.atRest() && stickNeutral,
+                                  !controllerRight || !input.selectActive || input.selectHeld,
+                                  controllerRight && input.selectActive && input.selectPressed, dt)) {
+        (void)galleryPick(app, renderer, controllerAim);
+      }
+      app.galleryAimPlaceable = app.galleryActive && app.carouselGate.ready();
+    } else {
+      app.carouselGate.reset();
+      app.galleryAimPlaceable = false;
     }
 
     // Hold-X delete: the selection's tint ramps red over kDeleteChargeS and
     // the delete fires at full charge; release before that cancels. Hold-to-
     // confirm on purpose — face buttons on Quest controllers are wobbly.
-    if ((input.deleteHeld || (app.handTool == 10 && handHeld && panelWanted)) &&
+    // The controller panel's Delete button runs its own hold above; leave
+    // that charge visible instead of clearing it here.
+    bool const controllerPanelDelete =
+        app.menuOwner != MenuOwner::none && controllerRight &&
+        app.panelPress.button() == ToolPanelPress::kDelete && app.panelPress.active();
+    bool const handPanelDelete =
+        app.menuOwner == MenuOwner::hand && app.handTool == ToolPanelPress::kDelete &&
+        handHeld && input.aimTracked[1] && app.handHover == ToolPanelPress::kDelete;
+    if (input.deleteInterrupted) {
+      deleteLatch.interrupt();
+    }
+    bool const deleteHeld = deleteLatch.update(
+        input.deleteActive && !input.deleteInterrupted, input.deleteHeld);
+    if ((deleteHeld || handPanelDelete) &&
         !app.selection.empty() && !app.galleryActive) {
       if (!app.deleteHolding) {
         app.deleteHolding = true;
@@ -3726,9 +4036,12 @@ int runXr(char const* shaderDir,
       app.deleteCharge = static_cast<float>(std::min(held / kDeleteChargeS, 1.0));
       if (app.deleteCharge >= 1.0F) {
         deleteSelection(app);
+        deleteLatch.interrupt();
         app.deleteHolding = false;
         app.deleteCharge = 0.0F;
       }
+    } else if (controllerPanelDelete) {
+      app.deleteHolding = false; // the controller panel owns the red ramp
     } else {
       app.deleteHolding = false;
       app.deleteCharge = 0.0F;
@@ -3739,21 +4052,16 @@ int runXr(char const* shaderDir,
     // the old "grip+A cancels" chord silently swallowed EVERY press (the
     // reported "nothing appears when I press A"). Cancelling is undo (B) — a
     // single, stable button the user already has.
-    if (input.spawnPressed && !carouselToggled) {
+    if (input.spawnPressed) {
       if (app.galleryActive) {
         galleryClose(app);
       } else {
+        if (app.menuOwner != MenuOwner::none) {
+          closeToolMenu(app);
+        }
         galleryOpen(app, renderer);
       }
     }
-    if (app.galleryActive) {
-      // The carousel owns the pointer: the trigger places the staged model
-      // at the aim point (handled at the trigger press).
-    }
-
-    // The placeable preview's rim is exactly "would this press place?" with
-    // the tracked-aim gate on top: a VALID-but-untracked pose never lights it.
-    app.galleryAimPlaceable = galleryAimHighlight(app, worldRay, carouselAimTracked);
 
     std::vector<DrawItem> items;
     std::vector<RendererVertex> depthLines;
@@ -3838,7 +4146,7 @@ int runXr(char const* shaderDir,
                 "renderFalse %llu (runtime hint ignored)\n",
                 static_cast<unsigned long long>(stats.stalePose),
                 static_cast<unsigned long long>(stats.renderFalse));
-    std::printf("[xr] controller sticks (left = move, right = edit): "
+    std::printf("[xr] controller sticks (right = carousel browse, left unused): "
                 "left X %.2f Y %.2f, right X %.2f Y %.2f (peaks)\n",
                 stats.leftXMax, stats.leftYMax, stats.rightXMax, stats.rightYMax);
   }
@@ -4117,12 +4425,14 @@ int main(int argc, char** argv) {
           "      shift = fine, 1 move / 2 rotate,\n"
           "      N model carousel ([ ] cycle, click places), Delete remove,\n"
           "      B backdrop, Ctrl-Z/Y undo/redo, shift+click part, Esc quit\n"
-          "vr:   trigger select (grip+trigger part), left stick move on the floor,\n"
-          "      hands: right pinch = select, hand aim = pointer (no buttons/sticks),\n"
-          "      right stick: scale (X) and height (Y), grip = fine,\n"
-          "      A or menu tap = model carousel (right stick X cycles,\n"
-          "      trigger places), hold X delete, B/Y undo/redo,\n"
-          "      menu hold = backdrop\n");
+          "vr:   right trigger: first press selects (grip+trigger part), release,\n"
+          "      next press-hold grabs the selection with the controller grip\n"
+          "      pose; release commits. Sticks never edit.\n"
+          "      left menu tap = tools panel (Models/Undo/Redo/Delete/Backdrop),\n"
+          "      right aim + trigger activates; A = carousel, right stick X\n"
+          "      browses, trigger places the settled centre model;\n"
+          "      hold X delete, B/Y undo/redo. Hands render and the hand menu\n"
+          "      still opens, but hand pinch/grasp no longer moves models.\n");
       return 0;
     } else if (arg[0] == '-') {
       std::printf("unknown option: %s\n", arg);
